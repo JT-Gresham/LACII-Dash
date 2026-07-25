@@ -191,8 +191,9 @@ class EngineLoadMixin:
             _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
             _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)
             if _cdir and (_is_diffusers_dir(_cdir) or _is_kokoro_dir(_cdir)
+                          or _is_whisper_dir(_cdir)
                           or os.path.isdir(os.path.join(_cdir, "ace_step_transformer"))):
-                return   # #t2i/#t2a/#tts: image/audio checkpoints have no LLM shard cache to compile
+                return   # #t2i/#t2a/#tts/#stt: media checkpoints have no LLM shard cache to compile
             # #embedding: an encoder / sentence-embedding checkpoint (nomic-embed, BERT, …) has no
             # 'model.embed_tokens.weight' — an int4 shard compile ALWAYS fails (KeyError) and, because
             # such models are typically persist/no_unload, RE-FIRES on every auto-load / re-adopt,
@@ -457,6 +458,11 @@ class EngineLoadMixin:
                         friendly, _tgt, reg_key or friendly, quant, replica_idx=replica_idx,
                         offload=(t2i_offload or bool(ENGINE_CONFIG.get("t2a_offload_default", True))),
                         cpu_only=cpu_only)
+                # #stt-serve: a Whisper ASR checkpoint (config model_type 'whisper') loads via the
+                # single-node speech-to-TEXT path — an encoder-decoder model, never pipeline-split.
+                if _d and _is_whisper_dir(_d):
+                    return await self._load_stt_locked(friendly, _tgt, reg_key or friendly,
+                                                       replica_idx=replica_idx)
                 # #tts-serve: a Kokoro speech checkpoint (kokoro-v1_0.pth + voices/, no
                 # safetensors, no model_index.json) loads via the single-node speech path.
                 if _d and _is_kokoro_dir(_d):
@@ -2088,6 +2094,146 @@ class EngineLoadMixin:
                      f"[{len(self.models)} model(s) resident]")
         return lm
 
+    async def _load_stt_locked(self, friendly: str, target_id: str, reg_key: str,
+                               replica_idx: int = 0) -> LoadedModel:
+        """#stt-serve: load a Whisper ASR checkpoint WHOLE onto ONE worker — the transcription
+        sibling of _load_tts_locked. Whisper is a small (~0.8-1.5 GB) ENCODER-DECODER model, so no
+        VRAM edge/quant tiers and no eviction dance. Prefers a co-located GPU worker; a REMOTE
+        worker advertising the runtime (can_stt) also serves (it snapshot_downloads the checkpoint
+        — #media-anywhere). A GPU whose MIOpen JIT-fails (gfx1151) is handled by the leaf's CPU
+        fallback. MUST hold self.lock (reached only from load())."""
+        model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
+        await self.ensure_data_listener()
+        if reg_key in self.models:
+            await self._unload_model_locked(reg_key, "reload (stt)")
+            await self._await_free_refresh()
+
+        def _is_colo(n):
+            return (n.hostname == socket.gethostname()
+                    or str(n.data_host).startswith(("127.", "::1"))
+                    or str(n.data_host) in _LOCAL_IPS)
+        # Candidates: a co-located worker (reads the model dir off shared disk — fast) OR any
+        # worker advertising the Whisper runtime (can_stt; it fetches from HF). Prefer, in order,
+        # a can_stt node, then a co-located one, then the most VRAM — so a remote GPU with the
+        # runtime beats a co-located CPU box, but a co-located node still serves with no can_stt.
+        cand = [n for n in registry.alive_sorted()
+                if n.can_infer and (_is_colo(n) or getattr(n, "can_stt", False))]
+        if not cand:
+            raise RuntimeError("no worker can serve the stt (Whisper) model — need a co-located "
+                               "worker or one advertising the transcription runtime (can_stt)")
+        node = sorted(cand, key=lambda _n: (bool(getattr(_n, "can_stt", False)),
+                                            _is_colo(_n), _n.vram_total_gb), reverse=True)[0]
+        device = "cuda" if node.vram_total_gb > 0 else "cpu"
+        # Whisper is ~1-3 GB — a small reservation so a concurrent big load budgets around it.
+        self._reservations[reg_key] = {node.node_id: {
+            "ram": int(3.0 * GB), "vram": int(3.0 * GB) if device == "cuda" else 0}}
+        self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
+                        "target": target_id, "total": 1, "ready": 0,
+                        "stages_total": 1, "stages_ready": 0,
+                        "basis": f"stt: single-node ({node.hostname}, whisper/{device})",
+                        "warnings": [], "node_ids": [node.node_id],
+                        "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
+                        "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
+        link = self.links.get(node.node_id)
+        if link is None:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"no control link to {node.node_id}")
+        fut = asyncio.get_event_loop().create_future()
+        link.pending_loads[target_id] = fut
+        await link.send({"type": "load", "kind": "stt", "model_id": target_id,
+                         "model_dir": model_dir, "quant": "none",
+                         "controller_http_port": ARGS.http_port,
+                         "next_host": None, "next_port": ARGS.data_port,
+                         "device": device})
+        try:
+            r = await asyncio.wait_for(fut, timeout=max(GEN_TIMEOUT_S, 600.0))
+        except Exception as exc:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"stt load on {node.hostname} failed: {exc!r}")
+        if isinstance(r, dict) and r.get("type") == "error":
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"stt load on {node.hostname} failed: {r.get('error')}")
+        gpu_b = int(r.get("gpu_bytes", 0)) if isinstance(r, dict) else 0
+        tot_b = int(r.get("loaded_bytes", 0)) if isinstance(r, dict) else 0
+        spec = ModelSpec(name=friendly, hidden_size=1, num_layers=1, num_heads=1,
+                         num_kv_heads=1, head_dim=1, intermediate_size=1, vocab_size=0,
+                         tie_embeddings=True, max_ctx=0, arch="stt",
+                         meas_layer_w=1, meas_embed=0, meas_head=0, meas_norm=0,
+                         meas_params=max(1, tot_b))
+        stage = StageAssign(node_id=node.node_id, hostname=node.hostname,
+                            layer_start=0, layer_end=1, has_embed=True, has_head=True,
+                            est_bytes=tot_b or 1, usable_bytes=int(node.usable_total_gb * GB),
+                            gpu_bytes=gpu_b, loaded_bytes=tot_b)
+        plan = PlanResult(ok=True, model=spec.name, ctx_len=0, num_layers=1,
+                          pool_usable_gb=node.usable_total_gb,
+                          required_gb=(tot_b or 1) / GB, stages=[stage])
+        node.shard_gpu_bytes = gpu_b
+        _dial = (_dial_host(node.data_host), node.data_port)
+        stage0_writer = await self._connect_retry(*_dial)
+        now = time.time()
+        lm = LoadedModel(reg_key, target_id, spec, 0, plan, [node.node_id], None, set(), now,
+                         quant="none", stage0_writer=stage0_writer, last_used=now,
+                         stage0_dial=_dial, last_send_ts=now)
+        lm.base, lm.replica_idx = friendly, replica_idx
+        lm.plan_basis = "stt: single-node"
+        lm.is_stt = True
+        lm.media = r.get("media") if isinstance(r, dict) else None   # device/params (#media-detail)
+        self.models[reg_key] = lm
+        self.loadings.pop(reg_key, None)
+        registry.dirty = False
+        print(f"[load] {reg_key} stt (whisper) on {node.hostname} "
+              f"({tot_b / GB:.2f} GB, {gpu_b / GB:.2f} GB GPU, {device})")
+        log_activity(f"{reg_key} READY (stt/whisper, {node.hostname}, {device}) "
+                     f"[{len(self.models)} model(s) resident]")
+        return lm
+
+    async def stt_transcribe(self, friendly: str, audio_bytes: bytes, language: str = "",
+                             task: str = "transcribe") -> tuple[str, dict]:
+        """#stt-serve: transcribe audio on the model's Whisper worker. Serializes per model on
+        LoadedModel.lock (same discipline as text/image/speech gens); the audio travels the control
+        link as base64 and the transcript returns in stt_done. Returns (text, meta)."""
+        lm = self.models.get(friendly)
+        if lm is None:
+            raise ValueError(f"model '{friendly}' is not loaded — load it first")
+        if not getattr(lm, "is_stt", False):
+            raise ValueError(f"'{friendly}' is not a transcription (stt) model")
+        import base64
+        async with lm.lock:
+            lm.last_used = time.time()
+            link = self.links.get(lm.stage_node_ids[0])
+            if link is None:
+                raise RuntimeError("the stt model's worker is disconnected — reload the model")
+            rid = self._stt_rid = getattr(self, "_stt_rid", 0) + 1
+            pend = getattr(self, "_stt_pending", None)
+            if pend is None:
+                pend = self._stt_pending = {}
+            fut = asyncio.get_event_loop().create_future()
+            pend[rid] = fut
+            lm.active = 1
+            lm.stt_req = rid
+            try:
+                await link.send({"type": "stt_transcribe", "model_id": lm.target_id, "req_id": rid,
+                                 "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
+                                 "language": str(language or ""),
+                                 "task": str(task or "transcribe")})
+                # Whisper decode is ~ realtime on GPU, a few x slower on CPU; scale to audio size.
+                r = await asyncio.wait_for(
+                    fut, timeout=max(GEN_TIMEOUT_S, 120.0 + len(audio_bytes) / 20000.0))
+            finally:
+                lm.active = 0
+                lm.stt_req = None
+                pend.pop(rid, None)
+            if not isinstance(r, dict) or r.get("type") == "stt_err":
+                raise RuntimeError(f"transcription failed: {(r or {}).get('error', 'no result')}")
+            lm.last_render_s = r.get("seconds")      # wall time (#media-detail)
+            lm.last_audio_s = r.get("audio_s")       # audio duration -> RTF in the modal
+            lm.last_used = time.time()
+            text = r.get("text") or ""
+            log_activity(f"{_ollama_name(friendly)}: transcribed {r.get('audio_s', '?')}s audio "
+                         f"({len(text)} chars)")
+            return text, {"seconds": r.get("seconds"), "audio_s": r.get("audio_s"),
+                          "language": language, "task": task}
+
     async def tts_generate(self, friendly: str, text: str, voice: str = "",
                            speed: float = 1.0, fmt: str = "wav") -> tuple[bytes, dict]:
         """#tts-serve: synthesize speech on the model's Kokoro worker. Serializes per model
@@ -2816,7 +2962,7 @@ class EngineLoadMixin:
                 # healthy pipeline (observed live: 'promoting qwen-image (56% was on CPU)'
                 # 25s after its first load). Skip like embeddings.
                 if getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False) \
-                        or getattr(m, "is_tts", False):
+                        or getattr(m, "is_tts", False) or getattr(m, "is_stt", False):
                     continue
                 if self._model_cpu_frac(m) <= 0.02:
                     continue
@@ -2973,7 +3119,7 @@ class EngineLoadMixin:
         (media/embedding aren't served through the generate() barrier and never spill by mistake)."""
         if (getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False)
                 or getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False)
-                or getattr(m, "is_tts", False)):
+                or getattr(m, "is_tts", False) or getattr(m, "is_stt", False)):
             return None
         cur_cpu = self._model_cpu_frac(m)
         cur_n = len(m.plan.stages)
@@ -3018,7 +3164,7 @@ class EngineLoadMixin:
             return {"ok": False, "error": f"'{friendly}' is not resident"}
         if (getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False)
                 or getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False)
-                or getattr(m, "is_tts", False)):
+                or getattr(m, "is_tts", False) or getattr(m, "is_stt", False)):
             return {"ok": False, "error": "load-faster applies to text models only"}
         base = m.base or friendly
         async with self._juggle_lock:
@@ -3169,7 +3315,7 @@ class EngineLoadMixin:
         if int(a0.get("tp_size", 1) or 1) > 1:
             return   # TP is not adoptable — the sweep frees it after grace
         # ---- coverage check (outside the lock: read-only) ----
-        if kind in ("embedding", "t2i", "t2a", "tts"):
+        if kind in ("embedding", "t2i", "t2a", "tts", "stt"):
             picked = [reports[0]]                       # single-node kinds: any one report serves
         else:
             n_stages = int(a0.get("num_stages", 0) or 0)
@@ -3323,6 +3469,8 @@ class EngineLoadMixin:
             elif kind == "t2a":
                 lm.is_t2a = True
                 lm.t2a_offload = offload
+            elif kind == "stt":
+                lm.is_stt = True
             else:
                 lm.is_tts = True
                 lm.is_kokoro = True

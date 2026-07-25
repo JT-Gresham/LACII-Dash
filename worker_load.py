@@ -341,6 +341,52 @@ class WorkerLoadMixin:
                 return {"loaded_params": eng.loaded_params,
                         "loaded_bytes": eng.loaded_bytes,
                         "gpu_bytes": eng.gpu_bytes}
+            # STT load (#stt-serve): a Whisper ASR pipeline builds WHOLE on THIS node — the
+            # transcription sibling of tts/t2a. worker_stt is imported lazily with the same
+            # fetch-if-missing bridge; a REMOTE worker (no shared FS) snapshot_downloads the
+            # checkpoint from HF itself (#media-anywhere), exactly like the t2a path.
+            if a.get("kind") == "stt":
+                mdir = a.get("model_dir") or ""
+                if not (mdir and os.path.isdir(mdir)
+                        and os.path.exists(os.path.join(mdir, "config.json"))):
+                    def _fetch_whisper() -> str:
+                        from huggingface_hub import snapshot_download
+                        try:
+                            return snapshot_download(model_id)
+                        except Exception as _e:
+                            raise RuntimeError(
+                                f"remote stt worker can't fetch {model_id!r} from HuggingFace "
+                                f"({_e!r}) — a Whisper model served on a REMOTE worker must be a "
+                                "public HF repo id (co-located serving works from local disk)"
+                            ) from _e
+                    mdir = await asyncio.to_thread(_fetch_whisper)
+                try:
+                    import worker_stt
+                except Exception:
+                    from worker_update import _fetch_repo_file
+                    _src = _fetch_repo_file("worker_stt.py")
+                    if not _src:
+                        raise RuntimeError("worker_stt.py missing and unfetchable (CDN lag?) — retry")
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "worker_stt.py"), "wb") as _tf:
+                        _tf.write(_src)
+                    import worker_stt
+                device = a.get("device") or self.device
+                if device == "":
+                    device = self.device
+                self._building += 1
+                try:
+                    eng = await asyncio.to_thread(
+                        worker_stt.WhisperPipeline, mdir, device, "none", False)
+                    self.shards[model_id] = eng
+                finally:
+                    self._building -= 1
+                self.next_writers.pop(model_id, None)
+                self.next_peer[model_id] = "controller"
+                return {"loaded_params": eng.loaded_params,
+                        "loaded_bytes": eng.loaded_bytes,
+                        "gpu_bytes": eng.gpu_bytes,
+                        "media": eng.media_info()}   # #media-detail: device/params for /status
             self._building += 1   # mark BUSY across the build so reclaim/self-update can't kill it
             try:
                 shard = await asyncio.to_thread(self._build_shard, base, model_id, a)
@@ -733,6 +779,40 @@ class WorkerLoadMixin:
                 await reply({"type": "t2a_err", "req_id": rid, "model_id": mid,
                              "error": repr(exc)})
             print(f"[t2a] generate FAILED: {exc!r}", flush=True)
+
+    async def handle_stt_gen(self, msg: dict, reply) -> None:
+        """#stt-serve: run ONE transcription on this worker's resident WhisperPipeline and mirror
+        the result over the control link. Dispatched as a TASK by command_loop (long audio takes
+        many seconds — awaiting inline would block unload/ping handling), so the reply is keyed by
+        req_id. The audio arrives as base64 (`audio_b64`); the TEXT result returns in `stt_done`
+        (no shared-FS path — a transcript is small, so it rides the control reply and an STT model
+        works #media-anywhere). _building marks the worker busy so self-update/reclaim won't kill a
+        live transcription."""
+        import base64
+        rid = msg.get("req_id")
+        mid = msg.get("model_id")
+        eng = self.shards.get(mid)
+        if eng is None or getattr(eng, "kind", "") != "stt":
+            await reply({"type": "stt_err", "req_id": rid, "model_id": mid,
+                         "error": "stt model not resident on this worker"})
+            return
+        try:
+            audio = base64.b64decode(msg.get("audio_b64") or "")
+            self._building += 1
+            try:
+                text, secs, audio_s = await asyncio.to_thread(
+                    eng.transcribe, audio,
+                    str(msg.get("language") or ""), str(msg.get("task") or "transcribe"))
+            finally:
+                self._building -= 1
+            await reply({"type": "stt_done", "req_id": rid, "model_id": mid,
+                         "text": text, "seconds": round(secs, 1),
+                         "audio_s": round(audio_s, 1)})   # #media-detail: for RTF in the modal
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await reply({"type": "stt_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[stt] transcribe FAILED: {exc!r}", flush=True)
 
     async def handle_pack(self, msg: dict) -> dict:
         """#distributed-packing Inc 1b/3b: pack ONE shard-cache unit FOR the controller (offloads the

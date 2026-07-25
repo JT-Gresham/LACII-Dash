@@ -217,6 +217,25 @@ def _is_kokoro_dir(d: str) -> bool:
         return False
 
 
+def _is_whisper_dir(d: str) -> bool:
+    """A Whisper ASR checkpoint (#stt): a config.json whose model_type is 'whisper' (or whose
+    architectures include WhisperForConditionalGeneration). Recognized explicitly so the load path
+    routes it to the single-node speech-to-TEXT leaf (_load_stt_locked) instead of the decoder-only
+    LLM pipeline — Whisper is an encoder-decoder seq2seq model the layer-split planner can't drive."""
+    try:
+        p = os.path.join(d, "config.json")
+        if not os.path.exists(p):
+            return False
+        with open(p, encoding="utf-8") as fh:
+            c = json.load(fh)
+        if str(c.get("model_type") or "").lower() == "whisper":
+            return True
+        return any("WhisperForConditionalGeneration" in str(a)
+                   for a in (c.get("architectures") or []))
+    except Exception:
+        return False
+
+
 def _kokoro_cache_dir(model_id: str):
     """The HF-cache snapshot dir for a Kokoro repo, iff it's COMPLETE (.pth + voices),
     else None. Kokoro is served straight from the cache (never migrated to models/) —
@@ -651,6 +670,11 @@ def _spec_from_config(model_dir: str, name: str) -> Optional[ModelSpec]:
         with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
             c = json.load(fh)
     except Exception:
+        return None
+    # #stt: a Whisper ASR checkpoint is an encoder-decoder seq2seq model, NOT a decoder-only LLM —
+    # it has no pipeline-splittable spec. Return None so the load path routes it to the single-node
+    # speech-to-text leaf (_load_stt_locked), exactly like Kokoro / ACE-Step / diffusers.
+    if str(c.get("model_type") or "").lower() == "whisper":
         return None
     tc = c.get("text_config")
     if tc is None:                                 # Qwen2.5-Omni nests text dims deeper

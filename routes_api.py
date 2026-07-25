@@ -439,6 +439,78 @@ def register(app):
         return await _count_tokens_anthropic(body)
 
     # ---- OpenAI-compatible Text-To-Speech (Kokoro TTS; Omni Talker fallback) ----
+    async def _run_transcription(req, default_task: str):
+        """#stt-serve: shared body for /v1/audio/transcriptions + /translations. Accepts the
+        OpenAI multipart form (file/model/language/response_format) AND, for a dependency-free
+        test path, the raw audio as the request body with ?model=... query params. Routes to the
+        dedicated single-node Whisper leaf (engine.stt_transcribe)."""
+        ip = _client_ip(req)
+        ctype = (req.headers.get("content-type") or "").lower()
+        qp = req.query_params
+        model = qp.get("model") or ""
+        language = qp.get("language") or ""
+        task = qp.get("task") or default_task
+        fmt = (qp.get("response_format") or "json").lower()
+        audio_bytes = b""
+        if "multipart/form-data" in ctype:
+            try:
+                form = await req.form()
+            except Exception as exc:
+                return JSONResponse({"error": {"message": "multipart parse failed (is "
+                    f"python-multipart installed on the controller?): {exc}"}}, status_code=400)
+            f = form.get("file")
+            if f is not None and hasattr(f, "read"):
+                audio_bytes = await f.read()
+            model = model or str(form.get("model") or "")
+            language = language or str(form.get("language") or "")
+            task = str(form.get("task") or task)
+            fmt = str(form.get("response_format") or fmt).lower()
+        else:
+            # Non-multipart: the raw request body IS the audio (curl --data-binary @clip.wav),
+            # with model/language/task as query params — no python-multipart dependency needed.
+            audio_bytes = await req.body()
+        if not audio_bytes:
+            return JSONResponse({"error": {"message": "no audio provided — send a multipart "
+                "'file' field or POST the raw audio bytes as the request body"}}, status_code=400)
+        if not model:
+            return JSONResponse({"error": {"message": "'model' is required (a Whisper model, "
+                "e.g. whisper-large-v3-turbo)"}}, status_code=400)
+        try:
+            friendly = resolve_model_name(model)
+        except Exception as exc:
+            return JSONResponse({"error": {"message": str(exc)}}, status_code=404)
+        try:
+            try:
+                await engine.ensure_loaded(friendly, 0, auto_load=True)
+            except Exception as exc:
+                return _media_load_error(exc, friendly, "stt")
+            text, meta = await engine.stt_transcribe(friendly, audio_bytes,
+                                                     language=language, task=task)
+            print(f"[v1/audio/transcriptions] {friendly}: {meta.get('audio_s')}s audio -> "
+                  f"{len(text)} chars ({task}) from {ip}")
+            if fmt == "text":
+                return Response(content=text, media_type="text/plain; charset=utf-8")
+            return JSONResponse({"text": text})
+        except Exception as exc:
+            import traceback
+            print(f"[v1/audio/transcriptions] error: {exc!r}\n{traceback.format_exc()[-1200:]}")
+            return JSONResponse({"error": {"message": f"{type(exc).__name__}: {exc}"}},
+                                status_code=500)
+
+    @app.post("/v1/audio/transcriptions")
+    async def v1_audio_transcriptions(req: Request):
+        """OpenAI /v1/audio/transcriptions: multipart {file, model, language, response_format}
+        -> {"text": ...}. Routes to the dedicated single-node Whisper leaf (#stt-serve). Also
+        accepts the raw audio as the request body with ?model=... (a python-multipart-free path
+        for curl/testing). response_format 'text' returns bare text; anything else returns JSON."""
+        return await _run_transcription(req, "transcribe")
+
+    @app.post("/v1/audio/translations")
+    async def v1_audio_translations(req: Request):
+        """OpenAI /v1/audio/translations: same shape as transcriptions, but Whisper translates the
+        speech to ENGLISH (task=translate)."""
+        return await _run_transcription(req, "translate")
+
     @app.post("/v1/audio/speech")
     async def v1_audio_speech(req: Request):
         """OpenAI /v1/audio/speech: {model, input, voice, speed, response_format}. Speaks

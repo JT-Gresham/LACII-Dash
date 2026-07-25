@@ -4,6 +4,19 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## Release 0.3.2 — speech-to-text (Whisper)
+
+- **#stt-serve** — InfiniteModel now transcribes speech. A Whisper checkpoint
+  (`WhisperForConditionalGeneration`) loads as a single-node **media leaf** — the ASR sibling of
+  Kokoro TTS (`#tts-serve`) and ACE-Step music (`#t2a-serve`) — and never touches the decoder-only
+  pipeline (Whisper is a small encoder-decoder seq2seq model). New OpenAI-compatible endpoints
+  `POST /v1/audio/transcriptions` and `/v1/audio/translations` (multipart `file`, or raw audio in the
+  request body with `?model=` for a python-multipart-free path; `response_format=text` returns bare
+  text). The worker decodes the audio (soundfile → 16 kHz mono, chunked at Whisper's 30 s window) and
+  returns the transcript over the control link, so an STT model works **#media-anywhere** on any
+  capable worker (a remote one `snapshot_download`s the checkpoint itself). Detected by config
+  `model_type: whisper`; badged `stt`; the worker control reader was widened to carry the audio frame.
+
 ## Release 0.3.1 — multi-controller federation
 
 First version tagged with a semantic version (earlier builds used internal `0.2-m4cNNN` deploy

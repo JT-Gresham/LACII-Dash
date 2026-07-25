@@ -498,6 +498,12 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 if _fut is not None and not _fut.done():
                     _fut.set_result(msg)
                 getattr(engine, "_tts_progress", {}).pop(msg.get("req_id"), None)
+            elif mtype in ("stt_done", "stt_err"):
+                # #stt-serve: final transcription result — resolve the waiting stt_transcribe future.
+                _pend = getattr(engine, "_stt_pending", None) or {}
+                _fut = _pend.pop(msg.get("req_id"), None)
+                if _fut is not None and not _fut.done():
+                    _fut.set_result(msg)
             elif mtype == "t2a_step":
                 # #t2a-serve: per-step music render progress (dashboard "step i/n"); stamps the
                 # progress time so a wedged render is distinguishable from a slow one.

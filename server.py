@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.1"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.2"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -126,6 +126,7 @@ def _fetch_repo_file(fname: str):
 EXTRA_UPDATE_FILES: list[str] = ["worker_t2i.py",   # #t2i-serve: worker diffusion engine
                                  "worker_tts.py",   # #tts-serve: worker Kokoro speech engine
                                  "worker_t2a.py",   # #t2a-serve: worker ACE-Step music engine
+                                 "worker_stt.py",   # #stt-serve: worker Whisper transcription engine
                                  "gptq_pack.py",       # #38: calibrated int2 compile (controller-only)
                                  "calib_corpus.txt",   # #38: its bundled calibration text
                                  "wire.py", "dashboard_html.py", "placement.py", "shards.py",
@@ -517,6 +518,7 @@ class Node:
     # GPU, not just the co-located one. False for workers that never reported it (pre-feature).
     can_t2a: bool = False
     can_t2i: bool = False
+    can_stt: bool = False
     # #wire-caps: wire-protocol capability set the worker advertised at registration (e.g.
     # {"ntensor"}). EMPTY for old workers that sent no 'caps' field — every capability-gated
     # wire feature then stays OFF for any chain through this node (mixed fleets degrade to the
@@ -634,7 +636,7 @@ class Node:
             "client_version": self.client_version, "wire": self.wire,
             "age_s": round(self.age, 1), "alive": self.alive,
             "can_infer": self.can_infer, "incapable_reason": self.incapable_reason,
-            "can_t2a": self.can_t2a, "can_t2i": self.can_t2i,
+            "can_t2a": self.can_t2a, "can_t2i": self.can_t2i, "can_stt": self.can_stt,
             "caps": sorted(self.caps),   # #wire-caps: advertised wire capabilities (/status)
             "vram_total_gb": round(self.vram_total_gb, 2),
             "vram_used_gb": round(self.vram_used_gb, 2),
@@ -680,6 +682,7 @@ class Registry:
                 cores=int(reg.get("cores", 0)),
                 can_t2a=bool(reg.get("can_t2a", False)),
                 can_t2i=bool(reg.get("can_t2i", False)),
+                can_stt=bool(reg.get("can_stt", False)),
                 # #wire-caps: record the worker's advertised wire capabilities. Absent/unknown
                 # field (old worker) -> empty frozenset -> every gated wire feature stays off.
                 caps=frozenset(str(c) for c in (reg.get("caps") or [])),
@@ -1482,7 +1485,8 @@ from model_store import (MODELS_DIR, _safe_name, _dir_has_model, _controller_mod
                          _READY_CACHE, _invalidate_ready_cache, _purge_hf_cache,
                          gc_redundant_cache, delete_model_cache,
                          convert_gguf_to_model_dir,
-                         _is_diffusers_dir, _is_kokoro_dir, _tree_weight_bytes)   # noqa: E402,F401
+                         _is_diffusers_dir, _is_kokoro_dir, _is_whisper_dir,   # noqa: E402,F401
+                         _tree_weight_bytes)
 model_store.set_hf_token_provider(lambda: HF_TOKEN)
 # GGUF source lookup: a target (HF repo) in GGUF_FILES is normalized to safetensors at acquisition
 # instead of pulled as safetensors. Set after GGUF_FILES is populated by load_custom_models() too,

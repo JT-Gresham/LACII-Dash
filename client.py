@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.1"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.2"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -827,7 +827,8 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py",
                                  "worker_quant.py",   # code-split Inc 10: quant/kernel family
                                  "worker_t2i.py",   # #t2i-serve: diffusion image engine (lazy import)
                                  "worker_tts.py",   # #tts-serve: Kokoro speech engine (lazy import)
-                                 "worker_t2a.py"]   # #t2a-serve: ACE-Step music engine (lazy import)
+                                 "worker_t2a.py",   # #t2a-serve: ACE-Step music engine (lazy import)
+                                 "worker_stt.py"]   # #stt-serve: Whisper transcription engine (lazy import)
 # (#distributed-packing) synced like a module — shards.pack_unit_tensors is the shared packer the
 # remote-pack handler calls, so a worker-packed cache unit is bit-identical to a controller-compiled one.
 
@@ -1003,6 +1004,12 @@ def _enable_keepalive(writer: asyncio.StreamWriter) -> None:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
 
 
+# #stt-serve / #media: the control link now carries multi-MB frames (audio bytes IN for a
+# transcription; base64 WAV OUT for t2a). asyncio's default StreamReader readline() cap is 64 KB,
+# which a >48 KB frame overruns (LimitOverrunError). Match the controller's _CTRL_READER_LIMIT.
+_CTRL_READER_LIMIT = 128 * 1024 * 1024
+
+
 async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                   on_connected) -> None:
     """One connect → register → {heartbeat, command-reader} lifecycle. Returns on
@@ -1012,7 +1019,8 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
     local_addr = _local_addr()
     try:
         reader, writer = await asyncio.open_connection(
-            args.controller, args.control_port, local_addr=local_addr)
+            args.controller, args.control_port, local_addr=local_addr,
+            limit=_CTRL_READER_LIMIT)
     except OSError:
         if local_addr is None:
             raise
@@ -1021,7 +1029,8 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
         # clear the global so data-plane dials stop trying the bad source too. If THIS
         # also fails it's a real outage and propagates to the reconnect backoff.
         global _ROUTE_SRC
-        reader, writer = await asyncio.open_connection(args.controller, args.control_port)
+        reader, writer = await asyncio.open_connection(args.controller, args.control_port,
+                                                       limit=_CTRL_READER_LIMIT)
         print(f"[net] source-bind to {_ROUTE_SRC} failed; using OS-default route for all traffic")
         _ROUTE_SRC = ""
     _enable_keepalive(writer)
@@ -1121,6 +1130,10 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     # #t2a-serve: a music render takes many seconds — dispatch as a task so this
                     # loop keeps serving unload/ping; handler replies keyed by req_id.
                     asyncio.create_task(worker.handle_t2a_gen(msg, reply))
+                elif mtype == "stt_transcribe":
+                    # #stt-serve: a transcription (esp. long audio on CPU) takes many seconds —
+                    # dispatch as a task so this loop keeps serving; handler replies keyed by req_id.
+                    asyncio.create_task(worker.handle_stt_gen(msg, reply))
                 elif mtype == "unload":
                     await worker.handle_unload(msg.get("model_id"), tenant)
                 elif mtype == "handoff":        # #handoff: move this node to another controller

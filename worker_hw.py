@@ -493,6 +493,7 @@ def build_registration(args: argparse.Namespace) -> dict:
             return False
     reg["can_t2a"] = _has("acestep")
     reg["can_t2i"] = _has("diffusers")
+    reg["can_stt"] = _has("transformers") and _has("soundfile")   # #stt-serve: Whisper ASR leaf
     # #wire-caps: advertise this build's wire-protocol capability set (e.g. ["ntensor"]) so the
     # controller can gate new wire formats per node (registry.node_caps). Read via getattr off
     # the wire MODULE — an old wire.py (per-file self-update convergence window) has no
