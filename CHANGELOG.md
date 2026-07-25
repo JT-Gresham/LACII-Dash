@@ -18,7 +18,11 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   `model_type: whisper`; badged `stt`; the worker control reader was widened to carry the audio frame.
   Placement honors the per-node tier opt-out like the t2a filter (audit #28): a node with **both**
   tiers disabled in `NODE_CONFIG` (a deliberately benched box — e.g. an off-limits GPU) never
-  receives a transcription, even if it advertises `can_stt`.
+  receives a transcription, even if it advertises `can_stt`. Device: CUDA runs on the GPU (fast,
+  warms on load). gfx1151/ROCm also runs on the GPU — but its first GPU inference JIT-compiles the
+  MIOpen conv kernels (~8 min, uncached on TheRock 7.13), so the load is slow ONCE per worker while
+  transcription is then GPU-fast (RTF ~1–3×); the warmup is deferred off the load so it doesn't race
+  a restart. `INFINITEMODEL_STT_CPU=1` forces the instant-load / ~30×-realtime CPU path instead.
 
 ## Release 0.3.1 — multi-controller federation
 
