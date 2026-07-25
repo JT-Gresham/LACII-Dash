@@ -16,6 +16,9 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   returns the transcript over the control link, so an STT model works **#media-anywhere** on any
   capable worker (a remote one `snapshot_download`s the checkpoint itself). Detected by config
   `model_type: whisper`; badged `stt`; the worker control reader was widened to carry the audio frame.
+  Placement honors the per-node tier opt-out like the t2a filter (audit #28): a node with **both**
+  tiers disabled in `NODE_CONFIG` (a deliberately benched box — e.g. an off-limits GPU) never
+  receives a transcription, even if it advertises `can_stt`.
 
 ## Release 0.3.1 — multi-controller federation
 

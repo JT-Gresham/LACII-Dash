@@ -2116,8 +2116,14 @@ class EngineLoadMixin:
         # worker advertising the Whisper runtime (can_stt; it fetches from HF). Prefer, in order,
         # a can_stt node, then a co-located one, then the most VRAM — so a remote GPU with the
         # runtime beats a co-located CPU box, but a co-located node still serves with no can_stt.
+        # #media-node-optout: honor the dashboard's per-node tier toggles exactly like the t2a
+        # filter (audit #28) — a node with BOTH tiers disabled in NODE_CONFIG is fully opted out
+        # and must NOT receive transcriptions. This is what keeps stt OFF furnace (RTX 5090,
+        # user-declared OFF-LIMITS, both tiers off) even though it advertises can_stt. A single
+        # disabled tier still admits the node; default (no NODE_CONFIG entry) is both-on -> unchanged.
         cand = [n for n in registry.alive_sorted()
-                if n.can_infer and (_is_colo(n) or getattr(n, "can_stt", False))]
+                if n.can_infer and (n.ram_enabled or n.vram_enabled)
+                and (_is_colo(n) or getattr(n, "can_stt", False))]
         if not cand:
             raise RuntimeError("no worker can serve the stt (Whisper) model — need a co-located "
                                "worker or one advertising the transcription runtime (can_stt)")
