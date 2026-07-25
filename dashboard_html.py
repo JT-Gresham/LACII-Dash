@@ -1422,7 +1422,24 @@ async function save(){
 }
 async function setTier(host,tier,on){ try{ await post('/nodeconfig?host='+encodeURIComponent(host)+'&'+tier+'='+(on?'true':'false')); msg('#node-msg',host+' '+tier+'='+on); }catch(e){ msg('#node-msg',String(e.message||e),1);} }
 async function bulk(tier,on){ try{ await post('/nodeconfig_all?tier='+tier+'&enabled='+(on?'true':'false')); msg('#node-msg','all '+tier+'='+on); load(); }catch(e){ msg('#node-msg',String(e.message||e),1);} }
-async function ctlAct(path,confirmMsg){ if(!confirm(confirmMsg))return; try{ await post(path); msg('#ctl-msg','sent — controller restarting if applicable'); }catch(e){ msg('#ctl-msg',String(e.message||e),1);} }
+async function ctlAct(path,confirmMsg){
+  if(!confirm(confirmMsg))return;
+  async function run(p){ const r=await fetch(p,{method:'POST'}); let j={}; try{ j=JSON.parse(await r.text()); }catch(e){} return {ok:r.ok,status:r.status,j:j}; }
+  try{
+    let res=await run(path);
+    // #force-restart: the in-progress guard (409 load_in_progress / render_in_progress) is NOT a
+    // dead end — a restart/update that would abort an in-flight load/compile/render is refused, but
+    // force=1 overrides it. Offer that instead of just surfacing the 409, so the operator can force
+    // past a WEDGED load that never clears on its own.
+    if(!res.ok && res.status===409 && res.j && (res.j.status==='load_in_progress'||res.j.status==='render_in_progress')){
+      if(confirm('Blocked: '+(res.j.reason||'a load/compile/render is in progress')+'\n\nForce it anyway? This ABORTS the in-flight load/render.')){
+        res=await run(path+(path.indexOf('?')>=0?'&':'?')+'force=1');
+      } else { msg('#ctl-msg','cancelled — nothing restarted',1); return; }
+    }
+    if(!res.ok || (res.j && res.j.ok===false)) throw new Error((res.j&&(res.j.error||res.j.reason))||('HTTP '+res.status));
+    msg('#ctl-msg','sent — controller restarting if applicable');
+  }catch(e){ msg('#ctl-msg',String(e.message||e),1); }
+}
 FIELDS.concat(TOGS).forEach(k=>{ const el=$('#'+k); if(el){ el.addEventListener('input',()=>DIRTY.add(k)); el.addEventListener('change',()=>DIRTY.add(k)); } });
 load(); setInterval(load,5000);
 </script>
