@@ -1094,12 +1094,12 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                         # (a single shared future cross-resolved on a co-loaded node).
                         await reply({"type": "ready", "node_id": node_id,
                                      "model_id": msg.get("model_id"), **info})
-                        if msg.get("kind") == "embedding":   # no layer range — whole encoder on one node
-                            print(f"[load] embedding {msg.get('model_id')} "
-                                  f"({info['loaded_bytes']/GB:.2f} GB)")
-                        elif msg.get("kind") == "t2i":       # no layer range — whole pipeline on this node
-                            print(f"[load] t2i {msg.get('model_id')} "
-                                  f"({info['loaded_bytes']/GB:.2f} GB)")
+                        # Single-node whole-model kinds (embedding + every media leaf: t2i/t2a/tts/
+                        # stt) have NO layer range — the load message carries no layer_start/_end, so
+                        # they must NOT hit the pipeline log below (it KeyError'd on a media load).
+                        if msg.get("kind") in ("embedding", "t2i", "t2a", "tts", "stt"):
+                            print(f"[load] {msg.get('kind')} {msg.get('model_id')} "
+                                  f"({info.get('loaded_bytes', 0)/GB:.2f} GB)")
                         else:
                             print(f"[load] stage {msg.get('stage')} "
                                   f"layers {msg['layer_start']}-{msg['layer_end']} "

@@ -101,9 +101,16 @@ class WhisperPipeline:
         want = str(device or "")
         if not want or "gpu" in want:
             want = "cuda" if torch.cuda.is_available() else "cpu"
-        # Build on the requested device + a tiny warmup. If the GPU path raises a
-        # HIP/MIOpen kernel-COMPILE error (the gfx1151 bug that also bites Kokoro),
-        # fall back to CPU transparently — Whisper is small, correctness > speed.
+        # gfx1151 / ROCm: Whisper's conv + attention JIT-compile MIOpen kernels on first use, which
+        # takes MINUTES on Strix Halo (the same MIOpen pain that sends Kokoro to CPU) — a ~500 s
+        # "load" that races the controller and is unusable as a GPU path. Whisper-turbo is 809M and
+        # fine on CPU, so on ROCm run it on CPU. NVIDIA/CUDA keeps the fast GPU path (no MIOpen).
+        if want.startswith("cuda") and getattr(torch.version, "hip", None):
+            print("[stt] ROCm detected — running Whisper on CPU (MIOpen GPU JIT is impractically "
+                  "slow on gfx1151); NVIDIA/CUDA nodes keep the GPU path", flush=True)
+            want = "cpu"
+        # Build on the requested device + a tiny warmup. If a GPU path still raises a HIP/MIOpen
+        # kernel-COMPILE error, fall back to CPU transparently — Whisper is small, correctness > speed.
         self.device = self._build_and_warm(want)
 
         self.loaded_params = sum(p.numel() for p in self.model.parameters())
