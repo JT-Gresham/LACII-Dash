@@ -101,17 +101,24 @@ class WhisperPipeline:
         want = str(device or "")
         if not want or "gpu" in want:
             want = "cuda" if torch.cuda.is_available() else "cpu"
-        # gfx1151 / ROCm: Whisper's conv + attention JIT-compile MIOpen kernels on first use, which
-        # takes MINUTES on Strix Halo (the same MIOpen pain that sends Kokoro to CPU) — a ~500 s
-        # "load" that races the controller and is unusable as a GPU path. Whisper-turbo is 809M and
-        # fine on CPU, so on ROCm run it on CPU. NVIDIA/CUDA keeps the fast GPU path (no MIOpen).
-        if want.startswith("cuda") and getattr(torch.version, "hip", None):
-            print("[stt] ROCm detected — running Whisper on CPU (MIOpen GPU JIT is impractically "
-                  "slow on gfx1151); NVIDIA/CUDA nodes keep the GPU path", flush=True)
-            want = "cpu"
-        # Build on the requested device + a tiny warmup. If a GPU path still raises a HIP/MIOpen
-        # kernel-COMPILE error, fall back to CPU transparently — Whisper is small, correctness > speed.
-        self.device = self._build_and_warm(want)
+        # gfx1151 / ROCm: Whisper stays on the GPU (decode is fast once the kernels are warm), but
+        # the FIRST GPU inference JIT-compiles conv/attention kernels — ~8 min on this chip, and (on
+        # TheRock ROCm 7.13) the result is NOT cached to disk, so a warmup on the load would pay it
+        # every time AND race the controller restart. So on ROCm we DEFER the warmup: the load
+        # returns instantly, the first transcribe pays the JIT once, and the compiled kernels then
+        # stay hot in-process for the worker's lifetime (a restart re-pays it — rare). NVIDIA/CUDA
+        # warms on load (fast there, no MIOpen). Set INFINITEMODEL_STT_CPU=1 to force CPU instead
+        # (instant load, but ~30x-realtime transcribes on gfx1151).
+        _rocm = bool(want.startswith("cuda") and getattr(torch.version, "hip", None))
+        if want.startswith("cuda") and os.environ.get("INFINITEMODEL_STT_CPU") == "1":
+            print("[stt] INFINITEMODEL_STT_CPU=1 — forcing Whisper onto CPU", flush=True)
+            want, _rocm = "cpu", False
+        elif _rocm:
+            print("[stt] ROCm/gfx1151 — Whisper on GPU with warmup DEFERRED to the first transcribe "
+                  "(the one-time ~8-min MIOpen JIT won't block the load)", flush=True)
+        # Build on the requested device (+ warmup unless deferred on ROCm). A GPU path that raises a
+        # HIP/MIOpen kernel-COMPILE error still falls back to CPU transparently.
+        self.device = self._build_and_warm(want, warm=not _rocm)
 
         self.loaded_params = sum(p.numel() for p in self.model.parameters())
         self.loaded_bytes = sum(p.numel() * p.element_size()
@@ -124,7 +131,7 @@ class WhisperPipeline:
               f"({self.loaded_params / 1e6:.0f}M params, "
               f"{self.loaded_bytes / GB:.2f} GB)", flush=True)
 
-    def _build_and_warm(self, device: str) -> str:
+    def _build_and_warm(self, device: str, warm: bool = True) -> str:
         import torch
         import numpy as np
 
@@ -135,9 +142,10 @@ class WhisperPipeline:
 
         try:
             self.model = _build(device)
-            if str(device).startswith("cuda"):
+            if warm and str(device).startswith("cuda"):
                 # Warm the encoder/decoder kernels on 0.2 s of silence — this is where
-                # gfx1151 MIOpen JIT-fails if it's going to.
+                # gfx1151 MIOpen JIT-fails if it's going to. Skipped when the caller defers the
+                # warmup (ROCm: the ~8-min JIT rides the first real transcribe instead of the load).
                 self._run(np.zeros(SR // 5, dtype=np.float32), "", "transcribe")
             return device
         except Exception as exc:
