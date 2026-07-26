@@ -199,6 +199,27 @@ def register(app):
         target = MODELS[friendly][0] if friendly in MODELS else friendly
         spec = resolve_spec(target)
         if spec is None:
+            # #media-plan: a KNOWN registry model with no transformer ModelSpec is a MEDIA model
+            # (Whisper STT, MusicGen, ACE-Step, Kokoro TTS). These are never pipeline-planned — they
+            # load SINGLE-NODE on a worker advertising the matching runtime, and the exact kind is
+            # only confirmed from the downloaded config, so there is no fit-preview to compute. The
+            # old code fell through to a red "unknown model 'whisper-large-v3-turbo'" for a model
+            # that IS known (the load-screen warning the user saw). Report the media kind instead —
+            # ok:true + basis renders as a normal 'plan:' line (the dashboard shows no error, and the
+            # empty stages/absent mem skip the footprint table). A genuinely unknown name still 404s.
+            _s = f"{friendly} {target}".lower()
+            _mk, _need = (
+                ("stt (Whisper)", "can_stt") if "whisper" in _s else
+                ("t2music (MusicGen)", "can_t2music") if "musicgen" in _s else
+                ("t2a (ACE-Step)", "can_t2a") if ("ace-step" in _s or "acestep" in _s
+                                                  or "ace_step" in _s) else
+                ("tts (Kokoro)", "co-located") if "kokoro" in _s else
+                ("", ""))
+            if _mk:
+                return JSONResponse({"ok": True, "media": True, "friendly": friendly, "stages": [],
+                                     "basis": f"{_mk} media model — single-node, placed at load on a "
+                                              f"worker advertising the {_need} runtime "
+                                              f"(media models have no fit-preview)."})
             return JSONResponse({"ok": False, "error": f"unknown model '{model}'"},
                                 status_code=404)
         # Measure REAL safetensors bytes so MoE / any non-dense arch sizes correctly in the
