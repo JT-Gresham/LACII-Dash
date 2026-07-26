@@ -212,10 +212,21 @@ surface, and the dashboard.
   `can_t2a=False` on purpose so the planner never routes music to it. Three walls: ACE-Step
   hard-depends on `torchaudio`, and the ROCm/TheRock builds ship **no `torchaudio` matching that
   torch ABI** (installing one from PyPI/CUDA breaks the venv, LLM stack included); its DiT + DCAE
-  kernels JIT through **MIOpen**, which is flaky-to-broken on gfx1151 (the same wall that pushes
-  **Kokoro TTS** to CPU here); and there is **no CPU fallback** — ACE-Step's diffusion does not run
+  kernels JIT through **MIOpen**, which is flaky-to-broken on gfx1151 at diffusion-scale conv
+  workloads; and there is **no CPU fallback** — ACE-Step's diffusion does not run
   usably on CPU. Serve music from a **CUDA** GPU instead, locally or anywhere in the pool via
   `#media-anywhere`. Full rationale in [T2A.md](T2A.md).
+- **Kokoro TTS now loads and runs on the gfx1151 GPU here** (verified 2026-07-26 on TheRock ROCm
+  7.13 / torch `2.12.0a0+rocm7.13` / kokoro 0.7.16): the earlier LSTM/dropout MIOpen bug
+  (`MIOpenDropoutHIP.cpp '<utility>' not found`) that *forced* CPU **no longer reproduces**, so the
+  leaf is no longer pushed to CPU by a compile failure. **Performance caveat — GPU is not a win for
+  Kokoro here:** it measured ~1.3× realtime *warm* (slower than realtime), plus a one-time
+  per-sequence-length MIOpen kernel-select on each new input length (uncached across restarts, like
+  Whisper's conv encoder). For an 82M model the Strix Halo **CPU** was previously measured *faster*
+  and steadier (~0.5× realtime, no per-shape JIT), so CPU remains a sensible/likely-preferable
+  device on this arch. `_load_tts_locked` currently defaults to the co-located GPU and only
+  auto-falls-back to CPU on a HIP compile error — there is no CPU-force lever for tts yet (unlike
+  stt's `INFINITEMODEL_STT_CPU=1`).
 - **CUDA-graph decode is broken on TheRock rocm7.13** — capture/replay run but replay computes
   wrong logits; the first-decode self-check auto-disables it (serving stays eager and correct).
   Leave `INFINITEMODEL_CUDA_GRAPH` unset on ROCm; details in
