@@ -68,7 +68,9 @@ Nothing heavy — the two deps are already needed by Whisper STT:
 pip install transformers soundfile
 ```
 
-Restart the worker (or `POST /refresh_backends`); it will then advertise `can_t2music=true`.
+Then **restart the worker** — it advertises `can_t2music=true` on (re)registration. Note `POST
+/refresh_backends` re-probes only the **controller's** own backends, *not* a worker's capability, so
+it will **not** flip `can_t2music` — the worker process must restart.
 NVIDIA and CPU work out of the box. On **AMD ROCm** the transformer runs on the GPU; the first render
 JIT-compiles EnCodec's decode through MIOpen once (see [ROCM.md](ROCM.md)).
 

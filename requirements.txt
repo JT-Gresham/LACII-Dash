@@ -13,6 +13,13 @@
 # --- Controller (server.py) ---
 fastapi
 uvicorn
+# python-multipart: FastAPI/starlette form parsing for audio-file UPLOADS — specifically
+# POST /v1/audio/transcriptions (Whisper STT). Without it that endpoint 400s ("python-multipart
+# must be installed to use form parsing"). starlette imports it at STARTUP, so install it BEFORE
+# launching the controller (or restart the controller after — a live-installed package is invisible
+# until the process re-imports). Text endpoints + /v1/audio/music (JSON in, audio out) do NOT need
+# it — only file uploads do.
+python-multipart  # optional — required ONLY for Whisper STT transcription (audio upload)
 
 # --- Controller (server.py) — Multimodal (vision + audio), CONTROLLER-SIDE only ---
 # Image/audio models (Qwen2.5-VL, Gemma-4 vision unified+tower, Pixtral/Mistral3, Qwen2.5-Omni)
@@ -39,6 +46,14 @@ psutil
 # huggingface_hub
 # einops         # required by some models' trust_remote_code (e.g. nomic-embed-text encoder)
 # nvidia-ml-py   # optional, only for VRAM reporting on CUDA nodes
+# soundfile      # optional — REQUIRED on a worker that serves Whisper STT or MusicGen t2music.
+#                # A worker advertises can_stt / can_t2music only when BOTH `transformers` AND
+#                # `soundfile` import (an import-free find_spec probe at registration); the worker
+#                # writes the finished WAV with soundfile (no torchaudio). After installing it,
+#                # RESTART the worker — capability is computed ONCE at registration, and
+#                # POST /refresh_backends re-probes only the CONTROLLER, never a worker. One dep
+#                # covers both STT and t2music. (The soundfile wheel bundles libsndfile on the
+#                # common Linux/Windows platforms, so usually no separate system lib is needed.)
 #
 # AMD GPU (ROCm) worker: do NOT use a CPU/CUDA torch — install a ROCm build matched to
 # your GPU arch. For Strix Halo (gfx1151) the generic download.pytorch.org wheels crash
