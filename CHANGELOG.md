@@ -28,6 +28,12 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 - **Add-model `.bin` fix** — `+ Add model` / `POST /add_model` now fetches `pytorch_model.bin` for
   repos that ship **no** safetensors (gated on that, so ordinary checkpoints never pull a redundant
   `.bin`) — a MusicGen model now downloads its weights instead of just `config.json`.
+- **Duration cap (0.3.7)** — MusicGen's audio-token decoder has a fixed position table
+  (`decoder.max_position_embeddings` = 2048 ≈ 40 s at 50 Hz). Requesting more (e.g. 45 s) indexed
+  **past** it → a **CUDA device-side assert that wedges the worker** (its CUDA context is then
+  corrupt until restart), or a CPU crash. Renders now hard-clamp `max_new_tokens` **and** the
+  requested duration to the model's real ceiling, and the dashboard exposes that ceiling as the
+  duration input's `max`.
 
 ## Release 0.3.2 — speech-to-text (Whisper)
 

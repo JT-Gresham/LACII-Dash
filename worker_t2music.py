@@ -99,6 +99,16 @@ class MusicGenPipeline:
         self.sample_rate = int(getattr(ae, "sampling_rate", 32000) or 32000)
         # tokens/sec of generated audio — duration -> max_new_tokens. EnCodec@32k = 50 Hz.
         self.frame_rate = float(getattr(ae, "frame_rate", 50.0) or 50.0)
+        # #t2music-cap: the audio-token decoder has a FIXED position table
+        # (decoder.max_position_embeddings, 2048 for MusicGen). Its delay pattern adds
+        # num_codebooks-1 positions + a BOS, so generating past ~that many tokens indexes OUT of the
+        # table -> a CUDA device-side assert (which then WEDGES the worker's CUDA context) or a CPU
+        # crash. Clamp EVERY render to this hard ceiling. ~2036 tokens ≈ 40 s at 50 Hz.
+        _dec = getattr(self.model.config, "decoder", None)
+        _pos = int(getattr(_dec, "max_position_embeddings", 2048) or 2048)
+        self.num_codebooks = int(getattr(_dec, "num_codebooks", 4) or 4)
+        self.max_tokens = max(16, _pos - self.num_codebooks - 8)
+        self.max_duration_s = round(self.max_tokens / self.frame_rate, 1)
         self.loaded_params = sum(p.numel() for p in self.model.parameters())
         self.loaded_bytes = sum(p.numel() * p.element_size()
                                 for p in self.model.parameters()) + \
@@ -148,7 +158,7 @@ class MusicGenPipeline:
                 "sample_rate": self.sample_rate, "frame_rate": self.frame_rate,
                 "params": int(self.loaded_params), "loaded_bytes": int(self.loaded_bytes),
                 "variant": _label,
-                "max_duration_s": 60, "default_guidance": 3.0,
+                "max_duration_s": int(self.max_duration_s), "default_guidance": 3.0,
                 "backend": ("ROCm" if self._rocm else
                             "CUDA" if str(self.device).startswith("cuda") else "CPU"),
                 "channels": 1, "codec": "EnCodec", "arch": "autoregressive-transformer"}
@@ -216,8 +226,10 @@ class MusicGenPipeline:
             prompt = (prompt or "").strip()
             if not prompt:
                 raise RuntimeError("empty prompt")
-            dur = max(1.0, min(60.0, float(duration)))
-            max_new = max(16, int(round(dur * self.frame_rate)))
+            dur = max(1.0, min(float(self.max_duration_s), float(duration)))
+            # NEVER exceed the decoder's position table — overrunning it is the CUDA device-side
+            # assert (which wedges the worker) / CPU crash. self.max_tokens is the hard ceiling.
+            max_new = min(max(16, int(round(dur * self.frame_rate))), self.max_tokens)
             if seed is not None:
                 with _suppress():
                     torch.manual_seed(int(seed))
