@@ -363,6 +363,8 @@ def _dir_has_model(d: str) -> bool:
             return _diffusers_complete(d)
         if _is_kokoro_dir(d):
             return True                    # #tts: .pth + voices/*.pt present == complete
+        if _is_musicgen_dir(d):            # #t2music: config + HF weights (pytorch_model.bin / safetensors)
+            return any(f.endswith((".safetensors", ".bin")) for f in os.listdir(d))
         if os.path.isdir(os.path.join(d, "ace_step_transformer")):
             # #t2a: ACE-Step component layout (no top-level safetensors / model_index.json) —
             # complete when all four component subfolders are present.
@@ -866,13 +868,13 @@ def model_ready(target_id: str, ttl: float = 3.0) -> bool:
         return hit[1]
     ready = _dir_has_model(os.path.join(MODELS_DIR, _safe_name(target_id)))
     if not ready:
+        # #t2music/#tts: Kokoro & MusicGen serve from the HF-cache snapshot (never migrated to
+        # models/), and MusicGen weights are `.bin` — a safetensors-only snapshot would MISS them and
+        # report the model as never-ready (perpetual "downloading"). _local_model_dir resolves those
+        # cache snapshots (and the ordinary safetensors case) with ZERO network (local_files_only).
         try:
-            from huggingface_hub import snapshot_download
-            d = snapshot_download(target_id,
-                                  allow_patterns=["*.safetensors", "*.json", "*.jinja",
-                                                  "*.txt", "*.model", "*.py"],
-                                  local_files_only=True)
-            ready = _dir_has_model(d)
+            d = _local_model_dir(target_id)
+            ready = bool(d) and _dir_has_model(d)
         except Exception:
             ready = False
     _READY_CACHE[target_id] = (now, ready)
