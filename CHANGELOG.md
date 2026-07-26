@@ -4,6 +4,31 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## Release 0.3.6 — text-to-music (MusicGen)
+
+- **#t2music-serve** — InfiniteModel now generates music from a text prompt with **MusicGen**
+  (Meta), a second music engine deliberately chosen for a DIFFERENT architecture than ACE-Step
+  (`#t2a-serve`): MusicGen is an **autoregressive transformer** over discrete EnCodec audio tokens,
+  not latent diffusion. That is exactly what lets it run where ACE-Step can't — it ships inside
+  `transformers`, needs **no `torchaudio`** (soundfile writes the WAV), its heavy compute is the
+  transformer decode (MIOpen-free), and its only conv is EnCodec's one-shot decode (a bounded
+  JIT-once tax like Whisper's encoder). So it serves on **AMD (ROCm) / NVIDIA (CUDA) / CPU**, with a
+  real GPU→CPU fallback. New single-node media leaf `worker_t2music.py` (`MusicGenPipeline`,
+  kind `t2music`); the prompt travels the control link and the finished WAV returns as base64
+  (**#media-anywhere**, so any capable worker serves it). Exposed at `POST /v1/audio/music` — now
+  polymorphic, dispatching to MusicGen or ACE-Step by the loaded model's type — with knobs
+  `duration / guidance / temperature / top_k / seed`. Detected by config `model_type: musicgen`
+  (or `musicgen_melody`); served WHOLE from its HF-cache snapshot like Kokoro (MusicGen ships
+  `pytorch_model.bin`, no safetensors); badged `t2music`; placement honors the per-node tier opt-out
+  (audit #28), keeping music off benched/off-limits nodes. The model-detail page gains a **Generate
+  music** panel — prompt + controls, an inline `<audio>` player, a WAV download, and a rich info
+  block (variant, backend, codec, token rate, device). Verified live on gfx1151 (om3nbox): medium
+  renders ~2× realtime warm after the one-time EnCodec JIT. Sizes: `musicgen-small` 300M,
+  `-medium` 1.5B, `-large` 3.3B, `-melody` 1.5B.
+- **Add-model `.bin` fix** — `+ Add model` / `POST /add_model` now fetches `pytorch_model.bin` for
+  repos that ship **no** safetensors (gated on that, so ordinary checkpoints never pull a redundant
+  `.bin`) — a MusicGen model now downloads its weights instead of just `config.json`.
+
 ## Release 0.3.2 — speech-to-text (Whisper)
 
 - **#stt-serve** — InfiniteModel now transcribes speech. A Whisper checkpoint
