@@ -629,6 +629,16 @@ def _local_model_dir(target_id: str):
     if _ks:
         _LOCAL_DIR_CACHE[target_id] = _ks
         return _ks
+    # #t2music: MusicGen (like Kokoro) serves from its complete cache snapshot (never migrated to
+    # models/); the local_files_only fallback below excludes *.bin, so a .bin-only MusicGen repo
+    # would otherwise resolve to None and never dispatch to the music path.
+    if _is_musicgen_dir(local):
+        _LOCAL_DIR_CACHE[target_id] = local
+        return local
+    _ms = _musicgen_cache_dir(target_id)
+    if _ms:
+        _LOCAL_DIR_CACHE[target_id] = _ms
+        return _ms
     if _dir_has_model(local):
         result = local
     else:
