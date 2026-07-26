@@ -109,6 +109,13 @@ which is disqualifying:
 `can_t2a=False` locally and renders on a CUDA worker elsewhere in its pool. If a pool has **no** CUDA
 acestep worker, it cannot serve t2a at all — that is a hardware gap, not a config one.
 
+**…or use MusicGen instead.** [MusicGen](T2MUSIC.md) is a *different* music engine — an
+autoregressive transformer over EnCodec tokens, not diffusion — that clears all three walls above
+(it's `transformers`-native, needs no `torchaudio`, its only conv is EnCodec's one-shot decode, and
+it has a CPU fallback). So it **does run on ROCm/AMD and CPU**, and serves through the same
+`POST /v1/audio/music`. On a ROCm box, or any pool without a CUDA acestep worker, MusicGen is the
+music path.
+
 ## Install gotchas & troubleshooting
 
 Real walls hit bringing this up on beast, amdcomp, and furnace, with their fixes:

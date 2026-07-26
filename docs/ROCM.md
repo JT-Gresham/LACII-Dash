@@ -215,7 +215,11 @@ surface, and the dashboard.
   kernels JIT through **MIOpen**, which is flaky-to-broken on gfx1151 at diffusion-scale conv
   workloads; and there is **no CPU fallback** — ACE-Step's diffusion does not run
   usably on CPU. Serve music from a **CUDA** GPU instead, locally or anywhere in the pool via
-  `#media-anywhere`. Full rationale in [T2A.md](T2A.md).
+  `#media-anywhere` — **or use MusicGen** (`#t2music`, [T2MUSIC.md](T2MUSIC.md)), a different
+  (autoregressive, `transformers`-native) music engine that DOES run on this gfx1151 GPU: no
+  `torchaudio`, the transformer decode is MIOpen-free, and only EnCodec's decode JITs through MIOpen
+  once (like Whisper's encoder). MusicGen is the music path on a ROCm box. Full rationale in
+  [T2A.md](T2A.md).
 - **Kokoro TTS now loads and runs on the gfx1151 GPU here** (verified 2026-07-26 on TheRock ROCm
   7.13 / torch `2.12.0a0+rocm7.13` / kokoro 0.7.16): the earlier LSTM/dropout MIOpen bug
   (`MIOpenDropoutHIP.cpp '<utility>' not found`) that *forced* CPU **no longer reproduces**, so the

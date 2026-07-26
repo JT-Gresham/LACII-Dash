@@ -84,6 +84,14 @@ dashboard.
   GPU whose worker advertises the acestep runtime** (`can_t2a`), fetching the checkpoint via
   `snapshot_download` and returning the WAV over the control link — no shared filesystem required.
   Install recipe + API → [docs/T2A.md](docs/T2A.md).
+- **Text-to-music (MusicGen)** *(optional, lightweight).* **MusicGen** (`small`→`large`, 300M–3.3B)
+  serves the same `POST /v1/audio/music` (text prompt → instrumental WAV). It is the architectural
+  counterpoint to ACE-Step — an **autoregressive transformer over EnCodec tokens, not diffusion** —
+  so unlike ACE-Step it **runs on AMD (ROCm) / NVIDIA / CPU**, needing only `transformers` +
+  `soundfile` (the same deps as Whisper STT — no `acestep`/`torchaudio`). Served whole from its
+  HF-cache snapshot; `/v1/audio/music` dispatches to whichever engine the loaded model is; the
+  model-detail page gets a **Generate music** panel (prompt + controls, player, WAV download).
+  Guide → [docs/T2MUSIC.md](docs/T2MUSIC.md).
 - **Tool calling.** Native `tools` on all three chat APIs — Ollama `/api/chat` (`tool_calls` with
   object args), OpenAI `/v1/chat/completions` (`tool_calls` + `finish_reason:"tool_calls"`), and
   Anthropic `/v1/messages` (`tool_use` blocks) — streaming and non-streaming, including the full

@@ -1094,7 +1094,7 @@ async function openDetail(name){
   else if(_isT2a) acts='<button class="btn sm pri" onclick="t2aLoadDlg(\''+esc(name)+'\')">Load 🎵</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
-  else if(_isT2m) acts='<button class="btn sm pri" onclick="loadT2music(\''+esc(name)+'\')">Load 🎵</button> '
+  else if(_isT2m) acts='<button class="btn sm pri" onclick="t2mLoadDlg(\''+esc(name)+'\')">Load 🎵</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   else acts='<button class="btn sm pri" onclick="closeOv();openLoad(\''+esc(name)+'\')">Load…</button> '
@@ -1183,6 +1183,18 @@ function loadT2a(name,off){
     .then(()=>{toast(name+' ready — open its card to generate');tick();})
     .catch(e=>errDlg('music pipeline load failed',String(e.message||e)));
   tick();
+}
+// #t2music-serve: the Load 🎵 dialog — MusicGen has no offload/GPU-resident choice (small
+// autoregressive net), so this is an informational confirm that sets expectations (autoregressive
+// render time scales with clip length; the FIRST render warms the EnCodec decoder once).
+function t2mLoadDlg(name){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🎵 '+esc(name)+'</h3>'
+    +'<div class="note" style="margin-top:8px">Loads the <b>MusicGen</b> pipeline (text encoder + audio-token transformer + EnCodec decoder) onto a capable GPU — or CPU if that\'s all there is. It\'s autoregressive (~50 audio tokens/sec), so render time scales with clip length.</div>'
+    +'<div class="note" style="margin-top:8px"><b>The first render warms the EnCodec decoder once.</b> On an AMD gfx1151 GPU that\'s a one-time MIOpen compile (~a minute); every render after is fast. NVIDIA is fast immediately; CPU runs but is much slower.</div>'
+    +'<div class="note" style="margin-top:8px">When it\'s ready, open its card and use the <b>Generate music</b> panel — prompt + duration / guidance / temperature / top-k / seed, with an inline player and a WAV download.</div>'
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="closeOv();loadT2music(\''+esc(name)+'\')">Load 🎵</button> '
+    +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
+  $('#ov').classList.add('show');
 }
 // #t2music-serve: load a MusicGen model (no offload dance — small autoregressive net). The FIRST
 // render also JIT-warms the EnCodec audio decoder once (esp. on ROCm/gfx1151), then renders are fast.
