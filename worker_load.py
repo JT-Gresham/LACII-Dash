@@ -387,6 +387,52 @@ class WorkerLoadMixin:
                         "loaded_bytes": eng.loaded_bytes,
                         "gpu_bytes": eng.gpu_bytes,
                         "media": eng.media_info()}   # #media-detail: device/params for /status
+            # T2MUSIC load (#t2music-serve): a MusicGen pipeline builds WHOLE on THIS node — the
+            # music-generation sibling of t2a, but transformers-native (no acestep/torchaudio) so it
+            # runs on AMD/NVIDIA/CPU. worker_t2music imported lazily via the fetch-if-missing bridge;
+            # a REMOTE worker snapshot_downloads the checkpoint itself (#media-anywhere).
+            if a.get("kind") == "t2music":
+                mdir = a.get("model_dir") or ""
+                if not (mdir and os.path.isdir(mdir)
+                        and os.path.exists(os.path.join(mdir, "config.json"))):
+                    def _fetch_musicgen() -> str:
+                        from huggingface_hub import snapshot_download
+                        try:
+                            return snapshot_download(model_id)
+                        except Exception as _e:
+                            raise RuntimeError(
+                                f"remote t2music worker can't fetch {model_id!r} from HuggingFace "
+                                f"({_e!r}) — a MusicGen model served on a REMOTE worker must be a "
+                                "public HF repo id (co-located serving works from local disk)"
+                            ) from _e
+                    mdir = await asyncio.to_thread(_fetch_musicgen)
+                try:
+                    import worker_t2music
+                except Exception:
+                    from worker_update import _fetch_repo_file
+                    _src = _fetch_repo_file("worker_t2music.py")
+                    if not _src:
+                        raise RuntimeError("worker_t2music.py missing and unfetchable (CDN lag?) — retry")
+                    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           "worker_t2music.py"), "wb") as _tf:
+                        _tf.write(_src)
+                    import worker_t2music
+                device = a.get("device") or self.device
+                if device == "":
+                    device = self.device
+                self._building += 1
+                try:
+                    eng = await asyncio.to_thread(
+                        worker_t2music.MusicGenPipeline, mdir, device, "none", False)
+                    self.shards[model_id] = eng
+                finally:
+                    self._building -= 1
+                self.next_writers.pop(model_id, None)
+                self.next_peer[model_id] = "controller"
+                return {"loaded_params": eng.loaded_params,
+                        "loaded_bytes": eng.loaded_bytes,
+                        "gpu_bytes": eng.gpu_bytes,
+                        "media": eng.media_info()}   # #media-detail: device/params for /status
             self._building += 1   # mark BUSY across the build so reclaim/self-update can't kill it
             try:
                 shard = await asyncio.to_thread(self._build_shard, base, model_id, a)
@@ -813,6 +859,48 @@ class WorkerLoadMixin:
                 await reply({"type": "stt_err", "req_id": rid, "model_id": mid,
                              "error": repr(exc)})
             print(f"[stt] transcribe FAILED: {exc!r}", flush=True)
+
+    async def handle_t2music_gen(self, msg: dict, reply) -> None:
+        """#t2music-serve: run ONE MusicGen render on this worker's resident MusicGenPipeline and
+        mirror the result over the control link. Dispatched as a TASK (a render takes many seconds),
+        so replies are keyed by req_id. Coarse token progress mirrors as `t2music_step`; the finished
+        WAV returns as base64 in `t2music_done` (#media-anywhere — no shared FS). _building marks the
+        worker busy so self-update/reclaim won't kill a live render."""
+        import base64
+        rid = msg.get("req_id")
+        mid = msg.get("model_id")
+        eng = self.shards.get(mid)
+        if eng is None or getattr(eng, "kind", "") != "t2music":
+            await reply({"type": "t2music_err", "req_id": rid, "model_id": mid,
+                         "error": "t2music model not resident on this worker"})
+            return
+        loop = asyncio.get_running_loop()
+
+        def _on_step(i: int, n: int) -> None:
+            with contextlib.suppress(Exception):
+                asyncio.run_coroutine_threadsafe(
+                    reply({"type": "t2music_step", "req_id": rid, "model_id": mid,
+                           "step": i, "total": n}), loop)
+
+        try:
+            self._building += 1
+            try:
+                wav, secs, audio_s = await asyncio.to_thread(
+                    eng.generate, str(msg.get("prompt") or ""),
+                    float(msg.get("duration", 15.0)), float(msg.get("guidance", 3.0)),
+                    float(msg.get("temperature", 1.0)), int(msg.get("top_k", 250)),
+                    float(msg.get("top_p", 0.0)), msg.get("seed"), _on_step)
+            finally:
+                self._building -= 1
+            _ab64 = await asyncio.to_thread(lambda: base64.b64encode(wav).decode("ascii"))
+            await reply({"type": "t2music_done", "req_id": rid, "model_id": mid,
+                         "audio_b64": _ab64, "seconds": round(secs, 1),
+                         "audio_s": round(audio_s, 1)})   # #media-detail: for RTF in the modal
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await reply({"type": "t2music_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[t2music] generate FAILED: {exc!r}", flush=True)
 
     async def handle_pack(self, msg: dict) -> dict:
         """#distributed-packing Inc 1b/3b: pack ONE shard-cache unit FOR the controller (offloads the

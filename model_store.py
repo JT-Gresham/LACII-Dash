@@ -236,6 +236,47 @@ def _is_whisper_dir(d: str) -> bool:
         return False
 
 
+def _is_musicgen_dir(d: str) -> bool:
+    """A MusicGen text-to-MUSIC checkpoint (#t2music): a config.json whose model_type is
+    'musicgen'/'musicgen_melody' (or whose architectures include MusicgenForConditionalGeneration).
+    Recognized explicitly so the load path routes it to the single-node MusicGen leaf
+    (_load_t2music_locked) instead of the decoder-only LLM pipeline — MusicGen is a composite
+    (text encoder + audio-token decoder + EnCodec) the layer-split planner can't drive."""
+    try:
+        p = os.path.join(d, "config.json")
+        if not os.path.exists(p):
+            return False
+        with open(p, encoding="utf-8") as fh:
+            c = json.load(fh)
+        if str(c.get("model_type") or "").lower() in ("musicgen", "musicgen_melody"):
+            return True
+        return any("Musicgen" in str(a) and "ConditionalGeneration" in str(a)
+                   for a in (c.get("architectures") or []))
+    except Exception:
+        return False
+
+
+def _musicgen_cache_dir(model_id: str):
+    """The HF-cache snapshot dir for a MusicGen repo, iff COMPLETE (config + weights), else None.
+    Served straight from the cache (like Kokoro) — the generic models/ migration copies only
+    *.safetensors/*.json and would MISS a repo shipping pytorch_model.bin, so never migrate it.
+    Scans the cache filesystem directly (deterministic, side-effect free)."""
+    try:
+        from huggingface_hub import constants
+        base = os.path.join(constants.HF_HUB_CACHE, "models--" + model_id.replace("/", "--"))
+        snaps = os.path.join(base, "snapshots")
+        if not os.path.isdir(snaps):
+            return None
+        for rev in sorted(os.listdir(snaps), reverse=True):   # newest-rev first
+            d = os.path.join(snaps, rev)
+            if _is_musicgen_dir(d) and any(
+                    f.endswith((".safetensors", ".bin")) for f in os.listdir(d)):
+                return d
+    except Exception:
+        return None
+    return None
+
+
 def _kokoro_cache_dir(model_id: str):
     """The HF-cache snapshot dir for a Kokoro repo, iff it's COMPLETE (.pth + voices),
     else None. Kokoro is served straight from the cache (never migrated to models/) —
@@ -370,6 +411,13 @@ def _controller_model_dir(model_id: str) -> str:
     _ksnap = _kokoro_cache_dir(model_id)
     if _ksnap:
         return _ksnap
+    # #t2music: MusicGen (like Kokoro) serves from its COMPLETE HF-cache snapshot — the
+    # pattern-limited models/ migration below would miss a pytorch_model.bin-only repo.
+    if _is_musicgen_dir(local):
+        return local
+    _msnap = _musicgen_cache_dir(model_id)
+    if _msnap:
+        return _msnap
     if _dir_has_model(local):
         _ensure_template_files(model_id, local)   # self-heal chat_template.jinja missed by an
         return local                              # earlier *.safetensors+*.json-only pull
@@ -675,6 +723,10 @@ def _spec_from_config(model_dir: str, name: str) -> Optional[ModelSpec]:
     # it has no pipeline-splittable spec. Return None so the load path routes it to the single-node
     # speech-to-text leaf (_load_stt_locked), exactly like Kokoro / ACE-Step / diffusers.
     if str(c.get("model_type") or "").lower() == "whisper":
+        return None
+    # #t2music: MusicGen is a composite (text encoder + audio-token LM + EnCodec), NOT a decoder-only
+    # LLM — no pipeline-splittable spec. Return None so the load routes it to _load_t2music_locked.
+    if str(c.get("model_type") or "").lower() in ("musicgen", "musicgen_melody"):
         return None
     tc = c.get("text_config")
     if tc is None:                                 # Qwen2.5-Omni nests text dims deeper

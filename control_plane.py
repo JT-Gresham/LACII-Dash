@@ -519,6 +519,20 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 if _fut is not None and not _fut.done():
                     _fut.set_result(msg)
                 getattr(engine, "_t2a_progress", {}).pop(msg.get("req_id"), None)
+            elif mtype == "t2music_step":
+                # #t2music-serve: coarse per-token render progress (dashboard "step i/n").
+                _mp = getattr(engine, "_t2music_progress", None)
+                if _mp is None:
+                    _mp = engine._t2music_progress = {}
+                _mp[msg.get("req_id")] = (int(msg.get("step", 0)), int(msg.get("total", 0)),
+                                          time.time())
+            elif mtype in ("t2music_done", "t2music_err"):
+                # #t2music-serve: final music result — resolve the waiting t2music_generate future.
+                _pend = getattr(engine, "_t2music_pending", None) or {}
+                _fut = _pend.pop(msg.get("req_id"), None)
+                if _fut is not None and not _fut.done():
+                    _fut.set_result(msg)
+                getattr(engine, "_t2music_progress", {}).pop(msg.get("req_id"), None)
             elif mtype in ("ready", "error"):
                 _resolve_pending(link.pending_loads, msg, peer_host)
             elif mtype == "unloaded":

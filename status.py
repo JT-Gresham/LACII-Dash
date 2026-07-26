@@ -153,7 +153,7 @@ def build_status() -> dict:
         # worker-reported metadata (voices/sample_rate/device for tts) plus derived device (from
         # whether any stage placed weights on GPU), weight size, and the last render's speed (RTF).
         _media = None
-        if any(getattr(lm, f, False) for f in ("is_tts", "is_t2i", "is_t2a", "is_stt")):
+        if any(getattr(lm, f, False) for f in ("is_tts", "is_t2i", "is_t2a", "is_stt", "is_t2music")):
             _media = dict(getattr(lm, "media", None) or {})
             _media["device"] = ("GPU" if any(getattr(s, "gpu_bytes", 0) > 0
                                              for s in lm.plan.stages) else "CPU")
@@ -168,7 +168,8 @@ def build_status() -> dict:
             if not _media.get("kind"):
                 _media["kind"] = ("tts" if getattr(lm, "is_tts", False)
                                   else "t2i" if getattr(lm, "is_t2i", False)
-                                  else "stt" if getattr(lm, "is_stt", False) else "t2a")
+                                  else "stt" if getattr(lm, "is_stt", False)
+                                  else "t2music" if getattr(lm, "is_t2music", False) else "t2a")
             _lr, _la = getattr(lm, "last_render_s", None), getattr(lm, "last_audio_s", None)
             if _lr is not None:
                 _media["last_render_s"] = round(float(_lr), 2)
@@ -246,6 +247,7 @@ def build_status() -> dict:
             "is_tts": bool(getattr(lm, "is_tts", False)),
             "is_t2a": bool(getattr(lm, "is_t2a", False)),
             "is_stt": bool(getattr(lm, "is_stt", False)),
+            "is_t2music": bool(getattr(lm, "is_t2music", False)),
             "media": _media,   # #media-detail: None for LLMs; dict for tts/t2i/t2a/stt
             "is_embedding": bool(getattr(lm.spec, "is_embedding", False)),
             "load_seconds": round(getattr(lm, "load_seconds", 0.0), 1),
@@ -385,7 +387,7 @@ def build_status() -> dict:
                      "tp_size", "is_tp", "upgrade", "num_layers", "params", "stages", "plan_basis",
                      "speed_tier", "loaded_at_ts", "last_used_ts", "load_seconds",
                      "req_total", "tok_in_total", "tok_out_total", "arch", "is_moe",
-                     "is_tts", "is_t2a", "is_stt", "media",   # #media-detail: media-model info block
+                     "is_tts", "is_t2a", "is_stt", "is_t2music", "media",   # #media-detail: media info
                      "persist", "no_unload")
     for _e in model_cards:
         if _e.get("loaded"):
@@ -424,7 +426,7 @@ def build_status() -> dict:
                  "owner": _pm.get("owner"), "owner_url": _pm.get("owner_url"),
                  "aliases": _pm.get("aliases") or [], "capabilities": []}
         for _k in ("quant", "kv_quant", "ctx", "size_gb", "active", "queued", "num_layers",
-                   "params", "arch", "is_moe", "is_embedding", "is_tts", "is_t2a", "is_stt",
+                   "params", "arch", "is_moe", "is_embedding", "is_tts", "is_t2a", "is_stt", "is_t2music",
                    "vram_used_gb", "tok_s", "ema_tok_s", "last_tok_s", "max_tok_s",
                    "loaded_at_ts", "last_used_ts"):
             if _pm.get(_k) is not None:
@@ -608,6 +610,11 @@ def _model_caps(tgt: str, spec=None) -> list:
         if d and _is_whisper_dir(d):
             _CAPS_CACHE[tgt] = ["stt"]
             return ["stt"]
+        # #t2music: a MusicGen text-to-music checkpoint — badge it and offer the music load/generate
+        # path, like t2i/t2a (no LLM Load action, no pipeline planning).
+        if d and _is_musicgen_dir(d):
+            _CAPS_CACHE[tgt] = ["t2music"]
+            return ["t2music"]
         # #t2a: an ACE-Step music checkpoint (ace_step_transformer/ component layout) — badge it
         # and offer the music load/generate path, like t2i/tts (no LLM Load action).
         if d and os.path.isdir(os.path.join(d, "ace_step_transformer")):
@@ -718,6 +725,11 @@ def _model_entry(name: str, tgt: str, draft: str) -> dict:
             _pr = getattr(engine, "_t2a_progress", {}).get(getattr(lm, "t2a_req", None))
             if _pr:
                 entry["t2a_step"], entry["t2a_total"] = _pr[0], _pr[1]
+        if getattr(lm, "is_t2music", False):     # #t2music-serve: MusicGen — live token progress
+            entry["t2music"] = True
+            _pr = getattr(engine, "_t2music_progress", {}).get(getattr(lm, "t2music_req", None))
+            if _pr:
+                entry["t2music_step"], entry["t2music_total"] = _pr[0], _pr[1]
     if status in ("downloading", "pausing", "stopping", "paused", "stopped"):
         pr = DOWNLOAD_PROGRESS.get(name) or {}     # frozen at the halt point for paused/stopped
         dl, tot = pr.get("downloaded", 0), pr.get("total", 0)

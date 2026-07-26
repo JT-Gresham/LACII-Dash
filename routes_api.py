@@ -675,10 +675,20 @@ def register(app):
                 # making retrying clients give up on a model that exists. Typed ladder now, and
                 # the refusal finally lands in log_activity (render-oom-guard telemetry gap).
                 return _media_load_error(exc, friendly, "t2a")
-            audio_bytes, meta = await engine.t2a_generate(
-                friendly, prompt, lyrics=(body.get("lyrics") or ""),
-                duration=_f("duration", 30.0), steps=_i("steps", 60),
-                guidance=_f("guidance", 15.0), seed=body.get("seed"), fmt=fmt)
+            _lm = engine.models.get(friendly)
+            if _lm is not None and getattr(_lm, "is_t2music", False):
+                # #t2music-serve: MusicGen (autoregressive transformer) — different knobs than
+                # ACE-Step diffusion: guidance/temperature/top_k/top_p/seed (no lyrics/steps).
+                audio_bytes, meta = await engine.t2music_generate(
+                    friendly, prompt, duration=_f("duration", 15.0),
+                    guidance=_f("guidance", 3.0), temperature=_f("temperature", 1.0),
+                    top_k=_i("top_k", 250), top_p=_f("top_p", 0.0),
+                    seed=body.get("seed"), fmt=fmt)
+            else:
+                audio_bytes, meta = await engine.t2a_generate(
+                    friendly, prompt, lyrics=(body.get("lyrics") or ""),
+                    duration=_f("duration", 30.0), steps=_i("steps", 60),
+                    guidance=_f("guidance", 15.0), seed=body.get("seed"), fmt=fmt)
             _media = "audio/wav" if fmt in ("wav", "") else f"audio/{fmt}"
             print(f"[v1/audio/music] '{prompt[:40]}...' {meta.get('audio_s')}s audio "
                   f"-> render {meta.get('seconds')}s")

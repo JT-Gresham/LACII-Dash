@@ -494,6 +494,9 @@ def build_registration(args: argparse.Namespace) -> dict:
     reg["can_t2a"] = _has("acestep")
     reg["can_t2i"] = _has("diffusers")
     reg["can_stt"] = _has("transformers") and _has("soundfile")   # #stt-serve: Whisper ASR leaf
+    # #t2music-serve: MusicGen ships inside transformers and needs NO torchaudio (soundfile writes
+    # the WAV) — so any Whisper-capable worker is also MusicGen-capable. Runs on AMD/NVIDIA/CPU.
+    reg["can_t2music"] = _has("transformers") and _has("soundfile")
     # #wire-caps: advertise this build's wire-protocol capability set (e.g. ["ntensor"]) so the
     # controller can gate new wire formats per node (registry.node_caps). Read via getattr off
     # the wire MODULE — an old wire.py (per-file self-update convergence window) has no

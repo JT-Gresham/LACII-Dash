@@ -191,9 +191,9 @@ class EngineLoadMixin:
             _ctgt = MODELS[friendly][0] if friendly in MODELS else friendly
             _cdir = await asyncio.to_thread(_controller_model_dir, _ctgt)
             if _cdir and (_is_diffusers_dir(_cdir) or _is_kokoro_dir(_cdir)
-                          or _is_whisper_dir(_cdir)
+                          or _is_whisper_dir(_cdir) or _is_musicgen_dir(_cdir)
                           or os.path.isdir(os.path.join(_cdir, "ace_step_transformer"))):
-                return   # #t2i/#t2a/#tts/#stt: media checkpoints have no LLM shard cache to compile
+                return   # #t2i/#t2a/#tts/#stt/#t2music: media checkpoints have no LLM shard cache
             # #embedding: an encoder / sentence-embedding checkpoint (nomic-embed, BERT, …) has no
             # 'model.embed_tokens.weight' — an int4 shard compile ALWAYS fails (KeyError) and, because
             # such models are typically persist/no_unload, RE-FIRES on every auto-load / re-adopt,
@@ -463,6 +463,12 @@ class EngineLoadMixin:
                 if _d and _is_whisper_dir(_d):
                     return await self._load_stt_locked(friendly, _tgt, reg_key or friendly,
                                                        replica_idx=replica_idx)
+                # #t2music-serve: a MusicGen text-to-music checkpoint (config model_type
+                # 'musicgen'/'musicgen_melody') loads via the single-node MusicGen path — a composite
+                # (text encoder + audio-token LM + EnCodec), never pipeline-split.
+                if _d and _is_musicgen_dir(_d):
+                    return await self._load_t2music_locked(friendly, _tgt, reg_key or friendly,
+                                                           replica_idx=replica_idx)
                 # #tts-serve: a Kokoro speech checkpoint (kokoro-v1_0.pth + voices/, no
                 # safetensors, no model_index.json) loads via the single-node speech path.
                 if _d and _is_kokoro_dir(_d):
@@ -2193,6 +2199,101 @@ class EngineLoadMixin:
                      f"[{len(self.models)} model(s) resident]")
         return lm
 
+    async def _load_t2music_locked(self, friendly: str, target_id: str, reg_key: str,
+                                   replica_idx: int = 0) -> LoadedModel:
+        """#t2music-serve: load a MusicGen text-to-music checkpoint WHOLE onto ONE worker — the music
+        sibling of _load_stt_locked. MusicGen is a small (~0.3-3.3 GB) autoregressive transformer +
+        EnCodec, so no VRAM edge/quant tiers and no eviction dance. Prefers a co-located GPU worker;
+        a REMOTE worker advertising the runtime (can_t2music) also serves (it snapshot_downloads the
+        checkpoint — #media-anywhere). Runs on AMD/NVIDIA/CPU (the leaf handles the device incl. a
+        GPU->CPU fallback). MUST hold self.lock (reached only from load())."""
+        model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
+        await self.ensure_data_listener()
+        if reg_key in self.models:
+            await self._unload_model_locked(reg_key, "reload (t2music)")
+            await self._await_free_refresh()
+
+        def _is_colo(n):
+            return (n.hostname == socket.gethostname()
+                    or str(n.data_host).startswith(("127.", "::1"))
+                    or str(n.data_host) in _LOCAL_IPS)
+        # Candidates: a co-located worker (reads the model dir off shared disk) OR any worker
+        # advertising the MusicGen runtime (can_t2music; it fetches from HF). Honor the per-node tier
+        # toggles (audit #28) — a node with BOTH tiers disabled is opted out (keeps t2music off
+        # furnace). Prefer a can_t2music node, then co-located, then most VRAM.
+        cand = [n for n in registry.alive_sorted()
+                if n.can_infer and (n.ram_enabled or n.vram_enabled)
+                and (_is_colo(n) or getattr(n, "can_t2music", False))]
+        if not cand:
+            raise RuntimeError("no worker can serve the t2music (MusicGen) model — need a co-located "
+                               "worker or one advertising the MusicGen runtime (can_t2music)")
+        node = sorted(cand, key=lambda _n: (bool(getattr(_n, "can_t2music", False)),
+                                            _is_colo(_n), _n.vram_total_gb), reverse=True)[0]
+        device = "cuda" if node.vram_total_gb > 0 else "cpu"
+        # MusicGen small/medium/large = ~1-13 GB — a moderate reservation so a concurrent big load
+        # budgets around it (just a hint; the worker reports real bytes back).
+        self._reservations[reg_key] = {node.node_id: {
+            "ram": int(6.0 * GB), "vram": int(6.0 * GB) if device == "cuda" else 0}}
+        self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
+                        "target": target_id, "total": 1, "ready": 0,
+                        "stages_total": 1, "stages_ready": 0,
+                        "basis": f"t2music: single-node ({node.hostname}, musicgen/{device})",
+                        "warnings": [], "node_ids": [node.node_id],
+                        "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
+                        "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
+        link = self.links.get(node.node_id)
+        if link is None:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"no control link to {node.node_id}")
+        fut = asyncio.get_event_loop().create_future()
+        link.pending_loads[target_id] = fut
+        await link.send({"type": "load", "kind": "t2music", "model_id": target_id,
+                         "model_dir": model_dir, "quant": "none",
+                         "controller_http_port": ARGS.http_port,
+                         "next_host": None, "next_port": ARGS.data_port,
+                         "device": device})
+        try:
+            r = await asyncio.wait_for(fut, timeout=max(GEN_TIMEOUT_S, 900.0))
+        except Exception as exc:
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"t2music load on {node.hostname} failed: {exc!r}")
+        if isinstance(r, dict) and r.get("type") == "error":
+            self.loadings.pop(reg_key, None)
+            raise RuntimeError(f"t2music load on {node.hostname} failed: {r.get('error')}")
+        gpu_b = int(r.get("gpu_bytes", 0)) if isinstance(r, dict) else 0
+        tot_b = int(r.get("loaded_bytes", 0)) if isinstance(r, dict) else 0
+        spec = ModelSpec(name=friendly, hidden_size=1, num_layers=1, num_heads=1,
+                         num_kv_heads=1, head_dim=1, intermediate_size=1, vocab_size=0,
+                         tie_embeddings=True, max_ctx=0, arch="t2music",
+                         meas_layer_w=1, meas_embed=0, meas_head=0, meas_norm=0,
+                         meas_params=max(1, tot_b))
+        stage = StageAssign(node_id=node.node_id, hostname=node.hostname,
+                            layer_start=0, layer_end=1, has_embed=True, has_head=True,
+                            est_bytes=tot_b or 1, usable_bytes=int(node.usable_total_gb * GB),
+                            gpu_bytes=gpu_b, loaded_bytes=tot_b)
+        plan = PlanResult(ok=True, model=spec.name, ctx_len=0, num_layers=1,
+                          pool_usable_gb=node.usable_total_gb,
+                          required_gb=(tot_b or 1) / GB, stages=[stage])
+        node.shard_gpu_bytes = gpu_b
+        _dial = (_dial_host(node.data_host), node.data_port)
+        stage0_writer = await self._connect_retry(*_dial)
+        now = time.time()
+        lm = LoadedModel(reg_key, target_id, spec, 0, plan, [node.node_id], None, set(), now,
+                         quant="none", stage0_writer=stage0_writer, last_used=now,
+                         stage0_dial=_dial, last_send_ts=now)
+        lm.base, lm.replica_idx = friendly, replica_idx
+        lm.plan_basis = "t2music: single-node"
+        lm.is_t2music = True
+        lm.media = r.get("media") if isinstance(r, dict) else None   # device/params (#media-detail)
+        self.models[reg_key] = lm
+        self.loadings.pop(reg_key, None)
+        registry.dirty = False
+        print(f"[load] {reg_key} t2music (musicgen) on {node.hostname} "
+              f"({tot_b / GB:.2f} GB, {gpu_b / GB:.2f} GB GPU, {device})")
+        log_activity(f"{reg_key} READY (t2music/musicgen, {node.hostname}, {device}) "
+                     f"[{len(self.models)} model(s) resident]")
+        return lm
+
     async def stt_transcribe(self, friendly: str, audio_bytes: bytes, language: str = "",
                              task: str = "transcribe") -> tuple[str, dict]:
         """#stt-serve: transcribe audio on the model's Whisper worker. Serializes per model on
@@ -2369,6 +2470,64 @@ class EngineLoadMixin:
                          f"({len(data) / 1e6:.2f} MB)")
             return data, {"seconds": r.get("seconds"), "audio_s": r.get("audio_s"),
                           "format": fmt}
+
+    async def t2music_generate(self, friendly: str, prompt: str, duration: float = 15.0,
+                               guidance: float = 3.0, temperature: float = 1.0,
+                               top_k: int = 250, top_p: float = 0.0, seed=None,
+                               fmt: str = "wav") -> tuple[bytes, dict]:
+        """#t2music-serve: render one music clip on the model's MusicGen worker. Serializes per model
+        on LoadedModel.lock (same discipline as text/image/speech gens); the prompt travels the
+        control link, coarse per-token progress arrives as t2music_step (see control_plane +
+        /status), and the finished WAV comes back as base64 in t2music_done. Returns
+        (audio_bytes, meta)."""
+        lm = self.models.get(friendly)
+        if lm is None:
+            raise ValueError(f"model '{friendly}' is not loaded — load it first")
+        if not getattr(lm, "is_t2music", False):
+            raise ValueError(f"'{friendly}' is not a music (t2music) model")
+        async with lm.lock:
+            lm.last_used = time.time()
+            link = self.links.get(lm.stage_node_ids[0])
+            if link is None:
+                raise RuntimeError("the t2music model's worker is disconnected — reload the model")
+            rid = self._t2music_rid = getattr(self, "_t2music_rid", 0) + 1
+            pend = getattr(self, "_t2music_pending", None)
+            if pend is None:
+                pend = self._t2music_pending = {}
+            fut = asyncio.get_event_loop().create_future()
+            pend[rid] = fut
+            lm.active = 1
+            lm.t2music_req = rid            # status: lets the card find this render's progress
+            _dur = max(1.0, min(60.0, float(duration)))
+            try:
+                await link.send({"type": "t2music_gen", "model_id": lm.target_id, "req_id": rid,
+                                 "prompt": str(prompt or ""), "duration": _dur,
+                                 "guidance": float(guidance), "temperature": float(temperature),
+                                 "top_k": int(top_k), "top_p": float(top_p), "seed": seed})
+                # MusicGen is autoregressive (~50 audio tokens/s). On a GPU a 15 s clip is ~1-3 min;
+                # on CPU (or gfx1151 for a long clip) DRAMATICALLY slower — a generous upper bound
+                # (it only bounds a hang; a legitimately slow render costs nothing extra).
+                _cpu = bool((lm.media or {}).get("device") and
+                            str((lm.media or {}).get("device")) != "GPU")
+                r = await asyncio.wait_for(
+                    fut, timeout=max(GEN_TIMEOUT_S,
+                                     (600.0 + _dur * 120.0) if _cpu else (180.0 + _dur * 60.0)))
+            finally:
+                lm.active = 0
+                lm.t2music_req = None
+                pend.pop(rid, None)
+                getattr(self, "_t2music_progress", {}).pop(rid, None)
+            if not isinstance(r, dict) or r.get("type") == "t2music_err":
+                raise RuntimeError(f"music generation failed: "
+                                   f"{(r or {}).get('error', 'no result')}")
+            lm.last_render_s = r.get("seconds")      # wall time of this render (#media-detail)
+            lm.last_audio_s = r.get("audio_s")       # audio duration -> RTF in the modal
+            import base64
+            data = await asyncio.to_thread(base64.b64decode, r.get("audio_b64") or "")
+            lm.last_used = time.time()
+            log_activity(f"{_ollama_name(friendly)}: music {r.get('seconds', '?')}s "
+                         f"({len(data) / 1e6:.2f} MB)")
+            return data, {"seconds": r.get("seconds"), "audio_s": r.get("audio_s"), "format": fmt}
 
     async def replicate(self, friendly: str, ctx: int, count: int,
                         consolidate: bool = True, prefer_vram: bool = True,
@@ -2968,7 +3127,8 @@ class EngineLoadMixin:
                 # healthy pipeline (observed live: 'promoting qwen-image (56% was on CPU)'
                 # 25s after its first load). Skip like embeddings.
                 if getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False) \
-                        or getattr(m, "is_tts", False) or getattr(m, "is_stt", False):
+                        or getattr(m, "is_tts", False) or getattr(m, "is_stt", False) \
+                        or getattr(m, "is_t2music", False):
                     continue
                 if self._model_cpu_frac(m) <= 0.02:
                     continue
@@ -3125,7 +3285,8 @@ class EngineLoadMixin:
         (media/embedding aren't served through the generate() barrier and never spill by mistake)."""
         if (getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False)
                 or getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False)
-                or getattr(m, "is_tts", False) or getattr(m, "is_stt", False)):
+                or getattr(m, "is_tts", False) or getattr(m, "is_stt", False)
+                or getattr(m, "is_t2music", False)):
             return None
         cur_cpu = self._model_cpu_frac(m)
         cur_n = len(m.plan.stages)
@@ -3170,7 +3331,8 @@ class EngineLoadMixin:
             return {"ok": False, "error": f"'{friendly}' is not resident"}
         if (getattr(m.spec, "is_embedding", False) or getattr(m, "is_embedding", False)
                 or getattr(m, "is_t2i", False) or getattr(m, "is_t2a", False)
-                or getattr(m, "is_tts", False) or getattr(m, "is_stt", False)):
+                or getattr(m, "is_tts", False) or getattr(m, "is_stt", False)
+                or getattr(m, "is_t2music", False)):
             return {"ok": False, "error": "load-faster applies to text models only"}
         base = m.base or friendly
         async with self._juggle_lock:
@@ -3321,7 +3483,7 @@ class EngineLoadMixin:
         if int(a0.get("tp_size", 1) or 1) > 1:
             return   # TP is not adoptable — the sweep frees it after grace
         # ---- coverage check (outside the lock: read-only) ----
-        if kind in ("embedding", "t2i", "t2a", "tts", "stt"):
+        if kind in ("embedding", "t2i", "t2a", "tts", "stt", "t2music"):
             picked = [reports[0]]                       # single-node kinds: any one report serves
         else:
             n_stages = int(a0.get("num_stages", 0) or 0)
@@ -3477,6 +3639,8 @@ class EngineLoadMixin:
                 lm.t2a_offload = offload
             elif kind == "stt":
                 lm.is_stt = True
+            elif kind == "t2music":
+                lm.is_t2music = True
             else:
                 lm.is_tts = True
                 lm.is_kokoro = True

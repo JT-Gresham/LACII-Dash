@@ -828,7 +828,8 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py",
                                  "worker_t2i.py",   # #t2i-serve: diffusion image engine (lazy import)
                                  "worker_tts.py",   # #tts-serve: Kokoro speech engine (lazy import)
                                  "worker_t2a.py",   # #t2a-serve: ACE-Step music engine (lazy import)
-                                 "worker_stt.py"]   # #stt-serve: Whisper transcription engine (lazy import)
+                                 "worker_stt.py",   # #stt-serve: Whisper transcription engine (lazy import)
+                                 "worker_t2music.py"]   # #t2music-serve: MusicGen engine (lazy import)
 # (#distributed-packing) synced like a module — shards.pack_unit_tensors is the shared packer the
 # remote-pack handler calls, so a worker-packed cache unit is bit-identical to a controller-compiled one.
 
@@ -1097,7 +1098,7 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                         # Single-node whole-model kinds (embedding + every media leaf: t2i/t2a/tts/
                         # stt) have NO layer range — the load message carries no layer_start/_end, so
                         # they must NOT hit the pipeline log below (it KeyError'd on a media load).
-                        if msg.get("kind") in ("embedding", "t2i", "t2a", "tts", "stt"):
+                        if msg.get("kind") in ("embedding", "t2i", "t2a", "tts", "stt", "t2music"):
                             print(f"[load] {msg.get('kind')} {msg.get('model_id')} "
                                   f"({info.get('loaded_bytes', 0)/GB:.2f} GB)")
                         else:
@@ -1134,6 +1135,10 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     # #stt-serve: a transcription (esp. long audio on CPU) takes many seconds —
                     # dispatch as a task so this loop keeps serving; handler replies keyed by req_id.
                     asyncio.create_task(worker.handle_stt_gen(msg, reply))
+                elif mtype == "t2music_gen":
+                    # #t2music-serve: a MusicGen render takes many seconds — dispatch as a task so
+                    # this loop keeps serving unload/ping; handler replies keyed by req_id.
+                    asyncio.create_task(worker.handle_t2music_gen(msg, reply))
                 elif mtype == "unload":
                     await worker.handle_unload(msg.get("model_id"), tenant)
                 elif mtype == "handoff":        # #handoff: move this node to another controller

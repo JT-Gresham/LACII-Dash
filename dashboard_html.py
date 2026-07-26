@@ -452,6 +452,7 @@ function modelRow(m,s){
     video:['🎞 video','Accepts video input (video token support in the checkpoint).'],
     stt:['🎤 stt','Accepts audio input (speech understanding — ask it what was said).'],
     tts:['🔊 tts','Speech output — synthesize WAV via /v1/audio/speech or the Text-to-speech panel in the model detail.'],
+    t2music:['🎵 music','Text-to-music (MusicGen) — autoregressive transformer + EnCodec; generate a WAV via POST /v1/audio/music or the Generate music panel. Runs on AMD / NVIDIA / CPU.'],
     ocr:['🔤 ocr','OCR-specialist checkpoint — built for document/text extraction from images (beyond generic vision).'],
     embedding:['🧮 embed','Embedding encoder — /api/embed + /v1/embeddings, not a chat model.']};
   const capChips=(m.capabilities||[]).filter(c=>CAPB[c]).map(c=>'<span class="chip" title="'+CAPB[c][1]+'">'+CAPB[c][0]+'</span>').join('');
@@ -572,7 +573,7 @@ function int4Badge(m){
   // shard cache — a compile would fail (decoder-shaped packer) and the payoff is false. Same
   // for the single-node media kinds (tts/t2a — Kokoro, ACE-Step): their leaves build whole
   // pipelines and never touch _shards/. No badge for any of them.
-  const _nocache=['embedding','t2i','tts','t2a'];
+  const _nocache=['embedding','t2i','tts','t2a','t2music'];
   if(!m.ready||(cz.int4&&cz.int4.ok)||(m.capabilities||[]).some(c=>_nocache.includes(c)))return '';
   const dk=(((LAST||{}).disk||{}).models||[]).find(x=>x.name===m.name||x.internal_name===m.internal_name)||{};
   const est=(dk.quant_gb||{}).int4, free=((LAST||{}).disk||{}).controller_free_gb;
@@ -819,7 +820,7 @@ function detailLive(name){
   if(m.loaded && m.media){
     const md=m.media; let o=''; const oadd=(k,v)=>{ if(v!=null&&v!=='') o+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
     const gen=(m.active||0)>0;
-    const KIND={tts:'Text-to-speech',t2i:'Text-to-image',t2a:'Text-to-audio (music)'};
+    const KIND={tts:'Text-to-speech',t2i:'Text-to-image',t2a:'Text-to-audio (music)',t2music:'Text-to-music (MusicGen)'};
     oadd('type',esc(KIND[md.kind]||md.kind||'media')+(md.engine?(' · '+esc(md.engine)):''));
     oadd('state', gen?('<span style="color:var(--good)">● generating'+((m.active||0)>1?(' ×'+m.active):'')+'</span>'):'<span class="em">idle</span>');
     if((m.queued||0)>0) oadd('queue','<span style="color:var(--warn)">'+m.queued+' waiting</span>');
@@ -830,6 +831,13 @@ function detailLive(name){
     oadd('VRAM',gb(m.vram_used_gb));
     if((m.ram_used_gb||0)>0.01) oadd('RAM',gb(m.ram_used_gb));
     if(md.sample_rate) oadd('sample rate',(md.sample_rate/1000)+' kHz');
+    if(md.variant) oadd('variant','MusicGen '+esc(md.variant));
+    if(md.backend) oadd('backend',esc(md.backend));
+    if(md.arch) oadd('architecture',esc(md.arch));
+    if(md.codec) oadd('audio codec',esc(md.codec));
+    if(md.frame_rate) oadd('token rate',md.frame_rate+' Hz');
+    if(md.max_duration_s!=null) oadd('max clip',md.max_duration_s+'s');
+    if(md.channels) oadd('channels',md.channels===1?'mono':md.channels);
     if(md.n_voices){
       const vlist=(md.voices||[]);
       oadd('voices', vlist.length
@@ -1036,6 +1044,31 @@ async function openDetail(name){
       +'<audio id="t2a-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
       +'<div><a id="t2a-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
   }
+  // #t2music-serve: MusicGen music box — text prompt + duration/guidance/temperature/top-k/seed,
+  // POST /v1/audio/music, play the WAV inline + download. STATIC (outside #dlive) so the per-poll
+  // live refresh can\'t wipe fields mid-typing. Served from the controller so the download works here.
+  let t2mg='';
+  if(m.loaded && (m.capabilities||[]).includes('t2music')){
+    const _ig='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
+    const _mv=((m.media||{}).variant||''); const _mdev=((m.media||{}).device==='GPU')?'GPU':'CPU';
+    t2mg='<h3 style="font-size:13px;margin-top:14px">Generate music <span class="em" style="font-weight:normal">· MusicGen '+esc(_mv)+' — autoregressive render on '+_mdev+'</span></h3>'
+      +'<textarea id="t2m-prompt" rows="2" placeholder="Describe the music — e.g. upbeat 80s synthwave, driving drums, warm analog bass, bright arpeggiated lead" style="width:100%;box-sizing:border-box;resize:vertical;'+_ig+'"></textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Clip length in seconds. MusicGen is trained around 10–30 s; longer just extends. Autoregressive — time scales with length.">Duration</label>'
+      +'<input id="t2m-dur" type="number" value="12" min="1" max="60" style="width:60px;'+_ig+'"><span class="em" style="font-size:11px;margin-left:-4px">s</span>'
+      +'<label style="font-size:12px;color:var(--muted)" title="Classifier-free guidance: how strongly it follows the prompt. 3 is the MusicGen default; higher = more on-prompt, less varied.">Guidance</label>'
+      +'<input id="t2m-guid" type="number" value="3" step="0.5" min="1" max="10" style="width:56px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Sampling temperature: higher = more varied, lower = more deterministic. 1.0 default.">Temp</label>'
+      +'<input id="t2m-temp" type="number" value="1.0" step="0.05" min="0.1" max="2" style="width:56px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Top-k sampling: consider the k most-likely tokens each step. 250 default.">Top-k</label>'
+      +'<input id="t2m-topk" type="number" value="250" min="0" max="1000" style="width:64px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Blank = random. Same seed + prompt + settings = the same track every time.">Seed</label>'
+      +'<input id="t2m-seed" type="number" placeholder="rnd" style="width:80px;'+_ig+'">'
+      +'<button class="btn sm pri" id="t2m-go" onclick="t2mGen(\''+esc(name)+'\')">Generate ▶</button>'
+      +'<span id="t2m-status" class="em" style="font-size:11px"></span></div>'
+      +'<audio id="t2m-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
+      +'<div><a id="t2m-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
+  }
   // #persist / #no-unload: per-model lifecycle pins (work for loaded AND not-loaded models — the
   // controller reports current state via LAST.controller.{persist_models,no_unload_models}).
   const _pc=(LAST&&LAST.controller)||{}, _pk=m.internal_name||m.friendly||name;
@@ -1049,7 +1082,8 @@ async function openDetail(name){
   let acts='';
   const _isT2i=(m.capabilities||[]).includes('t2i');
   const _isT2a=(m.capabilities||[]).includes('t2a');
-  if(m.loaded&&(_isT2i||_isT2a)) acts='<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button>';
+  const _isT2m=(m.capabilities||[]).includes('t2music');
+  if(m.loaded&&(_isT2i||_isT2a||_isT2m)) acts='<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button>';
   else if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
     +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
     +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
@@ -1060,11 +1094,14 @@ async function openDetail(name){
   else if(_isT2a) acts='<button class="btn sm pri" onclick="t2aLoadDlg(\''+esc(name)+'\')">Load 🎵</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
+  else if(_isT2m) acts='<button class="btn sm pri" onclick="loadT2music(\''+esc(name)+'\')">Load 🎵</button> '
+    +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
+    +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   else acts='<button class="btn sm pri" onclick="closeOv();openLoad(\''+esc(name)+'\')">Load…</button> '
     +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
     +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
-    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+t2ig+t2ag+tts+pre+pers
+    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+t2ig+t2ag+t2mg+tts+pre+pers
     +'<div id="mi_more"><div class="empty">loading full model info…</div></div>'
     +'<div style="margin-top:16px">'+acts+'</div>';
   $('#ov').classList.add('show');
@@ -1145,6 +1182,15 @@ function loadT2a(name,off){
   api('/load?model='+encodeURIComponent(name)+(off?'&t2i_offload=1':''),{method:'POST'})
     .then(()=>{toast(name+' ready — open its card to generate');tick();})
     .catch(e=>errDlg('music pipeline load failed',String(e.message||e)));
+  tick();
+}
+// #t2music-serve: load a MusicGen model (no offload dance — small autoregressive net). The FIRST
+// render also JIT-warms the EnCodec audio decoder once (esp. on ROCm/gfx1151), then renders are fast.
+function loadT2music(name){
+  toast('loading MusicGen '+name+' — the first render also warms the audio decoder (one-time)…');
+  api('/load?model='+encodeURIComponent(name),{method:'POST'})
+    .then(()=>{toast(name+' ready — open its card to generate music');tick();})
+    .catch(e=>errDlg('MusicGen load failed',String(e.message||e)));
   tick();
 }
 function errDlg(title,msg){
@@ -1242,6 +1288,32 @@ async function t2aGen(name){
     au.src=url; au.style.display='block'; au.play().catch(()=>{});
     dl.href=url; dl.download=name.replace(/[^a-z0-9]+/gi,'_')+'_'+durS+'s_'+Date.now()+'.wav'; dl.style.display='inline';
     st.textContent='done · '+durS+'s · '+(blob.size/1e6).toFixed(1)+' MB · rendered in '+((Date.now()-t0)/1000).toFixed(1)+'s';
+  }catch(e){ st.textContent=''; toast(String(e.message||e),1); }
+  finally{ clearInterval(tick_); btn.disabled=false; }
+}
+// #t2music-serve: render music from the detail modal via MusicGen. Raw fetch (NOT api()) —
+// /v1/audio/music returns binary WAV; read it as a blob, play it, offer a working download.
+async function t2mGen(name){
+  const p=($('#t2m-prompt').value||'').trim(); if(!p){ toast('describe the music first',1); return; }
+  const durS=parseInt($('#t2m-dur').value||'12')||12;
+  const guid=parseFloat($('#t2m-guid').value||'3'); const temp=parseFloat($('#t2m-temp').value||'1.0');
+  const topk=parseInt($('#t2m-topk').value||'250'); const seed=($('#t2m-seed').value||'').trim();
+  const btn=$('#t2m-go'), st=$('#t2m-status'), au=$('#t2m-audio'), dl=$('#t2m-dl');
+  btn.disabled=true; const t0=Date.now();
+  const tick_=setInterval(()=>{ if(st){ const m=(LAST.models||[]).find(x=>x.name===name)||{};
+    st.textContent='generating '+durS+'s… '+Math.round((Date.now()-t0)/1000)+'s'
+      +(m.t2music_step?(' · '+Math.round(100*m.t2music_step/(m.t2music_total||1))+'%'):''); } },1000);
+  try{
+    const body={model:name,prompt:p,duration:durS,guidance:guid,temperature:temp,top_k:topk,response_format:'wav'};
+    if(seed!=='')body.seed=parseInt(seed);
+    const r=await fetch('/v1/audio/music',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){ let msg='HTTP '+r.status; try{ const j=await r.json(); msg=(j.error&&j.error.message)||j.error||msg; }catch(e){} throw new Error(msg); }
+    const blob=await r.blob();
+    if(au._url)URL.revokeObjectURL(au._url);
+    const url=URL.createObjectURL(blob); au._url=url;
+    au.src=url; au.style.display='block'; au.play().catch(()=>{});
+    dl.href=url; dl.download=name.replace(/[^a-z0-9]+/gi,'_')+'_'+durS+'s_'+Date.now()+'.wav'; dl.style.display='inline';
+    st.textContent='done · '+durS+'s · '+(blob.size/1e6).toFixed(1)+' MB · generated in '+((Date.now()-t0)/1000).toFixed(1)+'s';
   }catch(e){ st.textContent=''; toast(String(e.message||e),1); }
   finally{ clearInterval(tick_); btn.disabled=false; }
 }
