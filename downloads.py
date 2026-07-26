@@ -63,12 +63,17 @@ def _pull_repo_interruptible(friendly: str, repo_id: str):
     # + voices/*.pt). Pull those too so "+ Add model" fetches a COMPLETE non-safetensors model
     # instead of just config.json. Gated on "no safetensors" so ordinary checkpoints never pull
     # redundant/stray .pt (training snapshots, EMA copies) alongside their real safetensors.
-    # #t2music: MusicGen ships its weights as pytorch_model.bin (NO safetensors, NOT .pth/.pt) —
-    # add .bin so "+ Add model" fetches a COMPLETE MusicGen instead of just config.json. Gated on
-    # "no safetensors" so ordinary checkpoints never pull a redundant pytorch_model.bin.
+    # #t2music: MusicGen ships weights as pytorch_model.bin (NO safetensors, NOT .pth/.pt). Add the
+    # HF weight .bin (pytorch_model*/model*) so "+ Add model" fetches a COMPLETE MusicGen — but NOT
+    # the redundant raw state_dict.bin / compression_state_dict.bin it ALSO ships (they duplicate the
+    # HF weights ~2x and from_pretrained ignores them; verified medium loads from pytorch_model.bin
+    # alone). Gated on "no safetensors" so ordinary checkpoints never pull a stray .bin.
+    _hf_bin = []
     if not any(f.endswith(".safetensors") for f in files):
-        _ext += [".pth", ".pt", ".bin"]
-    wanted = [f for f in files if f.endswith(tuple(_ext))]
+        _ext += [".pth", ".pt"]
+        _hf_bin = [f for f in files if f.endswith(".bin")
+                   and f.rsplit("/", 1)[-1].startswith(("pytorch_model", "model"))]
+    wanted = [f for f in files if f.endswith(tuple(_ext))] + _hf_bin
     for f in wanted:
         ctrl = DOWNLOAD_CONTROL.get(friendly)        # checked BETWEEN files (cheap dict read)
         if ctrl in ("pause", "stop"):
