@@ -683,7 +683,7 @@ def _tree_weight_bytes(d: str) -> int:
             if f.endswith(".safetensors"):
                 with contextlib.suppress(OSError):
                     total += os.path.getsize(os.path.join(root, f))
-            elif f.endswith((".pth", ".pt")):
+            elif f.endswith((".pth", ".pt", ".bin")):   # #t2music: MusicGen weights = pytorch_model.bin
                 with contextlib.suppress(OSError):
                     pt_total += os.path.getsize(os.path.join(root, f))
     return total or pt_total
@@ -814,7 +814,7 @@ def _hf_total_bytes(repo_id: str) -> int:
         # branch (a repo with no safetensors ships weights as .pth/.pt, e.g. Kokoro).
         _ext = [".safetensors", ".json", ".jinja", ".txt", ".model", ".py"]
         if not any((s.rfilename or "").endswith(".safetensors") for s in sib):
-            _ext += [".pth", ".pt"]
+            _ext += [".pth", ".pt", ".bin"]   # #t2music: MusicGen weights = pytorch_model.bin
         return sum(int(s.size or 0) for s in sib
                    if (s.rfilename or "").endswith(tuple(_ext)))
     except Exception:

@@ -63,8 +63,11 @@ def _pull_repo_interruptible(friendly: str, repo_id: str):
     # + voices/*.pt). Pull those too so "+ Add model" fetches a COMPLETE non-safetensors model
     # instead of just config.json. Gated on "no safetensors" so ordinary checkpoints never pull
     # redundant/stray .pt (training snapshots, EMA copies) alongside their real safetensors.
+    # #t2music: MusicGen ships its weights as pytorch_model.bin (NO safetensors, NOT .pth/.pt) —
+    # add .bin so "+ Add model" fetches a COMPLETE MusicGen instead of just config.json. Gated on
+    # "no safetensors" so ordinary checkpoints never pull a redundant pytorch_model.bin.
     if not any(f.endswith(".safetensors") for f in files):
-        _ext += [".pth", ".pt"]
+        _ext += [".pth", ".pt", ".bin"]
     wanted = [f for f in files if f.endswith(tuple(_ext))]
     for f in wanted:
         ctrl = DOWNLOAD_CONTROL.get(friendly)        # checked BETWEEN files (cheap dict read)
