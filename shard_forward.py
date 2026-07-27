@@ -862,12 +862,17 @@ class ShardForwardMixin:
         self._graph_ok goes False permanently on a failed build/self-check."""
         en = getattr(self, "_graph_en", None)
         if en is None:
-            import os
+            import os, torch
             ok = False
             try:
                 ud = self.uniform_device
                 if (os.environ.get("INFINITEMODEL_CUDA_GRAPH")
                         and ud is not None and getattr(ud, "type", None) == "cuda"
+                        # #5 HIP guard: ROCm reports device.type=="cuda", but a HIP graph SILENTLY
+                        # corrupts int4 decode logits on gfx1151 (a plausible-but-wrong output the
+                        # graph self-check need not catch). Never graph on HIP even if the env flag is
+                        # set -- INFINITEMODEL_CUDA_GRAPH targets real CUDA only (HIP-graph dead-end).
+                        and not getattr(torch.version, "hip", None)
                         and self.has_embed and self.has_head
                         and not self._hybrid and not self._omni and not getattr(self, "_mrope3d", False)
                         and getattr(self, "kv_quant", "none") == "none"   # #172: graph mirrors a
