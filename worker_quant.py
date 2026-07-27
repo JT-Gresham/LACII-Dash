@@ -917,6 +917,15 @@ def _w4a16_moe_op_locked():
                 # #dram-dealias: what the de-aliased (row-padded) gemma-26b gate_up wants on
                 # gfx1151 (+8% over BN=128 there; never picked where it loses)
                 triton.Config({"BN": 256, "SPLITK": 4}, num_warps=8, num_stages=2),
+                # #moe-30b: small-hidden A3B MoE (Qwen3-30B-A3B: hidden 2048, moe_intermediate 768
+                # -> gate_up K=2048/16 groups, down K=768/6 groups). The grid above has no SPLITK
+                # that divides the down-proj's 6 K-groups evenly, so SPLITK=8 wastes atomic-of-zero
+                # traffic on 2 idle splits. SPLITK=6 splits it cleanly (1 group/split, no idle).
+                # SPLITK=16 gives the gate_up max K-parallelism (1 group/split) at fine BN=64 for
+                # the small N=1536, lifting the grid for the tiny B=tokens*top_k (~8) decode shape.
+                # Both are bench-gated (reset_to_zero) -> picked only where they win, never worse.
+                triton.Config({"BN": 128, "SPLITK": 6}, num_warps=4, num_stages=3),
+                triton.Config({"BN": 64, "SPLITK": 16}, num_warps=2, num_stages=2),
             ],
             # sqn (within-expert row stride) is in the key so the load-time pad-vs-unpadded
             # bench (Packed4Tensor3D.prepare_fused) tunes each variant separately instead of
