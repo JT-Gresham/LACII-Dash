@@ -1677,6 +1677,15 @@ def _install_fused_moe_forward(experts_mod) -> None:
         gate, up = yb.chunk(2, dim=-1)                    # gate_up_proj output is [gate(I) | up(I)]
         h = self.act_fn(gate) * up
         zb = op(h, eid, dn_h.qweight, dn_h.scale, dn_h.zero, dn_h.group_size, dn_h.in_features)
+        # #moe-gather-fuse: a single decode token (T==1, the hot path) sums its top_k weighted
+        # expert rows — that IS the matvec w[1,top_k] @ zb[top_k,H]. Folding it collapses the tail
+        # (w-scale + zeros_like + arange + repeat_interleave + index_add = 5 launches) into ONE
+        # GEMV, cutting ~4 kernel launches per MoE layer per token on the launch-bound decode path
+        # (~192/token at 48 layers). Bit-equivalent within decode tolerance — the same weighted sum
+        # orig_forward computes, reassociated (the matmul even accumulates in fp32, unlike the bf16
+        # index_add). T>1 (tiny prefill chunks) keeps the general scatter. _selfcheck covers T==1.
+        if T == 1:
+            return (w.unsqueeze(0) @ zb).to(hidden_states.dtype)     # [1,top_k]@[top_k,H] -> [1,H]
         zb = zb * w[:, None]
         final = torch.zeros_like(hidden_states)
         tok = torch.arange(T, device=hidden_states.device).repeat_interleave(top_k)
@@ -1692,25 +1701,31 @@ def _install_fused_moe_forward(experts_mod) -> None:
             H = int(gu_h.in_features)
             dev = gu_h.qweight.device
             k = min(8, E)
-            x = torch.randn(2, H, device=dev, dtype=torch.bfloat16) * 0.1
-            idx = torch.stack([torch.randperm(E, device=dev)[:k] for _ in range(2)])
-            wts = (torch.rand(2, k, device=dev, dtype=torch.bfloat16) + 0.1)
-            # The reference must be INDEPENDENT of any Triton path, else orig_forward routes the SAME
-            # w4a16 kernel (Packed4Tensor3D.__getitem__'s _expert_triton subclass) and a shared bug
-            # would pass. Force both holders to the bf16 dequant for the reference, then restore lazy
-            # state so the eager fallback path keeps its own fast per-expert kernel.
-            sv = (gu_h._expert_triton, dn_h._expert_triton)
-            gu_h._expert_triton = dn_h._expert_triton = False
-            try:
-                ref = orig_forward(x, idx, wts).float()
-            finally:
-                gu_h._expert_triton, dn_h._expert_triton = sv
-            out = _compute(self, x, idx, wts).float()
-            scale = ref.abs().mean() + 1e-6
-            rel = ((out - ref).abs().mean() / scale).item()
-            relmax = ((out - ref).abs().max() / (ref.abs().max() + 1e-6)).item()   # worst element vs signal
-            ok = rel < 0.03 and relmax < 0.1
-            _builtins.print(f"[int4] fused-MoE self-check rel={rel:.4f} max={relmax:.4f} -> "
+            # Validate BOTH shapes: the T>1 general scatter AND the T==1 fused-gather branch
+            # (#moe-gather-fuse). Decode is T==1, so a T==2-only check would never exercise the
+            # fused matvec path — a bug there would corrupt decode silently.
+            worst = worst_max = 0.0
+            for T in (2, 1):
+                x = torch.randn(T, H, device=dev, dtype=torch.bfloat16) * 0.1
+                idx = torch.stack([torch.randperm(E, device=dev)[:k] for _ in range(T)])
+                wts = (torch.rand(T, k, device=dev, dtype=torch.bfloat16) + 0.1)
+                # The reference must be INDEPENDENT of any Triton path, else orig_forward routes the
+                # SAME w4a16 kernel (Packed4Tensor3D.__getitem__'s _expert_triton subclass) and a
+                # shared bug would pass. Force both holders to the bf16 dequant for the reference,
+                # then restore lazy state so the eager fallback keeps its own fast per-expert kernel.
+                sv = (gu_h._expert_triton, dn_h._expert_triton)
+                gu_h._expert_triton = dn_h._expert_triton = False
+                try:
+                    ref = orig_forward(x, idx, wts).float()
+                finally:
+                    gu_h._expert_triton, dn_h._expert_triton = sv
+                out = _compute(self, x, idx, wts).float()
+                scale = ref.abs().mean() + 1e-6
+                worst = max(worst, ((out - ref).abs().mean() / scale).item())
+                worst_max = max(worst_max,
+                                ((out - ref).abs().max() / (ref.abs().max() + 1e-6)).item())
+            ok = worst < 0.03 and worst_max < 0.1
+            _builtins.print(f"[int4] fused-MoE self-check rel={worst:.4f} max={worst_max:.4f} -> "
                             f"{'ACTIVE' if ok else 'fallback (per-expert)'}", flush=True)
             return ok
         except Exception as exc:
