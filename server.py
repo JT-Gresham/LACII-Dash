@@ -333,20 +333,14 @@ MODELS: dict[str, tuple[str, str]] = {
         "Qwen/Qwen3.6-35B-A3B",
         "Qwen/Qwen3.6-35B-A3B",
     ),
-    # MoE (Qwen3-30B-A3B-Instruct-2507): 128 experts / 8 active, ~30.5B total but only ~3.3B
-    # active/token. Draft = Qwen3-0.6B (SAME Qwen3 151936-vocab/tokenizer) so a draft_gpu load
-    # auto-attaches it controller-side and greedy options.speculative=true requests get
-    # draft-K/verify-once decode. Promoted to a built-in PAIR because a custom /add_model entry
-    # registers draft==target (spec off); the built-in is seeded before custom_models.json merges
-    # (MODELS.setdefault), so it wins and flips spec ON. #spec NOTE: on a SMALL-active MoE the
-    # per-token verify sweep is already cheap (~3.3B active, not the 70B's 37.8 GB/token), so
-    # spec only pays off when draft steps are cheap AND acceptance is high — measure before relying
-    # on it (it can tie/lose when draft+verify serialize on one GPU). Spec stays opt-in per request,
-    # so the pairing is harmless when unused.
-    "qwen3-30b-a3b-instruct": (
-        "Qwen/Qwen3-30B-A3B-Instruct-2507",
-        "Qwen/Qwen3-0.6B",
-    ),
+    # NOTE (#spec, measured 2026-07-27): qwen3-30b-a3b-instruct was briefly paired with a
+    # Qwen3-0.6B draft to try speculative decode, and it MEASURED A LOSS on gfx1151 — 10.2 vs
+    # 27.2 tok/s plain (2.7x SLOWER), 34% draft acceptance. A 3.3B-ACTIVE MoE's verify sweep is
+    # already cheap, so the K draft steps + verify (which serialize on the one gfx1151 GPU) cost
+    # far more than the ~2.35 tok/round they save. The pairing also forced a draft download+attach
+    # on EVERY load (the _load_draft call fires whenever draft_id != target_id, not just draft_gpu),
+    # thrashing unified-memory SVM. So it's intentionally left as draft==target (spec OFF). Spec
+    # stays reserved for big DENSE targets (llama-3.3-70b) where the verify sweep dominates.
     # Encoder / sentence-embedding (nomic_bert, ~140M params). Served by the single-node
     # embedding path (no pipeline/TP/KV/lm_head); draft "" since there's no decode.
     "nomic-embed-text": ("nomic-ai/nomic-embed-text-v1.5", ""),
