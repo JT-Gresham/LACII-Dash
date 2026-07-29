@@ -1029,7 +1029,7 @@ async function openDetail(name){
     const _ig='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
     t2ag='<h3 style="font-size:13px;margin-top:14px">Generate music <span class="em" style="font-weight:normal">· ACE-Step flow-matching render on the model\'s GPU worker</span></h3>'
       +'<textarea id="t2a-prompt" rows="2" placeholder="Style / genre tags — e.g. melodic techno, warm analog pads, driving sub-bass, 124 bpm, instrumental" style="width:100%;box-sizing:border-box;resize:vertical;'+_ig+'"></textarea>'
-      +'<textarea id="t2a-lyrics" rows="2" placeholder="Lyrics (optional — blank = instrumental). [verse] / [chorus] tags give it structure." style="width:100%;box-sizing:border-box;resize:vertical;margin-top:6px;'+_ig+'"></textarea>'
+      +'<textarea id="t2a-lyrics" rows="2" placeholder="[instrumental] = no vocals. Replace with your lyrics; [verse] / [chorus] tags give structure." style="width:100%;box-sizing:border-box;resize:vertical;margin-top:6px;'+_ig+'">[instrumental]</textarea>'
       +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
       +'<label style="font-size:12px;color:var(--muted)" title="Clip length in seconds (3–240; ACE-Step caps at ~4 min). Longer clips develop more; short ones can loop.">Duration</label>'
       +'<input id="t2a-dur" type="number" value="30" min="3" max="240" style="width:66px;'+_ig+'"><span class="em" style="font-size:11px;margin-left:-4px">s</span>'
