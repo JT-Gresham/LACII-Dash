@@ -803,6 +803,11 @@ def _spec_from_config(model_dir: str, name: str) -> Optional[ModelSpec]:
 # The controller is the single source of weights and NEVER auto-purges; models are kept until
 # explicitly deleted. Only models fully present on disk are reported as available.
 _READY_CACHE: dict[str, tuple[float, bool]] = {}
+# #ready-ttl: seconds a model_ready() answer is reused before re-walking the model dir. Deliberately
+# LONG (was 3s) — see model_ready(). Real changes invalidate the entry explicitly, so this only
+# bounds how stale a MISSED external change (e.g. files rsync'd in behind the controller's back)
+# can look on the dashboard.
+_READY_TTL: float = float(os.environ.get("INFINITEMODEL_READY_TTL", "60") or 60)
 
 
 def _hf_total_bytes(repo_id: str) -> int:
@@ -859,9 +864,17 @@ def _hf_cache_bytes(repo_id: str) -> int:
     return total
 
 
-def model_ready(target_id: str, ttl: float = 3.0) -> bool:
+def model_ready(target_id: str, ttl: float = _READY_TTL) -> bool:
     """True iff the model is fully on disk — in models/ OR still in the HF cache
-    (a load migrates cache->models/). No network. Cached (the dashboard polls)."""
+    (a load migrates cache->models/). No network. Cached (the dashboard polls).
+
+    #ready-ttl: the TTL was 3s, which made /status re-walk EVERY registered model's directory on
+    essentially every dashboard poll. On local disk that is cheap; on a NETWORK models dir (NFS/CIFS)
+    under load each walk takes seconds, so /status blocked, its connections queued holding sockets,
+    and the controller hit `OSError: [Errno 24] Too many open files` — twice on 2026-07-30 (at the
+    1024 soft limit, then again at 65535). Readiness only changes when a download/copy/delete
+    finishes, and every one of those paths already calls _invalidate_ready_cache(), so a short TTL
+    buys no freshness — it only multiplies filesystem work. INFINITEMODEL_READY_TTL overrides."""
     now = time.time()
     hit = _READY_CACHE.get(target_id)
     if hit and now - hit[0] < ttl:
