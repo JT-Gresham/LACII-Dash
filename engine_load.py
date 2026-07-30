@@ -315,6 +315,21 @@ class EngineLoadMixin:
                 f"missing on {', '.join(_nocap)} (stale worker code; self-update those nodes "
                 f"or load with kv_slots=1)")
 
+    def _ld_phase(self, reg_key: str, text: str) -> None:
+        """#load-phase: record what a load is DOING right now on its progress card.
+
+        Everything before dispatch (planning, evicting a resident copy, reading the weight map,
+        verifying the shard cache) has no shard or byte totals yet, so the card would otherwise sit
+        at a motionless "0/0" for minutes on a network models dir — indistinguishable from a hung
+        load, which invites a pointless restart. Naming the live sub-step keeps it honest.
+        Best-effort: progress reporting must never break a load."""
+        try:
+            c = self.loadings.get(reg_key)
+            if c is not None:
+                c["phase"] = text
+        except Exception:
+            pass
+
     async def load(self, friendly: str, ctx: int, consolidate: bool = True,
                    prefer_vram: bool = True, quant: str = "none", tp: int = 1,
                    cpu_only: bool = False, reg_key: Optional[str] = None,
@@ -362,8 +377,12 @@ class EngineLoadMixin:
             async with self._load_gate:
                 _c = self.loadings.get(rk)
                 if _c is not None and _c.get("state") == "queued":
-                    _c["state"] = "loading"
-                    _c["started"] = time.time()   # time the STREAMING, not the queue wait
+                    # our turn: leave "queued" for the PRE-dispatch phase (planning / evicting a
+                    # resident copy / reading the weight map) — _load_impl flips it to "loading"
+                    # when it publishes the real shard+byte totals at dispatch.
+                    _c["state"] = "planning"
+                    _c["basis"] = "planning…"
+                    _c["started"] = time.time()   # time the LOAD, not the queue wait
                 return await self._load_impl(friendly, ctx, consolidate=consolidate,
                                          prefer_vram=prefer_vram, quant=quant, tp=tp,
                                          cpu_only=cpu_only, reg_key=reg_key,
@@ -460,6 +479,12 @@ class EngineLoadMixin:
                     "model": friendly, "display_model": _ollama_name(friendly),
                     "target": MODELS[friendly][0] if friendly in MODELS else friendly,
                     "ready": 0, "total": 0, "stages_total": 0, "stages_ready": 0,
+                    # #load-phase: PRE-dispatch. Shard/byte totals aren't known yet (they come from
+                    # the plan), so a "0/0" progress bar here reads as a frozen download — this phase
+                    # can take minutes on a network models dir (weight-map reads, evicting a resident
+                    # copy, cache verification). Name the phase instead so the card is honest.
+                    "state": "planning",
+                    "bytes_total": 0, "bytes_done": 0,
                     "basis": "planning…", "warnings": [], "started": time.time(),
                     # #connections: which client asked for this load ("" = internal/auto)
                     "requested_by": requested_by or ""}
@@ -621,6 +646,7 @@ class EngineLoadMixin:
             # (spec.for_kv_slots is applied AFTER the TP branches below — a TP/auto-TP load
             # never carries slots, so its plan must see the unscaled 1-stream KV figure.)
             await self.ensure_data_listener()
+            self._ld_phase(reg_key, "planning placement")
             log_activity(f"load {friendly}: planning (ctx={ctx}, quant={quant}"
                          + (f", kv_quant={kv_quant}" if kv_quant != "none" else "")
                          + (", KV-OFFLOAD (KV cache in system RAM)" if kv_offload else "")
@@ -773,6 +799,7 @@ class EngineLoadMixin:
                                         _t += os.path.getsize(os.path.join(_r, _f))
                             return _t
                         _cache_read_gb = (await asyncio.to_thread(_cache_tree_bytes)) / GB
+                        self._ld_phase(reg_key, f"reading {quant} shard cache")
                         log_activity(f"{friendly}: serving from {quant} shard cache "
                                      f"(~{_cache_read_gb:.1f} GB pre-packed; skip bf16 stream "
                                      f"+ per-layer re-quant)")
@@ -1077,6 +1104,7 @@ class EngineLoadMixin:
                 basis = _describe_plan(stages, node_by_id, cpu_only, pv_eff, quant,
                                        gpu_spread=gpu_spread_eff)
                 log_activity(f"{friendly}: plan basis → {basis}")
+                self._ld_phase(reg_key, "dispatching shards to workers")
                 log_activity(f"{friendly}: handing out {total_shards} shard(s) across "
                              f"{n_stages} node(s) -> " + ", ".join(
                     f"{s.hostname}(L{s.layer_start}-{s.layer_end})" for s in stages))
@@ -1226,6 +1254,7 @@ class EngineLoadMixin:
                         "plan_ram_bytes": int(st.est_bytes),
                     })
 
+                self._ld_phase(reg_key, "workers fetching weights")
                 log_activity(f"{friendly}: awaiting {n_stages} shard(s) — workers fetch weights, "
                              f"then mmap-load + fuse + place: {', '.join(s.hostname for s in stages)}")
 

@@ -206,6 +206,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   .row .acts{display:flex;align-items:center;gap:7px}
   .miniprog{height:4px;background:#0a0e14;border-radius:3px;margin-top:5px;max-width:280px;overflow:hidden}
   .miniprog > i{display:block;height:100%;background:var(--warn)}
+  /* #load-phase: pre-dispatch has no percentage to show (totals come from the plan). A sliding
+     indeterminate bar says "working" without faking progress at a stuck 0%. */
+  .miniprog.indet > i{width:35%;animation:indet 1.1s ease-in-out infinite}
+  @keyframes indet{0%{margin-left:-35%}100%{margin-left:100%}}
+  @media (prefers-reduced-motion: reduce){.miniprog.indet > i{animation:none;width:100%;opacity:.45}}
   .grp{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;padding:8px 15px 4px;background:var(--bg)}
   /* nodes */
   .node{display:grid;grid-template-columns:210px 1fr 1fr 96px;align-items:center;gap:14px;padding:8px 15px;border-bottom:1px solid var(--border);font-size:13px}
@@ -504,6 +509,14 @@ function modelRow(m,s){
     // "queued" with no progress bar — a 0% "loading" bar that cannot move reads as a hung load.
     if(ld.state==='queued'){
       meta='queued · waiting for the in-flight load'+(ld.elapsed_s?(' · '+Math.round(ld.elapsed_s)+'s'):'');
+    } else if(ld.state==='planning'){
+      // PRE-dispatch: shard/byte totals are not known yet (they come from the plan), so a 0/0 bar
+      // would read as a frozen download. On a network models dir this phase is minutes: reading the
+      // weight map, evicting a resident copy, verifying the shard cache. Show the LIVE sub-step
+      // (ld.phase, updated by engine._ld_phase) + an indeterminate bar so it is visibly alive.
+      meta='<span class="warn">preparing</span> · '+esc(ld.phase||'planning placement')
+          +(ld.elapsed_s?(' · '+Math.round(ld.elapsed_s)+'s'):'')
+          +'<div class="miniprog indet"><i></i></div>';
     } else {
       // #load-bytes: byte progress is the honest measure (shard counts are lumpy — a 4 GB embed
       // slice and a 0.3 GB layer both count as "1"). Bar tracks bytes when we have them.
