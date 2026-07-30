@@ -429,11 +429,34 @@ def register(app):
                 with contextlib.suppress(Exception):
                     t.cancel()
                 cancelled.append(rk)
+        # #phantom-load-card: a load whose OWNER already finished (or died on an exception) can leave
+        # a STALE progress card in engine.loadings with no task behind it — /status keeps advertising
+        # "loading" forever, so the dashboard's Cancel button 404s ("no in-flight load") and the card
+        # can never be dismissed. Seen live: a t2a (ace-step) auto-load that failed on capacity
+        # ("no GPU has ~8.0 GB free") left a state="planning" card spinning indefinitely. The owner
+        # registers its cancel handle when it creates the card (engine_load: _loading_tasks[reg_key] =
+        # current_task), so NO task (or a done() one) means there is no in-flight owner and the card is
+        # stale BY DEFINITION — purging it can't abort real work. Only consulted when nothing live was
+        # cancelled, so a genuine in-flight load always takes the cancel path above.
+        stale = []
         if not cancelled:
+            for rk in list(getattr(engine, "loadings", {}).keys()):
+                base = rk.split("#", 1)[0]
+                if friendly and rk != friendly and base != friendly:
+                    continue
+                t = engine._loading_tasks.get(rk)
+                if t is None or t.done():
+                    engine.loadings.pop(rk, None)
+                    engine._loading_tasks.pop(rk, None)
+                    stale.append(rk)
+        if not cancelled and not stale:
             return JSONResponse({"ok": False, "error": "no in-flight load"
                                  + (f" for '{model}'" if model else "")}, status_code=404)
-        log_activity(f"cancelled in-flight load(s): {', '.join(cancelled)}")
-        return JSONResponse({"ok": True, "cancelled": cancelled})
+        if cancelled:
+            log_activity(f"cancelled in-flight load(s): {', '.join(cancelled)}")
+        if stale:
+            log_activity(f"cleared stale load card(s) with no in-flight task: {', '.join(stale)}")
+        return JSONResponse({"ok": True, "cancelled": cancelled, "stale": stale})
 
     @app.post("/unload")
     async def unload(model: str = "", owner: str = "") -> JSONResponse:
