@@ -499,9 +499,22 @@ function modelRow(m,s){
     meta=parts.join(' · ')+graphG;
     acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
   } else if(s.k==='loading'){
-    const ld=s.ld||{}; const r=pc(ld.ready||0,ld.total||1);
-    meta='compiling/loading · '+(ld.ready||0)+'/'+(ld.total||'?')+' · '+Math.round(ld.elapsed_s||0)+'s'+(ld.eta_s?(' · eta '+Math.round(ld.eta_s)+'s'):'')
-        +'<div class="miniprog"><i style="width:'+r+'%"></i></div>';
+    const ld=s.ld||{};
+    // #load-queue: only ONE model streams at a time. A model still waiting for the gate shows
+    // "queued" with no progress bar — a 0% "loading" bar that cannot move reads as a hung load.
+    if(ld.state==='queued'){
+      meta='queued · waiting for the in-flight load'+(ld.elapsed_s?(' · '+Math.round(ld.elapsed_s)+'s'):'');
+    } else {
+      // #load-bytes: byte progress is the honest measure (shard counts are lumpy — a 4 GB embed
+      // slice and a 0.3 GB layer both count as "1"). Bar tracks bytes when we have them.
+      const bt=ld.bytes_total||0, bd=ld.bytes_done||0;
+      const r=bt>0?pc(bd,bt):pc(ld.ready||0,ld.total||1);
+      meta='compiling/loading · '+(ld.ready||0)+'/'+(ld.total||'?')
+          +(bt>0?(' · '+fmtB(bd)+' / '+fmtB(bt)):'')
+          +(ld.bytes_per_s?(' · '+fmtB(ld.bytes_per_s)+'/s'):'')
+          +' · '+Math.round(ld.elapsed_s||0)+'s'+(ld.eta_s?(' · eta '+Math.round(ld.eta_s)+'s'):'')
+          +'<div class="miniprog"><i style="width:'+r+'%"></i></div>';
+    }
     acts='<button class="btn sm ghost" onclick="cancelLoad(\''+esc(m.name)+'\')">Cancel</button>';
   } else if(s.k==='compiling'){
     const cp=s.ld||{}; const r=pc(cp.ready||0,cp.total||1);

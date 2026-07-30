@@ -342,8 +342,29 @@ class EngineLoadMixin:
         # pops) so no concurrent op observes both the reservation AND the now-resident model.
         rk = reg_key or friendly
         _own = {"v": False}
+        # #load-queue: only ONE load streams at a time (see engine._load_gate). While a load waits
+        # for the gate, publish a lightweight card in state="queued" so the dashboard shows "queued"
+        # instead of a "loading" bar that cannot move — the streaming hasn't started. The card is
+        # replaced wholesale by _load_impl once this call owns the slot (it sets state="loading").
+        # We pop our own placeholder in the finally ONLY if we never became the owner (a dedup
+        # waiter must not clear the real owner's card — the #parallel-load ownership rule).
+        _placeholder = False
+        if rk not in self.loadings and self._load_gate.locked():
+            _tgt = MODELS.get(friendly, (friendly, friendly))[0]
+            self.loadings[rk] = {"model": friendly, "display_model": _ollama_name(friendly),
+                                 "target": _tgt, "state": "queued",
+                                 "total": 0, "ready": 0, "stages_total": 0, "stages_ready": 0,
+                                 "bytes_total": 0, "bytes_done": 0,
+                                 "basis": "queued — waiting for the in-flight load to finish",
+                                 "started": time.time(), "requested_by": requested_by}
+            _placeholder = True
         try:
-            return await self._load_impl(friendly, ctx, consolidate=consolidate,
+            async with self._load_gate:
+                _c = self.loadings.get(rk)
+                if _c is not None and _c.get("state") == "queued":
+                    _c["state"] = "loading"
+                    _c["started"] = time.time()   # time the STREAMING, not the queue wait
+                return await self._load_impl(friendly, ctx, consolidate=consolidate,
                                          prefer_vram=prefer_vram, quant=quant, tp=tp,
                                          cpu_only=cpu_only, reg_key=reg_key,
                                          exclude_nodes=exclude_nodes, replica_idx=replica_idx,
@@ -366,6 +387,13 @@ class EngineLoadMixin:
                 _f = self._loading_futures.pop(rk, None)   # wake any same-model requests queued on us
                 if _f is not None and not _f.done():
                     _f.set_result(self.models.get(rk))
+            elif _placeholder:
+                # #load-queue: we published the "queued" placeholder but never owned the load (dedup
+                # waiter, or we failed/were cancelled before _load_impl registered). Clear only our
+                # own placeholder — never a real owner's card.
+                _c = self.loadings.get(rk)
+                if _c is not None and _c.get("state") == "queued":
+                    self.loadings.pop(rk, None)
 
     async def _load_impl(self, friendly: str, ctx: int, consolidate: bool = True,
                    prefer_vram: bool = True, quant: str = "none", tp: int = 1,
@@ -1053,8 +1081,21 @@ class EngineLoadMixin:
                              f"{n_stages} node(s) -> " + ", ".join(
                     f"{s.hostname}(L{s.layer_start}-{s.layer_end})" for s in stages))
                 _card0 = self.loadings.get(reg_key) or {}   # keep load-start time + requester
+                # #load-bytes: shard COUNT alone hides how much is actually moving — a 70B and a 4B
+                # both read "12/38 shards". Publish the byte total from the plan (est_bytes is what
+                # the placement already reserved per stage) and let the shard-serving path accumulate
+                # bytes_done per streamed chunk, so the card can show transferred/total and a rate.
+                _bytes_total = 0
+                for _s in stages:
+                    try:
+                        _bytes_total += int(getattr(_s, "est_bytes", 0) or 0)
+                    except Exception:
+                        pass
                 self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
                                 "target": target_id, "total": total_shards,
+                                "state": "loading",
+                                "bytes_total": _bytes_total,
+                                "bytes_done": int(_card0.get("bytes_done") or 0),
                                 "ready": 0, "stages_total": n_stages, "stages_ready": 0,
                                 "basis": basis, "warnings": load_warnings,
                                 "node_ids": [s.node_id for s in stages],   # reaper grace for builders

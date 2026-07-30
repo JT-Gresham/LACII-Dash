@@ -2017,6 +2017,15 @@ class Engine(EngineLoadMixin, EngineGenMixin, EngineLifecycleMixin, EngineSpeech
         # answerable atomically under the lock for the whole load — NOT just after planning (the
         # unload-all TOCTOU fix: a blanket teardown checks self.loadings under self.lock).
         self.loadings: dict[str, dict] = {}
+        # #load-queue: ONE model streams at a time. Concurrent loads all pull weights from the same
+        # controller disk/NIC (and, when models/ is a network mount, the same NFS/CIFS server), so
+        # running them in parallel does not finish any of them sooner — it just makes every load slow
+        # and, on a network models dir, starves /status until the controller runs out of sockets.
+        # Serialized instead: the first caller streams, the rest sit in state="queued" (dashboard
+        # shows "queued" rather than a stalled "loading") until their turn. INFINITEMODEL_LOAD_PARALLEL=N
+        # raises the concurrency for anyone on fast local NVMe who wants the old behaviour.
+        self._load_gate = asyncio.Semaphore(
+            max(1, int(os.environ.get("INFINITEMODEL_LOAD_PARALLEL", "1") or 1)))
         # In-flight COMPILE (shard-cache) progress cards, keyed by "<friendly>::<quant>" — compiles run
         # CONCURRENTLY with loads and each other (own thread, bounded per-layer memory); same-target
         # dup compiles are deduped (409). Surfaced on /status alongside loadings.

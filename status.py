@@ -41,14 +41,28 @@ def _loading_view(ld: Optional[dict]) -> Optional[dict]:
         return ld
     started = ld.get("started")
     out = dict(ld)
+    out.setdefault("state", "loading")     # #load-queue: older cards predate the field
     if started:
         elapsed = max(0.0, time.time() - started)
         out["elapsed_s"] = round(elapsed, 1)
         total = ld.get("total") or 0
         ready = ld.get("ready") or 0
         frac = (ready / total) if total > 0 else 0.0
-        # need a stable-ish fraction before an ETA is meaningful (>=3% in); cap at 4h display
-        out["eta_s"] = round(min(4 * 3600, elapsed * (1 - frac) / frac)) if frac >= 0.03 else None
+        # #load-bytes: prefer BYTE fraction for the ETA when we have it — shard counts are lumpy
+        # (a 4 GB embed slice and a 0.3 GB layer both count as "1"), so bytes track real progress
+        # much more smoothly. Falls back to the shard fraction when byte totals are unknown.
+        b_done, b_total = int(ld.get("bytes_done") or 0), int(ld.get("bytes_total") or 0)
+        if b_total > 0:
+            out["bytes_per_s"] = round(b_done / elapsed) if elapsed > 0.5 else None
+            frac = min(1.0, b_done / b_total) or frac
+        else:
+            out["bytes_per_s"] = None
+        # a QUEUED load has not started streaming — an ETA would be meaningless
+        if out.get("state") == "queued":
+            out["eta_s"] = None
+        else:
+            # need a stable-ish fraction before an ETA is meaningful (>=3% in); cap at 4h display
+            out["eta_s"] = round(min(4 * 3600, elapsed * (1 - frac) / frac)) if frac >= 0.03 else None
     return out
 
 

@@ -12,6 +12,23 @@ Request, resolve_model_name, _controller_model_dir, ...) are injected at startup
 from __future__ import annotations
 
 
+def _ld_bytes(target, n: int) -> None:
+    """#load-bytes: add `n` just-streamed bytes to the in-flight load card for `target`.
+
+    Shard COUNT alone hides how much is actually moving (a 70B and a 4B both read "12/38 shards"),
+    so the weight-serving paths call this per chunk and /status turns bytes_done/bytes_total into a
+    transferred/total figure plus a rate. `engine` is a module global injected by state.bind().
+    Best-effort and fully swallowed: this is the DATA PLANE — a progress counter must never be able
+    to break a weight stream. loadings is tiny (one card per in-flight load), so the scan is free."""
+    try:
+        for c in engine.loadings.values():
+            if c.get("target") == target:
+                c["bytes_done"] = int(c.get("bytes_done") or 0) + int(n)
+                return
+    except Exception:
+        pass
+
+
 def register(app):
 
     @app.get("/shard_status")           # #shard-cache: which quants are pre-compiled per model
@@ -726,6 +743,7 @@ def register(app):
                             if not chunk:
                                 break
                             net_account(cnid, to_node=len(chunk))
+                            _ld_bytes(target, len(chunk))
                             yield chunk
                     ld = next((c for c in engine.loadings.values()
                                if c.get("target") == target), None)
@@ -772,6 +790,7 @@ def register(app):
                     for i in range(0, len(deq), 8 * 1024 * 1024):
                         chunk = deq[i:i + 8 * 1024 * 1024]
                         net_account(nid, to_node=len(chunk))
+                        _ld_bytes(target, len(chunk))
                         yield chunk
                     continue
                 with open(p["fn"], "rb") as f:
@@ -783,6 +802,7 @@ def register(app):
                             break
                         left -= len(chunk)
                         net_account(nid, to_node=len(chunk))
+                        _ld_bytes(target, len(chunk))
                         yield chunk
             # whole slice streamed -> the worker now mmap-loads + fuses + places it
             log_activity(f"  {_host}: received L{start}-{end} ({total / GB:.2f} GB), building shard")
@@ -856,6 +876,7 @@ def register(app):
             for i in range(0, total, 8 * 1024 * 1024):
                 chunk = blob[i:i + 8 * 1024 * 1024]
                 net_account(nid, to_node=len(chunk))
+                _ld_bytes(target, len(chunk))
                 yield chunk
             ld = next((c for c in engine.loadings.values() if c.get("target") == target), None)
             if ld is not None:
@@ -917,6 +938,7 @@ def register(app):
                             break
                         left -= len(chunk)
                         net_account(nid, to_node=len(chunk))
+                        _ld_bytes(target, len(chunk))
                         yield chunk
 
         return StreamingResponse(_gen(), media_type="application/octet-stream",
