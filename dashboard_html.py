@@ -201,6 +201,11 @@ DASHBOARD_HTML = r"""<!doctype html>
      RIGHT-aligned: .meta is flex:1 so its LEFT edge starts wherever that model's name (.nm)
      ends — a left-aligned fixed-width spark therefore staggers row to row. .meta's RIGHT edge
      is common to every row (bounded by .acts), so aligning right lines the graphs up. */
+  /* #load-graph: downloaded-vs-total bar shown BESIDE a loading row. Deliberately NOT .mspark —
+     the poll wipes every #models .mspark from modelSparkCache, which would blank this. */
+  .ldspark{display:inline-block;vertical-align:middle;margin-left:10px;line-height:0}
+  .ldspark svg{vertical-align:middle}
+  .ldspark rect{transition:width .3s linear}
   .row .meta .mspark{margin-top:7px;line-height:0;text-align:right}
   .row .meta .mspark svg{max-width:100%;height:auto;vertical-align:middle}
   .row .acts{display:flex;align-items:center;gap:7px}
@@ -526,6 +531,7 @@ function modelRow(m,s){
           +(bt>0?(' · '+fmtB(bd)+' / '+fmtB(bt)):'')
           +(ld.bytes_per_s?(' · '+fmtB(ld.bytes_per_s)+'/s'):'')
           +' · '+Math.round(ld.elapsed_s||0)+'s'+(ld.eta_s?(' · eta '+Math.round(ld.eta_s)+'s'):'')
+          +loadGraph(ld)            // #load-graph: downloaded-vs-total, hover for exact figures
           +'<div class="miniprog"><i style="width:'+r+'%"></i></div>';
     }
     acts='<button class="btn sm ghost" onclick="cancelLoad(\''+esc(m.name)+'\')">Cancel</button>';
@@ -826,6 +832,31 @@ async function unload(name){ closeOv(); if(_unloading[name])return; _unloading[n
 async function cancelLoad(name){ try{ await api('/cancel_load?model='+encodeURIComponent(name),{method:'POST'}); toast('cancelled load'); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function dl(name,action){ try{ await api('/download'+(action==='start'?'':'/'+action)+'?model='+encodeURIComponent(name),{method:'POST'}); toast(action+' '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
 
+// #load-graph: compact downloaded-vs-total bar for an in-flight load, drawn beside the row.
+// Two hoverable segments (done / remaining) each carry an SVG <title>, so mousing over either
+// gives exact figures — bytes, percent, rate, ETA and shard count — without cluttering the row.
+function loadGraph(ld){
+  const bt=ld.bytes_total||0; if(!bt) return '';
+  const bd=Math.max(0,Math.min(ld.bytes_done||0,bt)), rem=Math.max(0,bt-bd);
+  const W=124,H=22,pad=1,IW=W-2*pad;
+  const f=bt>0?bd/bt:0, fw=Math.max(f>0?2:0,IW*f), pct=(100*f).toFixed(1);
+  const rate=ld.bytes_per_s?fmtB(ld.bytes_per_s)+'/s':'—';
+  const eta=ld.eta_s?dur(ld.eta_s):'—';
+  const doneTip='downloaded '+fmtB(bd)+' of '+fmtB(bt)+' ('+pct+'%)'
+    +'\nrate '+rate+'\neta '+eta+'\nshards '+(ld.ready||0)+'/'+(ld.total||'?');
+  const remTip='remaining '+fmtB(rem)+' of '+fmtB(bt)+' ('+(100-f*100).toFixed(1)+'%)'
+    +'\nat '+rate+(ld.eta_s?(' → '+dur(ld.eta_s)+' left'):'');
+  return '<span class="ldspark">'
+    +'<svg viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="download progress '+pct+'%">'
+    +'<rect x="0" y="0" width="'+W+'" height="'+H+'" rx="3" fill="#0a0e14"/>'
+    +'<rect x="'+pad+'" y="'+pad+'" width="'+IW+'" height="'+(H-2*pad)+'" rx="2" fill="#1b2733">'
+    +'<title>'+esc(remTip)+'</title></rect>'
+    +'<rect x="'+pad+'" y="'+pad+'" width="'+fw.toFixed(1)+'" height="'+(H-2*pad)+'" rx="2" fill="var(--warn)">'
+    +'<title>'+esc(doneTip)+'</title></rect>'
+    +'<text x="'+(W/2)+'" y="'+(H/2+3.5)+'" text-anchor="middle" font-size="10.5" '
+    +'fill="#e6eef7" style="pointer-events:none;font-variant-numeric:tabular-nums">'+pct+'%</text>'
+    +'</svg></span>';
+}
 function dur(sec){ sec=Math.max(0,Math.round(sec||0)); if(sec<60)return sec+'s';
   const m=Math.floor(sec/60); if(m<60)return m+'m'+(sec%60?' '+(sec%60)+'s':'');
   const h=Math.floor(m/60); return h+'h'+(m%60?' '+(m%60)+'m':''); }
