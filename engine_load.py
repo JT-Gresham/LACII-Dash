@@ -373,6 +373,10 @@ class EngineLoadMixin:
                                  "basis": "queued — waiting for the in-flight load to finish",
                                  "started": time.time(), "requested_by": requested_by}
             _placeholder = True
+            # #phantom-load-card: tell _load_impl the card now sitting at rk is OUR OWN placeholder,
+            # not another call's live card — so it still takes ownership (and registers its cancel
+            # handle) instead of skipping registration and leaving nobody to clean up.
+            _own["ph"] = True
         try:
             async with self._load_gate:
                 _c = self.loadings.get(rk)
@@ -410,9 +414,17 @@ class EngineLoadMixin:
                 # #load-queue: we published the "queued" placeholder but never owned the load (dedup
                 # waiter, or we failed/were cancelled before _load_impl registered). Clear only our
                 # own placeholder — never a real owner's card.
+                # #phantom-load-card: accept "planning" too. This same wrapper REWRITES our
+                # placeholder's state "queued" -> "planning" on acquiring the gate (above), so a
+                # "queued"-only test could never reclaim it once we got that far — which is exactly
+                # how a failed queued load leaked a card that spun forever. Only our own placeholder
+                # can be parked at rk in this branch (_load_impl won't register over an occupied key),
+                # so matching the pre-dispatch states is safe; a real owner's card is never touched
+                # (that path is gated by _own["v"] above, and dispatch moves it to state="loading").
                 _c = self.loadings.get(rk)
-                if _c is not None and _c.get("state") == "queued":
+                if _c is not None and _c.get("state") in ("queued", "planning"):
                     self.loadings.pop(rk, None)
+                    self._loading_tasks.pop(rk, None)
 
     async def _load_impl(self, friendly: str, ctx: int, consolidate: bool = True,
                    prefer_vram: bool = True, quant: str = "none", tp: int = 1,
@@ -474,7 +486,13 @@ class EngineLoadMixin:
             # key — a same-key dedup-waiter must NOT clobber the in-flight owner's rich card (which holds
             # node_ids for reaper grace, real progress, started). The call that registers becomes the
             # OWNER (_own["v"]=True) and is the sole one that cleans up reservation/card/future.
-            if reg_key not in self.loadings:
+            # #phantom-load-card: ALSO take ownership when the card already sitting here is this same
+            # call's own "queued" placeholder (_own["ph"], published by load() when the load gate was
+            # busy). Without this, a load that had to queue never became the owner — so its finally
+            # popped nothing and it registered no cancel handle, leaking an uncancellable card
+            # (seen live: ace-step queued behind qwen2.5-vl-7b, then failed on t2a capacity -> a
+            # state="planning" card that spun forever and 404'd /cancel_load).
+            if reg_key not in self.loadings or (_own is not None and _own.get("ph")):
                 self.loadings[reg_key] = {
                     "model": friendly, "display_model": _ollama_name(friendly),
                     "target": MODELS[friendly][0] if friendly in MODELS else friendly,
