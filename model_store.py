@@ -370,8 +370,25 @@ def _dir_has_model(d: str) -> bool:
             # complete when all four component subfolders are present.
             return all(os.path.isdir(os.path.join(d, s)) for s in
                        ("ace_step_transformer", "music_dcae_f8c8", "music_vocoder", "umt5-base"))
-        return (os.path.exists(os.path.join(d, "config.json"))
-                and all(os.path.exists(p) for p in set(_weight_map(d).values())))
+        if not os.path.exists(os.path.join(d, "config.json")):
+            return False
+        # #ready-no-mmap: answer "are the weight files present?" with pure path checks — NEVER by
+        # opening the weights. _weight_map() has to `safe_open` a SINGLE-FILE checkpoint to list its
+        # tensor names, which MMAPS THE WHOLE FILE: on a small controller that raises
+        # RuntimeError('unable to mmap 23919549408 bytes ... Cannot allocate memory') for a 23.9 GB
+        # single-file model, the except below swallowed it, and a fully-downloaded model reported
+        # ready=False forever (live: google/gemma-4-12B-it on the 8 GB iM VM — byte-exact on disk,
+        # shown as not-ready/absent). Sharded models were never affected: their index.json path is
+        # plain JSON with no mmap — so the bug hit only LARGE single-file checkpoints. Byte-level
+        # completeness is deliberately NOT re-validated here (the sharded branch never did either;
+        # the download path owns that) — this is an existence check, and it must stay cheap because
+        # /status calls it per registered model on a NETWORK models dir.
+        idx = os.path.join(d, "model.safetensors.index.json")
+        if os.path.exists(idx):
+            with open(idx, encoding="utf-8") as fh:
+                wm = json.load(fh)["weight_map"]
+            return all(os.path.exists(os.path.join(d, fn)) for fn in set(wm.values()))
+        return os.path.exists(os.path.join(d, "model.safetensors"))
     except Exception:
         return False
 
