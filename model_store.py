@@ -359,26 +359,29 @@ def _weight_file_ok(p: str) -> bool:
     """A weight file that is present AND actually populated — stat() only in the common case.
 
     #sparse-guard: an interrupted/preallocated download leaves a shard with the RIGHT apparent
-    size but holes instead of data (`du` 4 KB allocated vs 4.6 GB apparent), so a plain
-    os.path.exists() calls a 22%-downloaded 70B "ready" and it explodes at load. Cheap path:
-    compare allocated blocks to size — a fully-written shard allocates ~its size. A compressed /
-    dedup / CoW filesystem legitimately under-allocates, so an apparent shortfall is CONFIRMED by
-    reading the safetensors header (8-byte LE length prefix); a hole reads as zeros -> length 0.
-    That read is 8 bytes, never an mmap (see _dir_has_model's #ready-no-mmap note)."""
+    size but holes instead of data (`du`: 4 KB allocated vs 4.6 GB apparent), so a plain
+    os.path.exists() calls a 22%-downloaded 70B "ready" and it explodes at load. ALLOCATED BLOCKS
+    are the signal — a fully written shard allocates ~its size. stat() only: never opens the file,
+    so the small-controller ENOMEM stays fixed (see _dir_has_model's #ready-no-mmap note).
+
+    ⚠ Do NOT try to confirm via the safetensors header: a preallocated download writes a VALID
+    header and leaves the TENSOR DATA as holes (measured on the live 70B — header length 1760,
+    file 0.0% allocated), so the header proves nothing about the data and an
+    "invalid-header-means-empty" test silently passes every such shard.
+
+    The 50% floor tolerates a compressed/dedup/CoW filesystem while still catching holes: bf16/fp16
+    weights are high-entropy and do not compress anywhere near 2:1. Platforms without block
+    accounting (Windows: no st_blocks) can't be assessed -> fall back to existence."""
     try:
         st = os.stat(p)
     except OSError:
         return False
     if st.st_size <= 8:
         return False
-    if getattr(st, "st_blocks", 0) * 512 >= st.st_size * 0.9:
-        return True                       # fully allocated -> populated, no read needed
-    try:
-        with open(p, "rb") as fh:
-            n = int.from_bytes(fh.read(8), "little")
-    except OSError:
-        return False
-    return 0 < n < st.st_size              # sane header -> real data (compressed fs, not a hole)
+    blocks = getattr(st, "st_blocks", None)
+    if blocks is None:
+        return True                       # no block accounting here -> existence is all we have
+    return blocks * 512 >= st.st_size * 0.5
 
 
 def _dir_has_model(d: str) -> bool:
