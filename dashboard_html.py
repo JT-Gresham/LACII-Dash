@@ -275,6 +275,10 @@ DASHBOARD_HTML = r"""<!doctype html>
 <div class="sec">
   <h2>Models</h2><span class="hint" id="mcount"></span>
   <span class="grow"></span>
+  <select class="f" id="msort" onchange="msortChange()" title="Sort models within each state group" style="width:auto">
+    <option value="name">Sort: name</option>
+    <option value="size">Sort: size ↓</option>
+  </select>
   <input class="f" id="filter" placeholder="filter models…" oninput="render()">
 </div>
 <div class="legend">
@@ -423,11 +427,20 @@ function mstate(m,cl){
   if(m.ready) return {k:'registered',c:'var(--dim)',rank:3};
   return {k:'notdl',c:'var(--bad)',rank:4};
 }
+function msortChange(){ try{localStorage.setItem('msort',$('#msort').value);}catch(e){} render(); }
 function renderModels(d,cl){
   const f=($('#filter').value||'').toLowerCase().trim();
+  // #model-sort: keep the state grouping (Loaded / Registered / …) as the PRIMARY key; the toggle
+  // only re-orders WITHIN each group — by name (A→Z) or by weight size (size_gb, largest first).
+  const sortSel=$('#msort');
+  if(sortSel && !renderModels._si){ renderModels._si=1; try{const sv=localStorage.getItem('msort'); if(sv)sortSel.value=sv;}catch(e){} }
+  const sortK=(sortSel&&sortSel.value)||'name';
+  const _sz=x=>(x.m.size_gb!=null?+x.m.size_gb:-1);   // models without a size sort to the bottom
   let ms=(d.models||[]).map(m=>({m,s:mstate(m,cl)}));
   if(f) ms=ms.filter(x=>(x.m.name+' '+(x.m.target||'')+' '+(x.m.aliases||[]).join(' ')).toLowerCase().includes(f));
-  ms.sort((a,b)=>a.s.rank-b.s.rank || a.m.name.localeCompare(b.m.name));
+  ms.sort((a,b)=>a.s.rank-b.s.rank
+    || (sortK==='size' ? ((_sz(b)-_sz(a)) || a.m.name.localeCompare(b.m.name))
+                       : a.m.name.localeCompare(b.m.name)));
   $('#mcount').textContent=ms.length+' model'+(ms.length==1?'':'s');
   if(!ms.length){ $('#models').innerHTML='<div class="empty">no models'+(f?' match "'+esc(f)+'"':'')+'</div>'; return; }
   let html='', grp='';
