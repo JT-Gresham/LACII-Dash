@@ -384,6 +384,29 @@ def _weight_file_ok(p: str) -> bool:
     return blocks * 512 >= st.st_size * 0.5
 
 
+def _weight_file_has_data(p: str) -> bool:
+    """Probe that a weight file holds real bytes, not a zero fill. ONE 64 KB read at the midpoint.
+
+    #zero-fill: copying a sparse (part-downloaded) model with a tool that does not preserve holes
+    — plain `rsync`/`cp` without --sparse — materializes every hole as REAL zero blocks. The result
+    is fully allocated, correctly sized, carries a valid safetensors header, and is 100% worthless:
+    _weight_file_ok's block test passes it. Measured on the live 70B after such a copy: 131 GB, all
+    five sampled offsets (10/25/50/75/95%) entirely zero. Tensor data is high-entropy, so a 64 KB
+    all-zero window at the midpoint of a multi-GB shard means a zero fill, not real weights.
+
+    Deliberately called for ONE representative shard per model (see _dir_has_model), not per shard:
+    a zero fill affects the whole copy, and /status runs this per registered model on a network
+    models dir — cost stays at one read per model, not one per shard."""
+    try:
+        if os.path.getsize(p) < 64 * 1024 * 1024:
+            return True                   # too small to judge; the block test already covered it
+        with open(p, "rb") as fh:
+            fh.seek(os.path.getsize(p) // 2)
+            return any(fh.read(65536))
+    except OSError:
+        return False
+
+
 def _dir_has_model(d: str) -> bool:
     """True if dir holds a complete model: config.json + every shard in the index
     (flat transformers layout), or a complete diffusers component tree (#t2i)."""
@@ -416,8 +439,13 @@ def _dir_has_model(d: str) -> bool:
         if os.path.exists(idx):
             with open(idx, encoding="utf-8") as fh:
                 wm = json.load(fh)["weight_map"]
-            return all(_weight_file_ok(os.path.join(d, fn)) for fn in set(wm.values()))
-        return _weight_file_ok(os.path.join(d, "model.safetensors"))
+            files = sorted(set(wm.values()))
+            if not all(_weight_file_ok(os.path.join(d, fn)) for fn in files):
+                return False
+            # #zero-fill: one representative shard is probed for real bytes (see the helper)
+            return _weight_file_has_data(os.path.join(d, files[0]))
+        one = os.path.join(d, "model.safetensors")
+        return _weight_file_ok(one) and _weight_file_has_data(one)
     except Exception:
         return False
 
