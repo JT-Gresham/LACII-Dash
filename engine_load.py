@@ -330,6 +330,36 @@ class EngineLoadMixin:
         except Exception:
             pass
 
+    def _refresh_persist_entry(self, lm) -> None:
+        """#pin-follows-reload: when a PINNED (persisted) model finishes (re)loading, update its
+        persist entry to the ctx+quant that ACTUALLY loaded — so a controller restart restores what
+        you CURRENTLY have, and you never manually re-pin after changing a pinned model's quant/ctx.
+        The persist reloader restores each entry at its SAVED quant (server.py _persist_reload), so
+        without this a pin snapshotted at pin-time went stale the moment you reloaded at a new quant.
+        No-op when the model isn't pinned or the entry already matches (avoids a needless disk write);
+        a persist-RESTORE reloads at the saved quant, so it matches and never loops. In-place ENGINE_
+        CONFIG mutation (state.py ENCODING pattern) + save_engine_config() to survive the restart."""
+        if lm is None:
+            return
+        pm = ENGINE_CONFIG.get("persist_models") or {}
+        if not pm:
+            return
+        fr = getattr(lm, "friendly", None)
+        base = getattr(lm, "base", None)
+        key = fr if fr in pm else (base if base in pm else None)   # pin may be keyed by friendly OR base
+        if key is None:
+            return
+        entry = {"ctx": int(getattr(lm, "ctx", 0) or 0),
+                 "quant": (getattr(lm, "quant", None) or "none")}
+        if pm.get(key) == entry:
+            return                                                 # already current — skip the write
+        pm = dict(pm)
+        pm[key] = entry
+        ENGINE_CONFIG["persist_models"] = pm
+        save_engine_config()
+        log_activity(f"persist: {key} pin now follows the reload — ctx={entry['ctx']}, "
+                     f"quant={entry['quant']} (auto-updated; no manual re-pin needed)")
+
     async def load(self, friendly: str, ctx: int, consolidate: bool = True,
                    prefer_vram: bool = True, quant: str = "none", tp: int = 1,
                    cpu_only: bool = False, reg_key: Optional[str] = None,
@@ -387,7 +417,7 @@ class EngineLoadMixin:
                     _c["state"] = "planning"
                     _c["basis"] = "planning…"
                     _c["started"] = time.time()   # time the LOAD, not the queue wait
-                return await self._load_impl(friendly, ctx, consolidate=consolidate,
+                _lm = await self._load_impl(friendly, ctx, consolidate=consolidate,
                                          prefer_vram=prefer_vram, quant=quant, tp=tp,
                                          cpu_only=cpu_only, reg_key=reg_key,
                                          exclude_nodes=exclude_nodes, replica_idx=replica_idx,
@@ -402,6 +432,12 @@ class EngineLoadMixin:
                                          t2i_offload=t2i_offload,
                                          auto=auto,
                                          _own=_own)
+                # #pin-follows-reload: a (re)load of a PINNED model refreshes its persist snapshot to
+                # what actually loaded, so a restart restores the current quant/ctx (no manual re-pin).
+                # Fully defensive — a persist-bookkeeping hiccup must never fail an otherwise-good load.
+                with contextlib.suppress(Exception):
+                    self._refresh_persist_entry(_lm)
+                return _lm
         finally:
             if _own["v"]:
                 self._reservations.pop(rk, None)
