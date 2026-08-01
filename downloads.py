@@ -136,6 +136,8 @@ def register(app):
         the live thread instead of being a silent no-op)."""
         target = MODELS[friendly][0] if friendly in MODELS else friendly
         if model_ready(target):
+            if DOWNLOAD_STATE.pop(friendly, None) is not None:   # #dl-resume: ready -> drop any stale halt flag
+                save_download_state()
             return {"ok": True, "status": "ready"}
         if friendly in DOWNLOADING:
             # Already pulling — if a pause/stop was pending, drop it so the running thread

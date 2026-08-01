@@ -1584,6 +1584,11 @@ def load_download_state() -> None:
         pass
     except Exception as exc:        # present but unparseable -> don't silently lose; flag it
         print(f"[cfg] download_state.json unreadable ({exc!r}); starting with none")
+    # #dl-resume: drop a stale halt/active flag for a model that's ALREADY fully downloaded — old
+    # completions never cleared the flag, leaving a ready model shown as "stopped". model_ready is
+    # the source of truth: a complete model is never halted.
+    for _k in [k for k in list(DOWNLOAD_STATE) if model_ready(MODELS[k][0] if k in MODELS else k)]:
+        DOWNLOAD_STATE.pop(_k, None)
     for friendly in DOWNLOAD_STATE:
         target = MODELS[friendly][0] if friendly in MODELS else friendly
         with contextlib.suppress(Exception):
