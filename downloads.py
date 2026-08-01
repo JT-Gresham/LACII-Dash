@@ -96,6 +96,37 @@ def _pull_repo_interruptible(friendly: str, repo_id: str):
     return "done"
 
 
+_START_DOWNLOAD = None   # #dl-resume: register() publishes _start_download here so the server's
+                         # startup lifespan can re-kick a pull that a controller restart interrupted.
+
+
+async def resume_interrupted_downloads() -> None:
+    """#dl-resume: after load_download_state() repopulates DOWNLOAD_STATE, re-trigger every download
+    that was ACTIVE ("downloading") when the controller was killed — completed shards are cached and
+    skipped, so each continues where it stopped. Paused/stopped intents are left halted (user-driven).
+    No-op if the exposure hook is unset or there are no active entries; one bad entry never blocks the
+    rest. Runs as a startup task off the lifespan (downloads pull to the controller's OWN HF cache, so
+    no worker-fleet settle is needed)."""
+    import asyncio
+    if _START_DOWNLOAD is None:
+        return
+    await asyncio.sleep(5)                       # let startup settle before streaming weights
+    pending = [f for f, st in list((DOWNLOAD_STATE or {}).items()) if st == "downloading"]
+    for friendly in pending:
+        try:
+            if friendly in DOWNLOADING:          # already live (shouldn't happen this early)
+                continue
+            target = MODELS[friendly][0] if friendly in MODELS else friendly
+            if model_ready(target):              # finished between kill and restart -> clear, done
+                DOWNLOAD_STATE.pop(friendly, None)
+                await asyncio.to_thread(save_download_state)
+                continue
+            log_activity(f"download {friendly}: auto-resuming — interrupted by a controller restart")
+            await _START_DOWNLOAD(friendly)
+        except Exception as exc:                 # one bad entry must not block the others
+            log_activity(f"download {friendly}: auto-resume failed ({exc!r})")
+
+
 def register(app):
 
     async def _start_download(friendly: str) -> dict:
@@ -116,8 +147,12 @@ def register(app):
         DOWNLOADING.add(friendly)
         DOWNLOAD_ERROR.pop(friendly, None)   # clear any prior failure on a fresh attempt
         DOWNLOAD_CONTROL.pop(friendly, None)  # drop any stale pause/stop signal from a prior run
-        if DOWNLOAD_STATE.pop(friendly, None) is not None:  # starting/resuming -> no longer halted
-            save_download_state()
+        # #dl-resume: persist an ACTIVE-download marker (overwrites any paused/stopped halt). If the
+        # controller is KILLED mid-pull this "downloading" state survives in download_state.json and
+        # startup auto-resumes it (cached shards skipped). Cleared on clean completion/error below; a
+        # pause/stop overwrites it with the halt intent (kept across a restart, but NOT auto-resumed).
+        DOWNLOAD_STATE[friendly] = "downloading"
+        save_download_state()
         epoch = DOWNLOAD_EPOCH[friendly] = DOWNLOAD_EPOCH.get(friendly, 0) + 1
         log_activity(f"download {friendly}: starting")
 
@@ -166,6 +201,8 @@ def register(app):
                     if DOWNLOAD_EPOCH.get(friendly) != epoch:
                         return
                     _invalidate_ready_cache(target)
+                    if DOWNLOAD_STATE.pop(friendly, None) is not None:   # #dl-resume: done -> not active
+                        await asyncio.to_thread(save_download_state)
                     print(f"[model] converted GGUF {friendly} ({target} :: {GGUF_FILES[target]})")
                     log_activity(f"download {friendly}: complete (GGUF normalized)")
                     return
@@ -186,6 +223,8 @@ def register(app):
                     # every file now in the HF cache -> migrate to models/ + purge the dup
                     await asyncio.to_thread(_controller_model_dir, target)
                     _invalidate_ready_cache(target)
+                    if DOWNLOAD_STATE.pop(friendly, None) is not None:   # #dl-resume: done -> not active
+                        await asyncio.to_thread(save_download_state)
                     print(f"[model] downloaded {friendly} ({target})")
                     log_activity(f"download {friendly}: complete")
             except Exception as exc:
@@ -198,6 +237,11 @@ def register(app):
                     msg += "  (gated repo — accept the license for this model on huggingface.co "
                     msg += "with the account whose token the controller uses)"
                 DOWNLOAD_ERROR[friendly] = msg[:400]
+                # #dl-resume: a CLEAN failure clears the active marker (the error is surfaced; the
+                # user resumes manually). Only a process-kill — which never reaches this handler —
+                # leaves "downloading" set for startup auto-resume.
+                if DOWNLOAD_STATE.pop(friendly, None) is not None:
+                    await asyncio.to_thread(save_download_state)
                 print(f"[model] download failed for {friendly}: {exc!r}")
                 log_activity(f"download {friendly}: FAILED ({type(exc).__name__})")
             finally:
@@ -212,6 +256,10 @@ def register(app):
 
         asyncio.create_task(_dl())
         return {"ok": True, "status": "downloading"}
+
+    # #dl-resume: publish _start_download at module scope so the server's startup lifespan can
+    # re-kick any pull interrupted by a controller restart (see resume_interrupted_downloads).
+    globals()["_START_DOWNLOAD"] = _start_download
 
     async def _do_delete(friendly: str) -> dict:
         """Delete a model COMPLETELY from the controller: its weight/quant CACHE

@@ -1579,7 +1579,7 @@ def load_download_state() -> None:
     try:
         with open(DOWNLOAD_STATE_PATH, encoding="utf-8") as fh:
             DOWNLOAD_STATE.update({k: v for k, v in json.load(fh).items()
-                                   if v in ("paused", "stopped")})
+                                   if v in ("paused", "stopped", "downloading")})   # #dl-resume: keep active intent
     except FileNotFoundError:
         pass
     except Exception as exc:        # present but unparseable -> don't silently lose; flag it
@@ -2692,6 +2692,11 @@ def build_app() -> FastAPI:
                 except Exception as exc:
                     log_activity(f"persist: auto-reload {name} FAILED ({exc!r})")
         persist_reloader = asyncio.create_task(_persist_reload())
+        # #dl-resume: re-kick any download interrupted by a controller restart (state "downloading"
+        # persisted in download_state.json). Independent of the worker fleet — it pulls to the
+        # controller's OWN HF cache — so no fleet-settle wait; cached shards are skipped on resume.
+        if hasattr(downloads, "resume_interrupted_downloads"):
+            _dl_resumer = asyncio.create_task(downloads.resume_interrupted_downloads())
         # "Ready to update" = no load/download/encode IN PROGRESS — a RESIDENT model no longer blocks
         # (user policy: don't defer if something is loaded; download, apply, restart NOW, dropping
         # in-flight gens which the controller re-streams). The engine.lock check stays essential: a
@@ -2862,10 +2867,16 @@ def main() -> None:
     if DELETED_MODELS:
         print(f"[cfg] {len(DELETED_MODELS)} deleted model(s) hidden from the list: "
               f"{', '.join(sorted(DELETED_MODELS))}")
-    load_download_state()    # restore paused/stopped intents (no auto-resume — user-driven)
+    load_download_state()    # restore paused/stopped intents + #dl-resume: interrupted-active intents
     if DOWNLOAD_STATE:
-        print("[cfg] halted downloads (resume from cache when ready): "
-              + ", ".join(f"{k}={v}" for k, v in DOWNLOAD_STATE.items()))
+        _dl_halted = {k: v for k, v in DOWNLOAD_STATE.items() if v in ("paused", "stopped")}
+        _dl_active = [k for k, v in DOWNLOAD_STATE.items() if v == "downloading"]
+        if _dl_halted:
+            print("[cfg] halted downloads (resume from cache when ready): "
+                  + ", ".join(f"{k}={v}" for k, v in _dl_halted.items()))
+        if _dl_active:
+            print("[cfg] #dl-resume: interrupted downloads will auto-resume on startup: "
+                  + ", ".join(_dl_active))
     load_net_history()
     load_ram_history()
     load_vram_history()
