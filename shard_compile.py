@@ -17,7 +17,7 @@ from typing import Optional
 import json
 import os
 
-from shards import (INT4_GROUP, INT2_GROUP, _dequant_fp8_to_bf16, _dequant_nvfp4_to_bf16, _fp8_block_size, _fp8_scale_name, _has_moe_experts, _head_key, _is_fp8_meta_name, _model_num_layers, _nvfp4_global_scale_name, _nvfp4_group_size, _nvfp4_scale_name, _skeleton_from_cfg, _text_prefix, _weight_map, build_skeleton_from_config)   # noqa: F401  (shared helpers STAY in shards)
+from shards import (INT4_GROUP, INT2_GROUP, _dequant_fp8_to_bf16, _dequant_nvfp4_to_bf16, _fp8_block_size, _fp8_scale_name, _has_moe_experts, _head_key, _is_fp8_meta_name, _is_tied, _model_num_layers, _nvfp4_global_scale_name, _nvfp4_group_size, _nvfp4_scale_name, _skeleton_from_cfg, _text_prefix, _weight_map, build_skeleton_from_config)   # noqa: F401  (shared helpers STAY in shards)
 from wire import (_fuse_moe_experts)   # noqa: F401
 
 # #distributed-packing Inc 4: a packer-identity tag stamped into the manifest so a load REJECTS a
@@ -325,9 +325,8 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
                              "build — no fused-3D layout to fuse into nor per-expert scope to pack); "
                              "cannot produce a correct cache")
     n_layers = _model_num_layers(model_dir)
-    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
-        tied = bool(json.load(fh).get("tie_word_embeddings", False))
     prefix = _text_prefix(wm)
+    tied = _is_tied(model_dir, wm, prefix)           # #tied-from-checkpoint
     out_dir = os.path.join(_shard_cache_root(model_dir), quant)
     os.makedirs(out_dir, exist_ok=True)
     manifest: dict = {"format": 1, "quant": quant, "group_size": group_size,

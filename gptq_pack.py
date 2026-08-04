@@ -41,7 +41,7 @@ import json
 import os
 
 from shards import (INT2_GROUP, _dequant_fp8_to_bf16, _dequant_nvfp4_to_bf16, _fp8_block_size,
-                    _fp8_scale_name, _has_moe_experts, _is_fp8_meta_name, _model_num_layers,
+                    _fp8_scale_name, _has_moe_experts, _is_fp8_meta_name, _is_tied, _model_num_layers,
                     _nvfp4_global_scale_name, _nvfp4_group_size, _nvfp4_scale_name,
                     _skeleton_from_cfg, _text_prefix, _weight_map)
 
@@ -213,9 +213,8 @@ def compile_int2_gptq(model_dir: str, group_size: int = INT2_GROUP, progress=Non
     fp8_block = _fp8_block_size(model_dir)
     nvfp4_group = _nvfp4_group_size(model_dir)
     n_layers = _model_num_layers(model_dir)
-    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
-        tied = bool(json.load(fh).get("tie_word_embeddings", False))
     prefix = _text_prefix(wm)
+    tied = _is_tied(model_dir, wm, prefix)           # #tied-from-checkpoint
 
     dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     fdt = torch.bfloat16 if dev.type == "cuda" else torch.float32   # forward dtype

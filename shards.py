@@ -245,6 +245,32 @@ def _head_key(weight_map, prefix: str) -> str:
     return "lm_head.weight"
 
 
+def _is_tied(model_dir: str, weight_map: dict | None = None, prefix: str | None = None) -> bool:
+    """Does the LM head SHARE the embedding matrix (no separate head tensor to load)?
+
+    #tied-from-checkpoint: ask the CHECKPOINT first. If it ships no head tensor there is
+    nothing to load a head FROM, so the model MUST be tied — whatever config.json says, or
+    doesn't say. CohereLabs/North-Mini-Code-1.0 (`Cohere2MoeForCausalLM`) OMITS
+    `tie_word_embeddings` entirely and carries only embed_tokens + norm outside its layers,
+    so the old `.get("tie_word_embeddings", False)` went looking for a non-existent
+    'lm_head.weight' and the compile died with `KeyError: 'lm_head.weight'`.
+
+    NOTE: transformers' own PretrainedConfig defaults this flag to **True** — the opposite of
+    the historical default here. We deliberately do NOT flip the config default: every model
+    already serving on this fleet declares the flag explicitly, and flipping it would
+    silently re-tie any checkpoint that omits the flag WHILE shipping a real lm_head (using
+    the embedding as the head = wrong logits, and silently so). The checkpoint probe fixes
+    the crash without touching any of those.
+    """
+    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    wm = _weight_map(model_dir) if weight_map is None else weight_map
+    pfx = _text_prefix(wm) if prefix is None else prefix
+    if _head_key(wm, pfx) not in wm:
+        return True                      # no head tensor exists -> necessarily tied
+    return bool(cfg.get("tie_word_embeddings", False))
+
+
 # #final-norm-alias: the FINAL norm (after the last decoder layer, before the LM head) is called
 # '<prefix>norm.weight' in most architectures — but NOT all. LiquidAI's LFM2/LFM2.5 name it
 # '<prefix>embedding_norm.weight', and hardcoding the classic spelling KeyErrors the entire HEAD
@@ -303,8 +329,7 @@ def _build_weight_blob(model_dir: str, start: int, end: int,
                        has_embed: bool, has_head: bool) -> str:
     """Write a safetensors file with exactly one stage's tensors; return its path."""
     from safetensors.torch import save_file
-    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
-        tied = bool(json.load(fh).get("tie_word_embeddings", False))
+    tied = _is_tied(model_dir)                       # #tied-from-checkpoint
     wm = _weight_map(model_dir)
     names = _selected_names(wm, start, end, has_embed, has_head, tied)
     sd = _assemble_sd(_load_tensors(names, wm), start, end, has_embed, has_head, tied)
@@ -552,7 +577,7 @@ def _plan_weight_stream(model_dir: str, start: int, end: int,
     shared experts) still come through this blob."""
     with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
         _cfg = json.load(fh)
-    tied = bool(_cfg.get("tie_word_embeddings", False))
+    tied = _is_tied(model_dir)                       # #tied-from-checkpoint
     fp8_block = _fp8_block_size(model_dir)   # None unless this is an fp8 checkpoint
     nvfp4_group = _nvfp4_group_size(model_dir)   # None unless compressed-tensors nvfp4 (group 16)
     wm = _weight_map(model_dir)
@@ -866,8 +891,7 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
     import torch                                  # noqa: F401 (used via save below)
     from safetensors.torch import save as st_save
     geo = _tp_geo_for_rank(model_dir, tp_rank, tp_size, weights)   # per-rank slice (het or uniform)
-    with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
-        tied = bool(json.load(fh).get("tie_word_embeddings", False))
+    tied = _is_tied(model_dir)                       # #tied-from-checkpoint
     wm = _weight_map(model_dir)
     prefix = _text_prefix(wm)
     fp8_block = _fp8_block_size(model_dir)   # fold fp8 weight_scale_inv -> bf16 before TP slicing

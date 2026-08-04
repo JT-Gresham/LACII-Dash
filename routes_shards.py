@@ -236,8 +236,7 @@ def register(app):
         # is scope[2] (the same meta model the worker rebuilds). For dense / already-fused checkpoints
         # _fuse_moe_experts is a no-op, so passing it unconditionally when per-expert is safe.
         _skel = scope[2] if (scope and _need_skel) else None
-        with open(os.path.join(mdir, "config.json"), encoding="utf-8") as fh:
-            tied = bool(json.load(fh).get("tie_word_embeddings", False))
+        tied = await asyncio.to_thread(_sh._is_tied, mdir, wm)   # #tied-from-checkpoint
         base_local = f"http://127.0.0.1:{ARGS.http_port}"
 
         def _pack_local(start: int, end: int, embed: int, head: int):
