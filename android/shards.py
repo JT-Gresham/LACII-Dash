@@ -185,9 +185,22 @@ def _weight_map(model_dir: str) -> dict[str, str]:
         return {name: os.path.join(model_dir, fn) for name, fn in wm.items()}
     single = os.path.join(model_dir, "model.safetensors")
     if os.path.exists(single):
-        from safetensors import safe_open
-        with safe_open(single, framework="pt") as fh:
-            return {name: single for name in fh.keys()}
+        # #header-only-weightmap (parity with the controller shards.py): tensor NAMES live in the
+        # safetensors HEADER (8-byte little-endian length + that many bytes of JSON) at the START
+        # of the file. safe_open(framework="pt") mmaps the WHOLE checkpoint just to enumerate them,
+        # which ENOMEMs on a small-RAM device — and a tablet has far less RAM than the controller
+        # VM that first hit this. Read the header directly: O(KB), independent of file size.
+        try:
+            with open(single, "rb") as fh:
+                n = int.from_bytes(fh.read(8), "little")
+                if not (0 < n <= (100 << 20)):        # sane header bound; else not a safetensors
+                    raise ValueError(f"implausible safetensors header length {n}")
+                hdr = json.loads(fh.read(n).decode("utf-8"))
+            return {name: single for name in hdr if name != "__metadata__"}
+        except Exception:
+            from safetensors import safe_open
+            with safe_open(single, framework="pt") as fh:
+                return {name: single for name in fh.keys()}
     raise FileNotFoundError(f"no safetensors found in {model_dir}")
 
 

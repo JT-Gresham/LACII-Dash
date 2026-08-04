@@ -185,9 +185,25 @@ def _weight_map(model_dir: str) -> dict[str, str]:
         return {name: os.path.join(model_dir, fn) for name, fn in wm.items()}
     single = os.path.join(model_dir, "model.safetensors")
     if os.path.exists(single):
-        from safetensors import safe_open
-        with safe_open(single, framework="pt") as fh:
-            return {name: single for name in fh.keys()}
+        # #header-only-weightmap: a single-file checkpoint's tensor NAMES live in the safetensors
+        # HEADER — an 8-byte little-endian header length followed by that many bytes of JSON — at
+        # the very START of the file. safe_open(framework="pt") would mmap the WHOLE file just to
+        # enumerate them: a PRIVATE mapping the size of the checkpoint for a few KB of JSON, which
+        # ENOMEMs on a RAM-small controller (the iM VM died here on a 16.9 GB LFM2.5 single-file
+        # checkpoint: "unable to mmap 16936006912 bytes ... Cannot allocate memory (12)"). The
+        # SHARDED branch above already reads only JSON; do the same for single-file. O(KB) read,
+        # independent of checkpoint size. Falls back to the mmap path if the header won't parse.
+        try:
+            with open(single, "rb") as fh:
+                n = int.from_bytes(fh.read(8), "little")
+                if not (0 < n <= (100 << 20)):        # sane header bound; else not a safetensors
+                    raise ValueError(f"implausible safetensors header length {n}")
+                hdr = json.loads(fh.read(n).decode("utf-8"))
+            return {name: single for name in hdr if name != "__metadata__"}
+        except Exception:
+            from safetensors import safe_open
+            with safe_open(single, framework="pt") as fh:
+                return {name: single for name in fh.keys()}
     raise FileNotFoundError(f"no safetensors found in {model_dir}")
 
 
