@@ -1134,6 +1134,8 @@ def _quantize_int4_(module) -> None:
     from torch import nn
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
+            if name in _ROUTER_LEAF_NAMES:
+                continue   # #bare-linear-router (see _ROUTER_LEAF_NAMES) -> keep bf16
             setattr(module, name, _quantize_linear4(child))
         elif type(child).__name__.endswith(("Router", "Gate")):
             continue   # leave router/gate projections bf16 (precision-sensitive routing)
@@ -1462,6 +1464,8 @@ def _quantize_int2_(module) -> None:
     from torch import nn
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
+            if name in _ROUTER_LEAF_NAMES:
+                continue   # #bare-linear-router -> keep bf16 (2-bit routing is even worse)
             setattr(module, name, _quantize_linear2(child))
         elif type(child).__name__.endswith(("Router", "Gate")):
             continue   # leave router/gate projections bf16 (precision-sensitive routing)
@@ -2233,6 +2237,16 @@ def _model_has_nonfused_experts(model) -> bool:
             if any(isinstance(m, nn.Linear) for m in experts[0].modules()):
                 return True
     return False
+
+
+# #bare-linear-router: a MoE router that is a PLAIN nn.Linear whose attribute name is just `gate`
+# (poolside/Laguna-XS-2.1: `model.layers.N.mlp.gate`) has NO *Router/*Gate-classed ancestor, so the
+# class-name walk below never sees it and int4 quantized the router — which corrupts top-k expert
+# selection and degenerates generation into repetition loops (Laguna answered "The capital of France
+# is Paris." then looped forever). Exact leaf-name match ONLY, so the big expert/MLP projections
+# `gate_proj` / `gate_up_proj` are untouched and stay quantized.
+# KEEP IN SYNC with shard_compile._quant_scope's copy — the cache must equal a cold load.
+_ROUTER_LEAF_NAMES = frozenset({"gate", "router", "wg"})
 
 
 def _meta_sibling_target(model, key: str, t):

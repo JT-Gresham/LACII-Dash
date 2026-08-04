@@ -230,8 +230,16 @@ def _quant_scope(model_dir: str):
                 if anc is not None and type(anc).__name__.endswith(("Router", "Gate")):
                     return True
             return False
+        # #bare-linear-router: a router that is a PLAIN nn.Linear named just `gate` (Laguna:
+        # `model.layers.N.mlp.gate`) has NO *Router/*Gate-classed ancestor, so _under_router can't
+        # see it and int4 quantized the ROUTER — corrupting top-k expert selection (Laguna answered
+        # correctly once, then looped forever). Exact leaf-name match only, so the big `gate_proj` /
+        # `gate_up_proj` expert projections stay quantized.
+        # KEEP IN SYNC with worker_quant._ROUTER_LEAF_NAMES — the cache must equal a cold load.
+        _router_leaf = frozenset({"gate", "router", "wg"})
         for name, mod in model.named_modules():
-            if isinstance(mod, nn.Linear) and ".layers." in name and not _under_router(name):
+            if (isinstance(mod, nn.Linear) and ".layers." in name and not _under_router(name)
+                    and name.rsplit(".", 1)[-1] not in _router_leaf):
                 lin2d.add(name + ".weight")
         for name, p in model.named_parameters():
             if (p.dim() == 3 and ".experts." in name
