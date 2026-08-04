@@ -6,6 +6,24 @@ leaf module; in client.py EXTRA_UPDATE_FILES.
 from __future__ import annotations
 
 
+# #final-norm-alias: the FINAL norm module (after the last decoder layer, before the LM head) is
+# `.norm` on most architectures — but LiquidAI's LFM2/LFM2.5 call it `.embedding_norm`, so
+# `model.model.norm` raised AttributeError("'Lfm2MoeModel' object has no attribute 'norm'") and
+# killed the whole shard build AFTER the cache had streamed. Mirrors shards._final_norm_key on the
+# controller (which resolves the same thing by TENSOR name); keep the two candidate lists in sync.
+_FINAL_NORM_ATTRS = ("norm", "embedding_norm", "final_layernorm", "ln_f")
+
+
+def _final_norm_module(inner):
+    """The decoder's final-norm submodule, whatever this architecture calls it. Falls back to
+    `.norm` so an unknown layout still raises the original, clear AttributeError."""
+    for attr in _FINAL_NORM_ATTRS:
+        mod = getattr(inner, attr, None)
+        if mod is not None:
+            return mod
+    return inner.norm
+
+
 class ShardBuildMixin:
 
     @staticmethod
@@ -598,7 +616,7 @@ class ShardBuildMixin:
         self.model = model
         self.owned_layers = [model.model.layers[i] for i in range(layer_start, layer_end)]
         self.embed = model.model.embed_tokens if has_embed else None
-        self.norm = model.model.norm if has_head else None
+        self.norm = _final_norm_module(model.model) if has_head else None
         self.head = model.lm_head if has_head else None
 
         self.loaded_params = 0

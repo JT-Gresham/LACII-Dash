@@ -1221,7 +1221,12 @@ def _assemble_sd(tensors: dict, start: int, end: int, has_embed: bool,
         for n in (x for x in tensors if x.startswith(f"model.layers.{i}.")):
             sd[n] = tensors[n]
     if has_head:
-        sd["model.norm.weight"] = tensors["model.norm.weight"]
+        # #final-norm-alias: the final norm's NAME varies by arch (LFM2/LFM2.5 ship
+        # 'model.embedding_norm.weight', not 'model.norm.weight'). It is the only
+        # '*norm.weight' outside a decoder layer, so match on that rather than hardcoding.
+        _nk = next((k for k in tensors if k.endswith("norm.weight") and ".layers." not in k),
+                   "model.norm.weight")
+        sd[_nk] = tensors[_nk]
         if tied:
             # #tied-dedup: the clone is DELIBERATE — load_state_dict(assign=True) with ONE tensor
             # for both keys would share a Parameter across embed+head BEFORE placement, and a
