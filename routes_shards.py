@@ -165,7 +165,7 @@ def register(app):
                              "tensors": len(res.get("mtensors") or {})})
 
     @app.post("/compile_dist")   # #distributed-packing Inc 2: compile a shard cache by fanning unit-packs across workers
-    async def compile_dist(model: str, quant: str = "int4") -> JSONResponse:
+    async def compile_dist(model: str, quant: str = "int4", node: str = "") -> JSONResponse:
         """Compile a model's pre-quantized shard cache by DISTRIBUTING the per-layer pack across the
         fleet (exo-inspired): each worker fetches a layer's bf16 from /weights, packs it with the
         SHARED shards.pack_unit_tensors (bit-identical to a local compile, proven by /pack_probe), and
@@ -213,6 +213,14 @@ def register(app):
         out_dir = os.path.join(_sc._shard_cache_root(mdir), quant)
         await asyncio.to_thread(lambda: os.makedirs(out_dir, exist_ok=True))
         caps = [n for n in registry.alive_sorted() if n.can_infer and engine.links.get(n.node_id)]
+        # #compile-picker: node= pins the pack to ONE worker (the dashboard's "a specific node"
+        # choice) — useful to keep a compile off busy boxes, or to drive it from the one machine
+        # with the RAM headroom. Empty = fan out across the whole fleet (the default).
+        if node:
+            caps = [n for n in caps if n.hostname == node]
+            if not caps:
+                return JSONResponse({"ok": False, "error": f"no alive, linked worker named '{node}'"},
+                                    status_code=404)
         engine.compiling[ckey] = {"model": friendly, "display_model": _ollama_name(friendly), "target": tgt,
                                   "ready": 0, "total": n_layers + 2, "stages_total": max(1, len(caps)),
                                   "stages_ready": 0, "basis": f"distributed {quant} compile "

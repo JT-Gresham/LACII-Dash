@@ -609,9 +609,10 @@ function fitMeta(m){
 }
 // #int4-badge: one-click int4 shard-cache compile for any on-disk model without one. Tooltip =
 // the cost (est. cache size on disk — disk.models' bf16-normalized int4 estimate — and the
-// controller's free disk) + the payoff (int4 loads serve from cache instantly). Click fires the
-// same compileShards() as the detail modal's Precache button; the row flips to Compiling with a
-// progress bar on the next poll. m.ready gate: can't compile weights that aren't downloaded.
+// controller's free disk) + the payoff (int4 loads serve from cache instantly). Click opens the
+// same openCompile() picker as the detail modal's Precache button (fleet / this controller / one
+// node); the row flips to Compiling with a progress bar on the next poll. m.ready gate: can't
+// compile weights that aren't downloaded.
 function int4Badge(m){
   const cz=m.cached||{};
   // embedding encoders load whole-model float32 (_load_embedding_locked) and NEVER read the
@@ -629,7 +630,7 @@ function int4Badge(m){
     +'\n• runs as a background subprocess (below-normal priority) — serving is unaffected'
     +'\n• once cached: int4 loads serve from cache instantly, no on-the-fly quantize'
     +'\n\nClick to compile now.';
-  return ' <span class="chip q4" title="'+esc(tip)+'" onclick="compileShards(\''+esc(m.name)+'\',\'int4\')">⚡ int4</span>';
+  return ' <span class="chip q4" title="'+esc(tip)+'" onclick="openCompile(\''+esc(m.name)+'\',\'int4\')">⚡ int4</span>';
 }
 
 // #load-faster: one-click "upgrade to a faster placement". Shown ONLY when the backend
@@ -1018,7 +1019,7 @@ async function openDetail(name){
   if(m.ready&&!(m.capabilities||[]).includes('t2i')){ let chips='';
     for(const q of ['int4','int8','int2']){
       if(cz[q]&&cz[q].ok) chips+='<span class="chip al">'+q+' cached '+gb(cz[q].size_gb)+'</span> ';
-      else chips+='<button class="btn sm ghost" '+(q==='int2'?'title="~2.5 bits/weight capacity tier, half the int4 cache size. CAVEAT: the current round-to-nearest int2 packing collapses generation quality on dense LLMs — build for experiments only until the calibrated (GPTQ-class) packer lands. Never auto-built on first load; an existing cache does serve int2 loads." ':'')+'onclick="compileShards(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
+      else chips+='<button class="btn sm ghost" '+(q==='int2'?'title="~2.5 bits/weight capacity tier, half the int4 cache size. CAVEAT: the current round-to-nearest int2 packing collapses generation quality on dense LLMs — build for experiments only until the calibrated (GPTQ-class) packer lands. Never auto-built on first load; an existing cache does serve int2 loads." ':'')+'onclick="openCompile(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
     }
     pre='<h3 style="font-size:13px;margin-top:14px">Precache (shard cache)</h3><div>'+chips+'</div>';
   }
@@ -1441,7 +1442,51 @@ async function openHistory(name){
   }).join('');
   $('#modal').innerHTML=head+'<div style="max-height:60vh;overflow:auto">'+blk+'</div>';
 }
-async function compileShards(name,quant){ closeOv(); toast('compiling '+quant+' cache for '+name+'…'); tick(); try{ await api('/compile_shards?model='+encodeURIComponent(name)+'&quant='+quant,{method:'POST'}); toast(quant+' cache for '+name+' done'); }catch(e){ toast(String(e.message||e),1);} tick(); }
+// #compile-picker: choose WHERE a shard-cache compile runs. /compile_shards packs on the
+// CONTROLLER (a small controller VM can OOM on a big checkpoint); /compile_dist fans one
+// layer-pack per worker across the fleet and is far faster — the packed bytes are identical
+// either way (the workers use the same shared packer). int2 is GPTQ-calibrated + sequential
+// (layer L needs layer L-1's quantized output) so it can ONLY build locally.
+function _compileNodeOpts(){
+  const ns=(LAST&&LAST.nodes||[]).filter(n=>n.alive&&n.can_infer).slice()
+    .sort((a,b)=>(b.free_mem_gb||0)-(a.free_mem_gb||0));
+  return ns.map(n=>'<option value="dist:'+esc(n.hostname)+'">'+esc(n.hostname)+' — '
+    +fmt(n.free_mem_gb)+' GB RAM free</option>').join('');
+}
+function openCompile(name,quant){
+  const two=(quant==='int2');
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Compile '+esc(quant)+' cache — '+esc(name)+'</h3>'
+   +'<p style="font-size:12px;color:var(--muted);margin:6px 0 10px">Pre-quantizes the model ONCE so every future load serves the small '+esc(quant)+' shards instead of streaming full bf16. The packed result is bit-identical whichever machine does the work.</p>'
+   +'<label>Where to compile</label><select id="c-where"'+(two?' disabled':'')+'>'
+   +(two?'':'<option value="dist:">Auto — whole fleet (parallel, recommended)</option>')
+   +'<option value="local:">This controller only (single box)</option>'
+   +(two?'':'<optgroup label="One specific node">'+_compileNodeOpts()+'</optgroup>')
+   +'</select>'
+   +'<p style="font-size:12px;color:var(--muted);margin-top:8px">'
+   +(two?'int2 is GPTQ-calibrated and sequential — layer L needs layer L-1\'s quantized output — so it can only be built locally on the controller.'
+        :'Auto fans one layer-pack per worker across the fleet: fastest, and it keeps the heavy packing OFF this controller. Pick a single node to confine the work to one machine. Embed/head are always packed locally.')
+   +'</p>'
+   +'<div style="margin-top:14px"><button class="btn" onclick="runCompile(\''+esc(name)+'\',\''+esc(quant)+'\')">Compile</button> '
+   +'<button class="btn ghost" onclick="closeOv()">Cancel</button></div>';
+  $('#ov').classList.add('show');
+}
+async function runCompile(name,quant){
+  const sel=$('#c-where');                      // READ before closeOv() wipes the modal
+  const w=(sel&&sel.value)||(quant==='int2'?'local:':'dist:');
+  const dist=(w.indexOf('dist:')===0), host=w.slice(w.indexOf(':')+1);
+  closeOv();
+  toast('compiling '+quant+' cache for '+name+(dist?(host?' on '+host:' across the fleet'):' on this controller')+'…');
+  tick();
+  try{
+    // /compile_dist returns as soon as the fan-out starts (progress shows on the model card);
+    // /compile_shards BLOCKS until the cache is written.
+    await api(dist?('/compile_dist?model='+encodeURIComponent(name)+'&quant='+quant+(host?'&node='+encodeURIComponent(host):''))
+                  :('/compile_shards?model='+encodeURIComponent(name)+'&quant='+quant),{method:'POST'});
+    toast(dist?(quant+' compile started for '+name+' — progress on the model card')
+              :(quant+' cache for '+name+' done'));
+  }catch(e){ toast(String(e.message||e),1); }
+  tick();
+}
 async function upgradePlacement(name){ closeOv(); toast('re-placing '+name+' faster…'); tick(); try{ const r=await api('/load_faster?model='+encodeURIComponent(name),{method:'POST'}); toast(name+' → '+((r&&r.to)||'faster placement')+(r&&r.forced?' (in-flight reply cut off)':'')); }catch(e){ toast(String(e.message||e),1);} tick(); }
 async function forget(name){ if(!confirm('Forget '+name+'? (keeps weight files)'))return; closeOv(); try{ await api('/forget?model='+encodeURIComponent(name),{method:'POST'}); toast('forgot '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
 async function del(name){ if(!confirm('DELETE '+name+' and its weight files?'))return; closeOv(); toast('deleting '+name+'…'); try{ await api('/delete?model='+encodeURIComponent(name),{method:'POST'}); toast('deleted '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
