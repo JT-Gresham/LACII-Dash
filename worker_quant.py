@@ -2235,6 +2235,43 @@ def _model_has_nonfused_experts(model) -> bool:
     return False
 
 
+def _meta_sibling_target(model, key: str, t):
+    """#router-bias-alias: find a STILL-META attribute matching `key`'s LEAF name under the same
+    parent scope, when the checkpoint's own name resolves to no attribute at all.
+
+    transformers renames some checkpoint tensors onto different submodules while building a model
+    (`_checkpoint_conversion_mapping` and friends) — a rename the STREAMED build bypasses, because
+    it installs tensors by name instead of going through from_pretrained. poolside/Laguna-XS-2.1
+    stores its DeepSeek-style router bias at `...mlp.experts.e_score_correction_bias`, but the
+    built module tree carries it at `...mlp.gate.e_score_correction_bias` — so the served tensor
+    resolved to nothing, the buffer stayed on `meta`, and the load aborted with
+    "unmaterialized meta tensor(s) after streamed build" for all 39 MoE layers.
+
+    Deliberately narrow, so this can never silently mis-assign: it only runs when the exact
+    checkpoint path is absent from the module tree, and it requires the SAME grandparent scope
+    (e.g. `mlp`), an IDENTICAL leaf name, a target still on `meta`, and an identical shape.
+    Returns (parent_module, attr_name, current_meta_tensor) or None."""
+    parts = key.split(".")
+    if len(parts) < 3:
+        return None
+    leaf = parts[-1]
+    gp = model
+    try:
+        for p in parts[:-2]:                      # walk to the GRANDparent (skip the renamed module)
+            gp = gp[int(p)] if p.isdigit() else getattr(gp, p)
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return None
+    named = getattr(gp, "named_children", None)
+    if named is None:
+        return None
+    for _name, child in list(named()):
+        cur = getattr(child, leaf, None)
+        if (cur is not None and getattr(cur, "is_meta", False)
+                and tuple(cur.shape) == tuple(t.shape)):
+            return child, leaf, cur
+    return None
+
+
 def _assign_meta_from_sd(model, sd) -> int:
     """Materialize meta tensors that load_state_dict(assign=True) SKIPPED.
 
@@ -2253,15 +2290,22 @@ def _assign_meta_from_sd(model, sd) -> int:
     for key, t in sd.items():
         parent = model
         parts = key.split(".")
+        attr = parts[-1]
         try:
             for p in parts[:-1]:
                 parent = parent[int(p)] if p.isdigit() else getattr(parent, p)
-            attr = parts[-1]
             cur = getattr(parent, attr, None)
         except (AttributeError, IndexError, KeyError, TypeError):
-            continue
-        if cur is None or not getattr(cur, "is_meta", False):
-            continue
+            cur = None
+        if cur is not None and not getattr(cur, "is_meta", False):
+            continue                       # already materialized — nothing to do
+        if cur is None:
+            # #router-bias-alias: the checkpoint's name isn't in the module tree at all (transformers
+            # renamed it onto a sibling during model build). Try the same leaf under this scope.
+            alt = _meta_sibling_target(model, key, t)
+            if alt is None:
+                continue
+            parent, attr, cur = alt
         val = (t if t.dtype == cur.dtype else t.to(cur.dtype)).detach().clone()
         if isinstance(cur, torch.nn.Parameter):
             setattr(parent, attr, torch.nn.Parameter(val, requires_grad=False))
