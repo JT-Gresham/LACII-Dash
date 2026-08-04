@@ -245,6 +245,26 @@ def _head_key(weight_map, prefix: str) -> str:
     return "lm_head.weight"
 
 
+# #final-norm-alias: the FINAL norm (after the last decoder layer, before the LM head) is called
+# '<prefix>norm.weight' in most architectures — but NOT all. LiquidAI's LFM2/LFM2.5 name it
+# '<prefix>embedding_norm.weight', and hardcoding the classic spelling KeyErrors the entire HEAD
+# unit, which kills any weight serve/compile that includes it (LFM2.5-8B-A1B died with
+# "KeyError: 'model.norm.weight'" at _plan_weight_stream). Try the known spellings, classic first.
+_FINAL_NORM_SUFFIXES = ("norm.weight", "embedding_norm.weight",
+                        "final_layernorm.weight", "ln_f.weight")
+
+
+def _final_norm_key(weight_map, prefix: str = "model.") -> str:
+    """SOURCE name of the model's final norm. Returns the first known spelling present in the
+    checkpoint; falls back to the classic name so a genuinely-missing norm still raises the same
+    clear KeyError downstream rather than silently dropping the tensor."""
+    for suf in _FINAL_NORM_SUFFIXES:
+        cand = f"{prefix}{suf}"
+        if cand in weight_map:
+            return cand
+    return f"{prefix}norm.weight"
+
+
 def _selected_names(all_names, start: int, end: int, has_embed: bool,
                     has_head: bool, tied: bool, prefix: str = "model.") -> list[str]:
     want: list[str] = []
@@ -253,7 +273,7 @@ def _selected_names(all_names, start: int, end: int, has_embed: bool,
     for i in range(start, end):
         want += [n for n in all_names if n.startswith(f"{prefix}layers.{i}.")]
     if has_head:
-        want.append(f"{prefix}norm.weight")
+        want.append(_final_norm_key(all_names, prefix))
         want.append(f"{prefix}embed_tokens.weight" if tied else "lm_head.weight")
     return list(dict.fromkeys(want))
 
@@ -267,7 +287,11 @@ def _assemble_sd(tensors: dict, start: int, end: int, has_embed: bool,
         for n in (x for x in tensors if x.startswith(f"model.layers.{i}.")):
             sd[n] = tensors[n]
     if has_head:
-        sd["model.norm.weight"] = tensors["model.norm.weight"]
+        # #final-norm-alias: tensors are keyed by OUTPUT name; the final norm is the only
+        # '*norm.weight' outside a decoder layer (LFM2 -> model.embedding_norm.weight).
+        _nk = next((k for k in tensors if k.endswith("norm.weight") and ".layers." not in k),
+                   "model.norm.weight")
+        sd[_nk] = tensors[_nk]
         if tied:
             sd["lm_head.weight"] = tensors["model.embed_tokens.weight"].clone()
         else:
@@ -544,7 +568,8 @@ def _plan_weight_stream(model_dir: str, start: int, end: int,
                       for n in names
                       if n.startswith(f"{prefix}layers.{i}.") and not _is_fp8_meta_name(n)]
     if has_head:
-        out_pairs.append(("model.norm.weight", f"{prefix}norm.weight"))
+        _nsrc = _final_norm_key(wm, prefix)          # #final-norm-alias (LFM2: embedding_norm)
+        out_pairs.append((_nsrc.replace(prefix, "model.", 1), _nsrc))
         out_pairs.append(("lm_head.weight",
                           f"{prefix}embed_tokens.weight" if tied else _head_key(wm, prefix)))
     if skip_experts:    # drop MoE experts (fused 3D AND per-expert); worker streams them via /experts (#62)
@@ -859,7 +884,8 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
                       for n in names
                       if n.startswith(f"{prefix}layers.{i}.") and not _is_fp8_meta_name(n)]
     if has_head:
-        out_pairs.append(("model.norm.weight", f"{prefix}norm.weight"))
+        _nsrc = _final_norm_key(wm, prefix)          # #final-norm-alias (LFM2: embedding_norm)
+        out_pairs.append((_nsrc.replace(prefix, "model.", 1), _nsrc))
         out_pairs.append(("lm_head.weight",
                           f"{prefix}embed_tokens.weight" if tied else _head_key(wm, prefix)))
     # group source reads by file (one safe_open per file) to avoid reopening per tensor
