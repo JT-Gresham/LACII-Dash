@@ -2841,6 +2841,45 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _cap_controller_cpu_threads() -> None:
+    """#controller-thread-cap: BOUND the controller process's torch CPU threads.
+
+    The WORKER has always tuned its threads (worker_quant.tune_cpu_threads, called from
+    client.py) — the CONTROLLER never did, so torch defaulted to every core it could see.
+    Any in-process tensor work then saturated the whole box: on the GPU-less iM controller
+    VM a single Qwen2.5-VL image encode ran a ~230 s CPU forward pinned at ~400% across all
+    4 cores, back-to-back, so the box looked permanently wedged while the controller was
+    "doing nothing".
+
+    A controller's job is routing/planning/serving weights — it must never be able to eat
+    the machine. Cap at HALF the cores (min 1) so control-plane latency stays bounded no
+    matter what runs in-process. An explicit OMP_NUM_THREADS/MKL_NUM_THREADS/
+    TORCH_NUM_THREADS is honored verbatim (never stomp a deliberate operator choice).
+
+    This is CONTAINMENT, not the fix: heavy model work does not belong on the controller at
+    all — see #vision-on-node for moving the encode to a worker.
+    """
+    try:
+        import torch
+    except Exception:
+        return                                   # torch-less controller: nothing to cap
+    n = None
+    for ev in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "TORCH_NUM_THREADS"):
+        v = os.environ.get(ev)
+        if v and v.strip().isdigit():
+            n = int(v.strip())
+            break
+    if n is None:
+        n = max(1, (os.cpu_count() or 2) // 2)
+    n = max(1, min(int(n), 128))
+    with contextlib.suppress(Exception):
+        torch.set_num_threads(n)
+    with contextlib.suppress(Exception):         # raises once a parallel region already ran
+        torch.set_num_interop_threads(1)
+    print(f"[cpu] controller torch threads capped at {n} "
+          f"(of {os.cpu_count()} cores) — the control plane must never saturate the box")
+
+
 def main() -> None:
     global ARGS
     with contextlib.suppress(Exception):
@@ -2855,6 +2894,7 @@ def main() -> None:
                routes_dashboard, routes_lifecycle, routes_api, routes_diag, serving,
                serving_anthropic, status, downloads, routes_shards, routes_peers)
     print(f"InfiniteModel controller {VERSION}")
+    _cap_controller_cpu_threads()
     if HF_TOKEN:
         print(f"[hf] auth token loaded (...{HF_TOKEN[-4:]}) — model pulls authenticated")
     else:
