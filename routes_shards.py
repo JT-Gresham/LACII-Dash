@@ -720,9 +720,15 @@ def register(app):
     # Llava/Mistral3 `model.vision_tower.` + `model.multi_modal_projector.`, Gemma-4
     # `model.vision_tower.` + `model.embed_vision.` (its `model.vision_embedder.` spelling is
     # renamed by the WORKER, matching multimodal._vision_ckpt_renames).
-    _VISION_PREFIXES = ("model.visual.", "thinker.visual.", "model.vision_tower.",
-                        "model.multi_modal_projector.", "model.embed_vision.",
-                        "model.vision_embedder.")
+    # ⚠ CHECKPOINT keys, which are NOT the module-tree names: Qwen2.5-VL stores the tower at
+    # TOP-LEVEL `visual.*` (390 tensors) while the built module is `model.visual.*` — transformers
+    # renames on load. So both spellings are listed; the worker strips whichever prefix it gets and
+    # loads relative to the tower module, which makes the rename irrelevant.
+    _VISION_PREFIXES = ("visual.", "model.visual.", "thinker.visual.",
+                        "vision_tower.", "model.vision_tower.",
+                        "multi_modal_projector.", "model.multi_modal_projector.",
+                        "embed_vision.", "model.embed_vision.",
+                        "vision_embedder.", "model.vision_embedder.")
 
     @app.get("/vision_weights")
     async def vision_weights(model: str):

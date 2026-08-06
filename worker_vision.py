@@ -84,10 +84,24 @@ def _build_tower(model_id: str, weights_url: str):
     with urllib.request.urlopen(weights_url, timeout=1800) as r:
         blob = r.read()
     sd = _apply_ckpt_renames(st_load(blob), getattr(cfg, "model_type", "") or "")
+    visual = _resolve_visual(model)
+    # Load RELATIVE to the tower module rather than through the whole model. The checkpoint's
+    # names are NOT the module-tree names — Qwen2.5-VL stores the tower at top-level `visual.*`
+    # while the built module is `model.visual.*` (transformers renames on load) — so a
+    # whole-model load_state_dict would match nothing and leave every tensor on meta. Stripping
+    # the leading namespace makes this rename-proof for every spelling the controller serves.
+    rel: dict = {}
+    for k, v in sd.items():
+        for pfx in ("model.visual.", "visual.", "thinker.visual.",
+                    "model.vision_tower.", "vision_tower."):
+            if k.startswith(pfx):
+                rel[k[len(pfx):]] = v
+                break
+        else:
+            rel[k] = v                    # projector/embedder pieces: leave as-is
     # assign=True installs the served tensors straight onto the meta modules (no copy); the
     # text LM keeps its meta params and is never touched — we only ever call the tower.
-    model.load_state_dict(sd, strict=False, assign=True)
-    visual = _resolve_visual(model)
+    missing = visual.load_state_dict(rel, strict=False, assign=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     visual.to(dev)
     left = [n for n, p in visual.named_parameters() if getattr(p, "is_meta", False)]
