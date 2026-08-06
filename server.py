@@ -2559,6 +2559,9 @@ def build_app() -> FastAPI:
         # accepted. _resilient_serve owns a per-accept try/except so the listener
         # survives. ctrl exposes .close()/.wait_closed() and ctrl.task is the
         # accept loop task, so the shutdown block below is unchanged.
+        # #vision-on-node: stash the running loop so code called via asyncio.to_thread (the
+        # image encode) can hand a control frame back to a worker with run_coroutine_threadsafe.
+        engine._loop = asyncio.get_running_loop()
         ctrl = await _resilient_serve(ARGS.host, ARGS.control_port, handle_control, "control")
         await engine.ensure_data_listener()
         # #discovery: answer worker broadcast queries so a fresh worker needs NO config.json edit.

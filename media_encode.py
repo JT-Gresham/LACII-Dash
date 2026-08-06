@@ -38,6 +38,82 @@ import time
 ENCODING: int = 0                  # >0 while a vision/audio encode is in flight (idle-gate guard)
 
 
+def _vision_node_forward(target_id: str, pv, grid):
+    """#vision-on-node: run the tower forward on a WORKER and return its merged tokens, or None
+    to fall back to the controller's own (slow) local forward.
+
+    A tower forward is a MODEL forward — it belongs on a node, like every other part of a model.
+    Run in-process on a GPU-less controller it costs ~230 s of CPU per image and pins the box
+    (the iM VM at a constant 400%). Only the FORWARD moves: preprocessing is free and the
+    config-derived metadata (counts / out_hidden / image_token_id) still comes from the
+    controller's meta-built model, so nothing else about the encode changes.
+
+    Node choice: alive, inference-capable, has a GPU, and has a live control link — preferring
+    the most free VRAM. Returns None (never raises) on no candidate / timeout / worker error, so
+    this can never break serving.
+    """
+    import base64
+    import urllib.parse as _up
+    from safetensors.torch import load as _st_load, save as _st_save
+
+    # Set once by the controller's lifespan; absent on an old/partially-updated controller, in
+    # which case we simply stay local rather than guessing at a loop from a worker thread.
+    loop = getattr(engine, "_loop", None)
+    if loop is None:
+        return None
+    cands = [n for n in registry.alive_sorted()
+             if n.can_infer and n.vram_total_gb > 0 and engine.links.get(n.node_id) is not None]
+    if not cands:
+        return None
+    cands.sort(key=lambda n: -float(getattr(n, "vram_total_gb", 0) or 0))
+    nd = cands[0]
+    link = engine.links.get(nd.node_id)
+    # The worker fetches the tower weights over HTTP — it must be an address the WORKER can
+    # reach, never this box's loopback (#loopback-nexthop).
+    host = engine._lan_visible_host("127.0.0.1", nd, link)
+    if str(host).startswith(("127.", "::1", "localhost")):
+        return None                       # couldn't resolve a LAN-visible address -> stay local
+    url = f"http://{host}:{ARGS.http_port}/vision_weights?model={_up.quote(target_id)}"
+    payload = {"pixel_values": pv.detach().to("cpu").contiguous()}
+    if grid is not None:
+        payload["image_grid_thw"] = grid.detach().to("cpu").contiguous()
+    rid = f"vis-{int(time.time() * 1000)}"
+    frame = {"type": "vision_encode", "req_id": rid, "model_id": target_id,
+             "weights_url": url, "payload_b64": base64.b64encode(_st_save(payload)).decode()}
+
+    async def _run():
+        pend = getattr(engine, "_vision_pending", None)
+        if pend is None:
+            pend = engine._vision_pending = {}
+        fut = loop.create_future()
+        pend[rid] = fut
+        try:
+            await link.send(frame)
+            return await asyncio.wait_for(fut, timeout=_VISION_NODE_TIMEOUT_S)
+        finally:
+            pend.pop(rid, None)
+
+    try:
+        msg = asyncio.run_coroutine_threadsafe(_run(), loop).result(_VISION_NODE_TIMEOUT_S + 30)
+    except Exception as exc:   # noqa: BLE001
+        print(f"[vision] node encode on {nd.hostname} failed ({exc!r}) -> local CPU forward",
+              flush=True)
+        return None
+    if not msg or msg.get("type") != "vision_done":
+        print(f"[vision] node encode on {nd.hostname} refused "
+              f"({(msg or {}).get('error', 'no result')}) -> local CPU forward", flush=True)
+        return None
+    with contextlib.suppress(Exception):
+        feats = _st_load(base64.b64decode(msg["feats_b64"]))["feats"]
+        print(f"[vision] tower ran on NODE {nd.hostname} -> {list(feats.shape)} "
+              f"(controller did no forward)", flush=True)
+        return feats
+    return None
+
+
+_VISION_NODE_TIMEOUT_S = 900.0    # a cold node builds the tower first (weights fetch + build)
+
+
 def _encode_images(target_id: str, images: list) -> dict:
     """Run the image processor + vision tower. Returns {image_embeds [N,hidden], grid_thw,
     info}. image_embeds are the per-image-token features to splice into stage-0's
@@ -242,18 +318,25 @@ def _encode_images(target_id: str, images: list) -> dict:
                     "grid_list": [], "pos_scheme": "1d", "grid_rc": grid_rc}
         visual, _prefix = _resolve_visual(model)
         t_fwd = time.time()
-        with torch.inference_mode():
-            # The visual tower's OWN forward runs patch_embed -> blocks -> merger and returns
-            # the LM-READY MERGED tokens [prod(grid)/merge^2, out_hidden(==text_hidden)].
-            # get_image_features returns only the PRE-merge backbone [patches, vision_hidden],
-            # which is the wrong dim/count to splice — so call visual() directly.
-            try:
-                feats = visual(pv, grid_dev)
-                info["path"] = "visual(pixel_values, grid_thw)"
-            except Exception as exc:
-                info["visual_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
-                feats = model.get_image_features(pixel_values=pv, image_grid_thw=grid_dev)
-                info["path"] = "get_image_features(fallback)"
+        # #vision-on-node: try a GPU NODE first — a tower forward is a model forward and does not
+        # belong on the controller. Falls through to the local path below on any failure.
+        feats = _vision_node_forward(target_id, pv, grid)
+        if feats is not None:
+            info["path"] = "node"
+            info["forward_s"] = round(time.time() - t_fwd, 1)
+        if feats is None:                       # no capable node / it failed -> local forward
+            with torch.inference_mode():
+                # The visual tower's OWN forward runs patch_embed -> blocks -> merger and returns
+                # the LM-READY MERGED tokens [prod(grid)/merge^2, out_hidden(==text_hidden)].
+                # get_image_features returns only the PRE-merge backbone [patches, vision_hidden],
+                # which is the wrong dim/count to splice — so call visual() directly.
+                try:
+                    feats = visual(pv, grid_dev)
+                    info["path"] = "visual(pixel_values, grid_thw)"
+                except Exception as exc:
+                    info["visual_error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+                    feats = model.get_image_features(pixel_values=pv, image_grid_thw=grid_dev)
+                    info["path"] = "get_image_features(fallback)"
         info["forward_s"] = round(time.time() - t_fwd, 1)
         info["raw_return_type"] = type(feats).__name__
         # Splice the MERGED tokens (pooler_output, dim == text hidden), not the pre-merge

@@ -732,6 +732,38 @@ class WorkerLoadMixin:
                              "error": repr(exc)})
             print(f"[t2i] generate FAILED: {exc!r}", flush=True)
 
+    async def handle_vision_encode(self, msg: dict, reply) -> None:
+        """#vision-on-node: run ONE vision-tower forward HERE and return the merged tokens.
+
+        The controller preprocesses the images (free) and sends `pixel_values` (+ grid) as
+        safetensors b64; we build the tower ONCE per model from the controller's
+        /vision_weights and run it on this node's GPU. Dispatched as a TASK by command_loop —
+        a tower forward takes seconds on GPU but minutes on CPU, and awaiting inline would
+        block unload/ping. `_building` marks the worker busy so self-update/reclaim can't kill
+        it mid-forward. ANY failure replies `vision_err` so the controller falls straight back
+        to its own local encode — this path must never be able to break serving."""
+        import base64
+        rid = msg.get("req_id")
+        mid = str(msg.get("model_id") or "")
+        try:
+            self._building += 1
+            try:
+                import worker_vision
+                payload = base64.b64decode(msg.get("payload_b64") or "")
+                out = await asyncio.to_thread(worker_vision.encode, mid,
+                                              str(msg.get("weights_url") or ""), payload)
+            finally:
+                self._building -= 1
+            await reply({"type": "vision_done", "req_id": rid, "model_id": mid,
+                         "feats_b64": base64.b64encode(out).decode(), "bytes": len(out)})
+            print(f"[vision-node] {mid}: returned {len(out)/(1<<20):.1f} MB of merged tokens",
+                  flush=True)
+        except Exception as exc:   # noqa: BLE001
+            with contextlib.suppress(Exception):
+                await reply({"type": "vision_err", "req_id": rid, "model_id": mid,
+                             "error": repr(exc)})
+            print(f"[vision-node] FAILED: {exc!r}", flush=True)
+
     async def handle_tts_gen(self, msg: dict, reply) -> None:
         """#tts-serve: run ONE speech synthesis on this worker's resident KokoroPipeline and
         mirror the result over the control link. Dispatched as a TASK by command_loop (a long

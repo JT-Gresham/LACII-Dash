@@ -512,6 +512,14 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                     _ap = engine._t2a_progress = {}
                 _ap[msg.get("req_id")] = (int(msg.get("step", 0)), int(msg.get("total", 0)),
                                           time.time())
+            elif mtype in ("vision_done", "vision_err"):
+                # #vision-on-node: the worker finished (or failed) a tower forward — resolve the
+                # future _encode_images_remote is waiting on. An error resolves it too, so the
+                # caller falls back to a local encode immediately instead of burning the timeout.
+                _vp = getattr(engine, "_vision_pending", None) or {}
+                _vf = _vp.pop(msg.get("req_id"), None)
+                if _vf is not None and not _vf.done():
+                    _vf.set_result(msg)
             elif mtype in ("t2a_done", "t2a_err"):
                 # #t2a-serve: final music result — resolve the waiting t2a_generate future.
                 _pend = getattr(engine, "_t2a_pending", None) or {}

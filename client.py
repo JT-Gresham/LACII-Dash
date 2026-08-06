@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.11"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.12"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -825,6 +825,7 @@ EXTRA_UPDATE_FILES: list[str] = ["wire.py", "config.json", "shards.py",
                                  "worker_load.py", "worker_net.py",   # config + shared packer
                                  "kv_quant.py",   # TurboQuant KV-cache quantizer (#172)
                                  "worker_quant.py",   # code-split Inc 10: quant/kernel family
+                                 "worker_vision.py",  # #vision-on-node: run the tower HERE, not on the controller
                                  "worker_t2i.py",   # #t2i-serve: diffusion image engine (lazy import)
                                  "worker_tts.py",   # #tts-serve: Kokoro speech engine (lazy import)
                                  "worker_t2a.py",   # #t2a-serve: ACE-Step music engine (lazy import)
@@ -1119,6 +1120,12 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                         await reply({"type": "error", "node_id": node_id,
                                      "req_id": msg.get("req_id"), "error": repr(exc)})
                         print(f"[pack] FAILED: {exc!r}")
+                elif mtype == "vision_encode":
+                    # #vision-on-node: run the VISION TOWER here instead of on the controller
+                    # (a GPU-less controller spends ~230 s of CPU per image doing this). A tower
+                    # forward is slow enough to block the loop, so dispatch as a task — the
+                    # handler replies keyed by req_id when done, like t2i/tts.
+                    asyncio.create_task(worker.handle_vision_encode(msg, reply))
                 elif mtype == "t2i_gen":
                     # #t2i-serve: renders take minutes — dispatch as a task so this loop keeps
                     # serving unload/ping; the handler replies keyed by req_id when done.

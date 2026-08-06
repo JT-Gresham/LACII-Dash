@@ -711,6 +711,49 @@ def register(app):
         return JSONResponse(await asyncio.to_thread(_collect))
 
 
+    # #vision-on-node: the vision TOWER's weights, so a GPU worker can build the tower and run the
+    # encode there instead of the controller doing a ~230 s CPU forward in-process (the iM VM at a
+    # constant 400%). Mirrors /weights: byte-range reads out of the checkpoint, safetensors on the
+    # wire. Selection is by KEY PREFIX off the weight map — no model build needed on this side, so a
+    # GPU-less controller never touches torch for this. Prefixes cover the layouts multimodal.py
+    # materializes: standard `model.visual.` (Qwen2.5-VL / Qwen3.6-VL), Omni `thinker.visual.`,
+    # Llava/Mistral3 `model.vision_tower.` + `model.multi_modal_projector.`, Gemma-4
+    # `model.vision_tower.` + `model.embed_vision.` (its `model.vision_embedder.` spelling is
+    # renamed by the WORKER, matching multimodal._vision_ckpt_renames).
+    _VISION_PREFIXES = ("model.visual.", "thinker.visual.", "model.vision_tower.",
+                        "model.multi_modal_projector.", "model.embed_vision.",
+                        "model.vision_embedder.")
+
+    @app.get("/vision_weights")
+    async def vision_weights(model: str):
+        from safetensors.torch import save as _st_save
+        try:
+            friendly = resolve_model_name(model)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        target = MODELS[friendly][0] if friendly in MODELS else friendly
+        mdir = await asyncio.to_thread(_controller_model_dir, target)
+        if not mdir:
+            return JSONResponse({"error": "model not available on the controller"}, status_code=404)
+
+        def _collect() -> bytes:
+            import shards as _sh
+            wm = _sh._weight_map(mdir)
+            names = [n for n in wm if n.startswith(_VISION_PREFIXES)]
+            if not names:
+                raise KeyError("no vision-tower tensors in this checkpoint")
+            return _st_save(_sh._load_tensors(names, wm))
+
+        try:
+            blob = await asyncio.to_thread(_collect)
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        except Exception as exc:   # noqa: BLE001
+            return JSONResponse({"error": f"vision weight read failed: {exc!r}"}, status_code=500)
+        log_activity(f"serving VISION TOWER weights for {_ollama_name(friendly)} "
+                     f"({len(blob)/(1<<20):.0f} MB)")
+        return Response(content=blob, media_type="application/octet-stream")
+
     @app.get("/weights")
     async def weights(model: str, start: int, end: int, embed: int = 0, head: int = 0,
                       skip_experts: int = 0, cache: str = ""):
