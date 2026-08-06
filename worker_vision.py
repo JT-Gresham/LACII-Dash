@@ -158,8 +158,21 @@ def encode(model_id: str, weights_url: str, payload: bytes) -> bytes:
             print(f"[vision-node] tower forward failed ({type(exc).__name__}: "
                   f"{str(exc)[:160]}) -> get_image_features", flush=True)
             raise
-    if not isinstance(feats, torch.Tensor):          # some towers return a ModelOutput
-        feats = getattr(feats, "pooler_output", None) or getattr(feats, "last_hidden_state", None)
+    if not isinstance(feats, torch.Tensor):          # some towers return a ModelOutput/tuple
+        # NB: never chain these with `or` — truth-testing a multi-element tensor raises
+        # "Boolean value of Tensor with more than one value is ambiguous".
+        _cand = None
+        for _a in ("pooler_output", "last_hidden_state"):
+            _v = getattr(feats, _a, None)
+            if isinstance(_v, torch.Tensor):
+                _cand = _v
+                break
+        if _cand is None and isinstance(feats, (tuple, list)) and feats:
+            if isinstance(feats[0], torch.Tensor):
+                _cand = feats[0]
+        if _cand is None:
+            raise RuntimeError(f"tower returned {type(feats).__name__} with no usable tensor")
+        feats = _cand
     out = feats.detach().to("cpu")
     print(f"[vision-node] {model_id}: forward={time.time() - t0:.1f}s on {dev} -> "
           f"{list(out.shape)}", flush=True)
