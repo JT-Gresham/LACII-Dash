@@ -101,7 +101,31 @@ def _build_tower(model_id: str, weights_url: str):
             rel[k] = v                    # projector/embedder pieces: leave as-is
     # assign=True installs the served tensors straight onto the meta modules (no copy); the
     # text LM keeps its meta params and is never touched — we only ever call the tower.
-    missing = visual.load_state_dict(rel, strict=False, assign=True)
+    visual.load_state_dict(rel, strict=False, assign=True)
+    # Some tower tensors are NOT in the checkpoint: a rotary module's `inv_freq` is a
+    # NON-PERSISTENT buffer that transformers computes from config at __init__ — under a meta
+    # build it is created on meta and no served tensor can fill it. Left alone, the subsequent
+    # .to(device) dies with "Cannot copy out of meta tensor; no data!". (The controller's own
+    # loader reports the same thing as "materialized 1 meta tensor(s)".) Rebuild every remaining
+    # meta buffer on the real device before moving the tower.
+    _rebuilt = 0
+    for _mod in visual.modules():
+        for _bname, _buf in list(_mod.named_buffers(recurse=False)):
+            if not getattr(_buf, "is_meta", False):
+                continue
+            _new = None
+            if _bname == "inv_freq":
+                dim = int(getattr(_mod, "dim", 0) or 0) or int(_buf.shape[-1]) * 2
+                theta = float(getattr(_mod, "theta", 0) or getattr(_mod, "base", 0) or 10000.0)
+                _new = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+                _new = _new[: _buf.shape[-1]]
+            if _new is None:
+                _new = torch.zeros(_buf.shape, dtype=_buf.dtype)
+            _mod.register_buffer(_bname, _new.to(_buf.dtype), persistent=False)
+            _rebuilt += 1
+    if _rebuilt:
+        print(f"[vision-node] rebuilt {_rebuilt} non-persistent buffer(s) not in the checkpoint",
+              flush=True)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     visual.to(dev)
     left = [n for n, p in visual.named_parameters() if getattr(p, "is_meta", False)]
