@@ -4,6 +4,31 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## Recent — VRAM-accounting hygiene + KV-quant in the Load UI
+
+- **#reservation-reconcile** — the controller's in-flight-load ledger (`engine._reservations`) is the
+  planned per-node VRAM/RAM that *every* placement subtracts (`_reserved_bytes`) so two concurrent
+  loads never over-provision a node. Each entry is set at load start and popped in the `load()`
+  finally; a load cancelled/killed on a path that skips that finally — or a sub-load (replica/TP/media)
+  whose key the top-level wrapper never pops — **leaked** the entry, so placement kept subtracting VRAM
+  no worker actually held and a node read **"no room"** until the controller was *restarted* and the
+  in-memory dict cleared (the "workers appear to hold fake VRAM; a restart frees it" symptom). A new
+  20 s controller sweep (`control_plane.reservation_reconcile_loop`) does what the restart did, **live**:
+  it frees any reservation whose owning load is provably over (its `_loading_tasks` handle finished) or
+  that has out-lived a TTL with no live owner, returning that phantom budget without a restart. It
+  **never** touches a reservation whose load task is still running (a genuine in-flight load), clears
+  the stale "loading" card, wakes anyone queued behind the ghost load, and logs each drop with the GB
+  it returns. Controller-only, deploys hitless. Tunable (default on): `reserve_reconcile`,
+  `reserve_ttl_s` (600 s). (The **worker**-side half — an on-demand `empty_cache` endpoint plus
+  `expandable_segments:True` to stop allocator *fragmentation* at the source — is proposed, not yet
+  built.)
+- **KV quant in the Load screen** — the dashboard Load dialog now exposes a **KV quant** selector
+  (`none / turbo4 / turbo3 / turbo2`) beside the KV-cache-location control, forwarding `kv_quant` to
+  `/load` (previously API-only). turbo4 is near-lossless and keeps a big context **on-GPU** without
+  spilling weights — the right lever (over `kv_offload`, which shuffles KV over PCIe every token) for
+  fitting full context on a single discrete GPU at 0 % CPU. (The "Preview fit" estimate still sizes KV
+  at bf16, so it under-counts what turbo saves — a follow-up.)
+
 ## Release 0.3.6 — text-to-music (MusicGen)
 
 - **#t2music-serve** — InfiniteModel now generates music from a text prompt with **MusicGen**
