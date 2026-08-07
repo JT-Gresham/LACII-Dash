@@ -557,9 +557,32 @@ def log_csv(ts, samples):
         pass
 
 
+FETCH_DEADLINE = 6.0                               # hard cap on a single /status poll (see below)
+
+
 def fetch(host, hp):
-    with urlopen(f"http://{host}:{hp}/status", timeout=4) as r:
-        return json.load(r)
+    """Poll /status with a HARD TOTAL deadline. urlopen(timeout=) is only a per-recv IDLE timeout,
+    so a big reply dribbling in over the tablet's flaky Wi-Fi keeps resetting it and json.load()
+    can block for tens of seconds — which freezes the whole render loop on the last good frame.
+    Run the poll in a daemon thread and abandon it past the deadline so a slow link degrades to a
+    normal 'unreachable' frame instead of a hang."""
+    import threading
+    box = {}
+
+    def _do():
+        try:
+            with urlopen(f"http://{host}:{hp}/status", timeout=4) as r:
+                box["data"] = json.load(r)
+        except BaseException as e:                 # carry ANY failure back to the caller thread
+            box["err"] = e
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(FETCH_DEADLINE)
+    if t.is_alive():                               # still reading past the cap -> treat as unreachable
+        raise TimeoutError(f"/status poll exceeded {FETCH_DEADLINE:.0f}s (slow/flaky link)")
+    if "err" in box:
+        raise box["err"]
+    return box["data"]
 
 
 _last_size = [0, 0]
@@ -798,7 +821,23 @@ def main():
     sys.stdout.write("\033[?25l")
     try:
         while True:
-            render()
+            try:
+                render()
+            except Exception as e:                       # NEVER let one bad frame freeze the panel on
+                import traceback                          # a stale screen. render() builds the frame in
+                # memory and writes only at the end, so an unguarded throw mid-build leaves the LAST
+                # good frame on screen forever while the shell loop silently relaunches into the same
+                # error. Instead: redraw a visible, still-ticking error frame (which also surfaces the
+                # traceback) and keep polling — most causes are transient (a reply mid-restart, a
+                # terminal-resize race, a node with an unexpected field).
+                sys.stdout.write("\033[H\033[2J")
+                sys.stdout.write(f"\033[1;31m FLEET BANDWIDTH — panel error, retrying every "
+                                 f"{POLL:.0f}s   {time.strftime('%H:%M:%S')}\033[0m\033[K\n\033[K\n")
+                sys.stdout.write(f"\033[31m  {type(e).__name__}: {e}\033[0m\033[K\n\033[K\n")
+                for ln in traceback.format_exc().splitlines()[-8:]:
+                    sys.stdout.write(f"  \033[2m{ln}\033[0m\033[K\n")
+                sys.stdout.write("\033[J")
+                sys.stdout.flush()
             time.sleep(POLL)
     except KeyboardInterrupt:
         pass

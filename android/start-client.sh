@@ -22,6 +22,8 @@ if [ ! -x .venv/bin/python ]; then
   exit 1
 fi
 PY="$HERE/.venv/bin/python"
+# Clean interactive stop: Ctrl-C / SIGTERM breaks the self-heal loop below.
+trap 'echo "[stop] signalled - exiting."; exit 0' INT TERM
 code=0
 while true; do
   set +e
@@ -33,6 +35,10 @@ while true; do
     echo "[update] new code pulled - relaunching ..."
     continue
   fi
-  break
+  # ANY other exit (crash / dropped control link / flaky-Wi-Fi blip) self-heals by
+  # restarting. Critical on the tablet: if this script exits, the tmux 'wrk' pane drops
+  # to a shell and the bandwidth panel that tails that pane FREEZES. Back off so a
+  # hard-failing worker can't hot-loop.
+  echo "[restart] worker exited (code $code) - restarting in 3s ..."
+  sleep 3
 done
-exit "$code"
