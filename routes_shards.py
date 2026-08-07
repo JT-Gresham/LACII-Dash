@@ -297,6 +297,16 @@ def register(app):
                 for i in range(n_layers):
                     q.put_nowait(i)
 
+                # #repack-elsewhere: a worker that fails a unit is usually MISSING SOMETHING the
+                # model needs (einops for a trust_remote_code arch, shards.py not yet fetched, no
+                # torch) — i.e. it will fail EVERY unit, not just this one. The old behaviour packed
+                # each failure LOCALLY on the controller, so a fleet where only a couple of nodes can
+                # handle the model quietly dumped all the remaining layers onto the controller and the
+                # compile appeared to stall after those two nodes finished. Instead: retire the
+                # failing node for THIS compile, hand its unit back to the queue for a healthy node,
+                # and only pack locally once no capable node is left.
+                _bad: set = set()
+
                 async def _node_loop(node):
                     while True:
                         try:
@@ -313,13 +323,34 @@ def register(app):
                                     c["stages_ready"] = len(_part)
                                 log_activity(f"compile_dist: {node.hostname} packing "
                                              f"{_ollama_name(friendly)} {quant} layers")
-                        except Exception as exc:   # worker died / no shards.py / timeout -> local fallback
-                            log_activity(f"compile_dist {unit} on {node.hostname} failed ({exc!r}) -> local pack")
+                        except Exception as exc:   # worker died / missing dep / timeout
+                            _bad.add(node.node_id)
+                            _left = [n for n in caps if n.node_id not in _bad]
+                            if _left:
+                                q.put_nowait(i)     # give it to a node that CAN pack it
+                                log_activity(
+                                    f"compile_dist {unit} on {node.hostname} failed ({exc!r}) — "
+                                    f"retiring that node for this compile, re-queued to "
+                                    f"{len(_left)} healthy node(s)")
+                                return              # this node fails everything; stop feeding it
+                            log_activity(f"compile_dist {unit} on {node.hostname} failed ({exc!r}) "
+                                         f"— no capable node left, packing locally")
                             blob, mt = await asyncio.to_thread(_pack_local, i, i + 1, 0, 0)
                         _write(unit, blob, mt)
 
                 if caps:
                     await asyncio.gather(*[_node_loop(n) for n in caps])
+                    # Every capable node retired with work still queued -> finish locally so the
+                    # cache is COMPLETE. Without this the manifest would silently miss those units.
+                    while True:
+                        try:
+                            i = q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        log_activity(f"compile_dist: no worker could pack L{i:04d} "
+                                     f"({len(_bad)} node(s) retired) — packing locally")
+                        blob, mt = await asyncio.to_thread(_pack_local, i, i + 1, 0, 0)
+                        _write(f"L{i:04d}.safetensors", blob, mt)
                 else:                              # no workers -> compile fully locally
                     for i in range(n_layers):
                         blob, mt = await asyncio.to_thread(_pack_local, i, i + 1, 0, 0)
