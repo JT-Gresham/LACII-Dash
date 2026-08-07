@@ -758,14 +758,15 @@ function openLoad(name){
    +'<optgroup label="Tensor-parallel"><option value="tp:gpu">GPU tensor-parallel</option><option value="tp:cpu">CPU tensor-parallel (RAM)</option></optgroup></select>'
    +'<div id="l-tpwrap" style="display:none;margin-top:8px"><label>TP width (number of nodes)</label><input id="l-tpn" type="number" min="2" value="2" oninput="previewSoon(\''+esc(name)+'\')"></div>'
    +'<div class="grid2" style="margin-top:8px">'
-   +'<div><label title="Where the KV cache (the conversation scratchpad — grows with context) lives. GPU = fastest. System RAM (OffloadedCache, per-layer prefetch) frees that VRAM for model layers — useful when pushing context past what the card holds; decode is slower.">KV cache</label>'
-   +'<select id="l-kvo"><option value="">GPU (fastest)</option><option value="1">System RAM (frees VRAM)</option></select></div>'
-   +'<div><label title="Default sampling temperature for this model: used when a request does not send its own (explicit request values always win). Empty = greedy (0). ~0.7 leans creative, 0 = deterministic.">Default temperature</label>'
-   +'<input id="l-temp" type="number" min="0" max="2" step="0.1" placeholder="0 (greedy)"></div></div>'
+   +'<div><label title="Where the KV cache (the conversation scratchpad — grows with context) lives. GPU = fastest. System RAM (OffloadedCache, per-layer prefetch) frees that VRAM for model layers — useful when pushing context past what the card holds. Decode is slower, and MUCH slower on a discrete GPU (the whole cache crosses PCIe every token). To keep a big context on-GPU without spilling weights, prefer KV quant instead.">KV cache location</label>'
+   +'<select id="l-kvo" onchange="previewSoon(\''+esc(name)+'\')"><option value="">GPU (fastest)</option><option value="1">System RAM (frees VRAM)</option></select></div>'
+   +'<div><label title="TurboQuant KV-cache quantization (#172): store keys/values at ~2-4 bits ON the GPU (data-free rotation + Lloyd-Max, un-rotated on read so attention is unchanged), shrinking the KV ~4-5x so a bigger context fits on the same card WITHOUT spilling weights to RAM. turbo4 is near-lossless, turbo3 more aggressive, turbo2 smallest. Best on large (>=~7B) models — small models degrade. Overridden by System-RAM offload. NOTE: the fit-preview still sizes KV at bf16, so it under-counts what turbo saves.">KV quant</label>'
+   +'<select id="l-kvq" onchange="previewSoon(\''+esc(name)+'\')"><option value="">none (bf16, exact)</option><option value="turbo4">turbo4 &middot; ~4-bit (near-lossless)</option><option value="turbo3">turbo3 &middot; ~3-bit</option><option value="turbo2">turbo2 &middot; ~2-bit (smallest)</option></select></div></div>'
    +'<div class="grid2" style="margin-top:8px">'
+   +'<div><label title="Default sampling temperature for this model: used when a request does not send its own (explicit request values always win). Empty = greedy (0). ~0.7 leans creative, 0 = deterministic.">Default temperature</label>'
+   +'<input id="l-temp" type="number" min="0" max="2" step="0.1" placeholder="0 (greedy)"></div>'
    +'<div><label title="Min-p sampling floor: drops any token whose probability is below this fraction of the top token\'s. Confidence-adaptive — strict when the model is sure, looser when it isn\'t — so it pairs well with HIGH temperature (temp flattens the distribution and lets weird tokens in; min-p cuts them first). At temperature >= 1.0 use 0.05-0.1: lower barely filters, higher eats the variety you raised temperature for. Used when a request sends no min_p of its own.">Default min-p</label>'
-   +'<input id="l-minp" type="number" min="0" max="1" step="0.01" placeholder="0 (off)"></div>'
-   +'<div></div></div>'
+   +'<input id="l-minp" type="number" min="0" max="1" step="0.01" placeholder="0 (off)"></div></div>'
    +(dc>=131072?'<div class="note">⚠ native ctx is '+(Math.round(dc/1024))+'k — a huge KV cache. Keep ctx modest (8–16k) unless you need more.</div>':'')
    +'<div style="margin-top:16px;text-align:right"><button class="btn ghost" onclick="preview(\''+esc(name)+'\')">Preview fit</button> '
    +'<button class="btn pri" onclick="doLoad(\''+esc(name)+'\')">Load</button></div>'
@@ -782,6 +783,7 @@ function placeParams(name){
   else if(v==='tp:gpu'){ p.tp=$('#l-tpn').value||2; }
   else if(v==='tp:cpu'){ p.tp=$('#l-tpn').value||2; p.cpu_only='true'; }
   const kvo=$('#l-kvo'); if(kvo&&kvo.value)p.kv_offload='true';      // #kv-offload: KV in system RAM
+  const kvq=$('#l-kvq'); if(kvq&&kvq.value)p.kv_quant=kvq.value;     // #172 TurboQuant KV preset (turbo2/3/4)
   const tmp=$('#l-temp'); if(tmp&&tmp.value!=='')p.temperature=tmp.value;  // #load-temp: default temp
   const mp=$('#l-minp'); if(mp&&mp.value!=='')p.min_p=mp.value;            // #min-p: default floor
   return p;
