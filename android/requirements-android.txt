@@ -13,3 +13,7 @@ safetensors==0.8.0
 huggingface_hub==1.19.0
 numpy==2.4.6
 psutil==7.2.2
+# einops: trust_remote_code models import it at load. A worker WITHOUT einops throws
+# ImportError, and the controller then marks this node can_infer=False for EVERY model
+# (one missing package benches the tablet fleet-wide). Pinned to the fleet's version.
+einops==0.8.2

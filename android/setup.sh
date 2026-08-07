@@ -28,13 +28,14 @@ echo "== pip: torch — CPU aarch64 wheel from the PyTorch CPU index =="
 pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
 
 echo "== pip: transformers stack (PyPI) =="
-pip install transformers==5.12.1 safetensors==0.8.0 huggingface_hub==1.19.0 numpy==2.4.6 psutil==7.2.2
+pip install transformers==5.12.1 safetensors==0.8.0 huggingface_hub==1.19.0 numpy==2.4.6 psutil==7.2.2 einops==0.8.2
 
 echo "== verify =="
 python - <<'PY'
-import torch, transformers, safetensors, numpy, psutil
+import torch, transformers, safetensors, numpy, psutil, einops
 print("  OK  torch", torch.__version__, "| transformers", transformers.__version__,
-      "| numpy", numpy.__version__, "| cuda", torch.cuda.is_available())
+      "| numpy", numpy.__version__, "| einops", einops.__version__,
+      "| cuda", torch.cuda.is_available())
 PY
 
 echo
