@@ -528,6 +528,11 @@ class Node:
     can_t2a: bool = False
     can_t2i: bool = False
     can_stt: bool = False
+    # #einops-probe: einops is pulled in by several models' trust_remote_code. Missing it fails
+    # the load with ImportError, which marks the node can_infer=False fleet-wide until its worker
+    # restarts — so surface the gap in /status BEFORE a load trips over it. True unless the worker
+    # explicitly reported otherwise, so a pre-feature worker is never shown as missing it.
+    has_einops: bool = True
     can_t2music: bool = False   # #t2music-serve: MusicGen (transformers+soundfile; = can_stt)
     # #wire-caps: wire-protocol capability set the worker advertised at registration (e.g.
     # {"ntensor"}). EMPTY for old workers that sent no 'caps' field — every capability-gated
@@ -647,7 +652,7 @@ class Node:
             "age_s": round(self.age, 1), "alive": self.alive,
             "can_infer": self.can_infer, "incapable_reason": self.incapable_reason,
             "can_t2a": self.can_t2a, "can_t2i": self.can_t2i, "can_stt": self.can_stt,
-            "can_t2music": self.can_t2music,
+            "can_t2music": self.can_t2music, "has_einops": self.has_einops,
             "caps": sorted(self.caps),   # #wire-caps: advertised wire capabilities (/status)
             "vram_total_gb": round(self.vram_total_gb, 2),
             "vram_used_gb": round(self.vram_used_gb, 2),
@@ -695,6 +700,7 @@ class Registry:
                 can_t2i=bool(reg.get("can_t2i", False)),
                 can_stt=bool(reg.get("can_stt", False)),
                 can_t2music=bool(reg.get("can_t2music", False)),
+                has_einops=bool(reg.get("has_einops", True)),   # #einops-probe (absent -> assume OK)
                 # #wire-caps: record the worker's advertised wire capabilities. Absent/unknown
                 # field (old worker) -> empty frozenset -> every gated wire feature stays off.
                 caps=frozenset(str(c) for c in (reg.get("caps") or [])),

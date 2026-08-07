@@ -493,6 +493,13 @@ def build_registration(args: argparse.Namespace) -> dict:
             return False
     reg["can_t2a"] = _has("acestep")
     reg["can_t2i"] = _has("diffusers")
+    # #einops-probe: einops is imported by several models' trust_remote_code (nomic-embed's
+    # encoder, Kimi-Linear, …). A node missing it fails the load with ImportError, and the
+    # controller's handler then marks the WHOLE node can_infer=False and replans without it
+    # (engine_load ~1408) — so one missing pip package benches that node for EVERY model until
+    # its worker restarts. Report it up front so the gap is visible in /status BEFORE a load
+    # trips over it, instead of being diagnosed from a failed placement.
+    reg["has_einops"] = _has("einops")
     reg["can_stt"] = _has("transformers") and _has("soundfile")   # #stt-serve: Whisper ASR leaf
     # #t2music-serve: MusicGen ships inside transformers and needs NO torchaudio (soundfile writes
     # the WAV) — so any Whisper-capable worker is also MusicGen-capable. Runs on AMD/NVIDIA/CPU.
