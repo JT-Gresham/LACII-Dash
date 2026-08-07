@@ -595,6 +595,71 @@ async def reaper_loop() -> None:
                     link.writer.close()
 
 
+# #reservation-reconcile: engine._reservations is the in-flight-load ledger — each entry is planned
+# per-node VRAM/RAM that EVERY placement subtracts (Engine._reserved_bytes) so two concurrent loads
+# never over-provision a node. An entry is set at load start and popped in the load() finally. If a
+# load is cancelled/killed on a path that skips that finally — or a sub-load (replica/TP/media) leaves
+# a key the top-level wrapper never pops — the entry LEAKS: placement keeps subtracting VRAM that no
+# worker actually holds, so the node reads "no room" and refuses new loads until the controller is
+# RESTARTED and the in-memory dict clears (the "workers hold fake VRAM, a restart frees it" symptom).
+RESERVE_RECONCILE_GRACE_S = 20.0   # never touch a reservation younger than one sweep (a real load's
+                                   # _loading_tasks handle may register a beat after the reservation)
+RESERVE_TTL_S_DEFAULT = 600.0      # backstop: a genuine load finishes well within this; older + NO
+                                   # live owner == orphan. Tunable via ENGINE_CONFIG["reserve_ttl_s"].
+
+
+async def reservation_reconcile_loop() -> None:
+    """Drop LEAKED in-flight-load reservations (engine._reservations) live, so a phantom entry can't
+    wedge placement into a permanent "no room" that only a controller restart clears — doing what the
+    restart did, without one. SAFETY: a reservation whose _loading_tasks handle is still RUNNING is
+    NEVER dropped (a genuine in-flight load), and a grace window protects a just-set entry. A reservation
+    is freed only once its owning load is provably over (its task finished) OR it has out-lived a
+    generous TTL with no live owner. Every drop is logged with the budget it returns. See
+    #reservation-reconcile."""
+    while True:
+        await asyncio.sleep(20.0)
+        try:
+            if not ENGINE_CONFIG.get("reserve_reconcile", True):
+                continue   # explicitly disabled
+            now = time.time()
+            seen = engine._reservation_seen
+            for rk in list(engine._reservations.keys()):
+                seen.setdefault(rk, now)               # first-seen stamp (lazy — no load-path edits)
+            try:
+                ttl = float(ENGINE_CONFIG.get("reserve_ttl_s", RESERVE_TTL_S_DEFAULT))
+            except (TypeError, ValueError):
+                ttl = RESERVE_TTL_S_DEFAULT
+            for rk in list(seen.keys()):
+                if rk not in engine._reservations:
+                    seen.pop(rk, None)                 # already released cleanly — forget it
+                    continue
+                task = engine._loading_tasks.get(rk)
+                if task is not None and not task.done():
+                    continue                           # a real load owns it -> NEVER drop
+                age = now - seen.get(rk, now)
+                if age < RESERVE_RECONCILE_GRACE_S:
+                    continue                           # too young; let the normal finally run first
+                done_owner = task is not None and task.done()
+                if not (done_owner or (ttl > 0 and age >= ttl)):
+                    continue                           # no live/finished owner AND not old enough yet
+                res = engine._reservations.pop(rk, None)
+                seen.pop(rk, None)
+                engine.loadings.pop(rk, None)          # clear the stale "loading" card too
+                engine._loading_tasks.pop(rk, None)
+                _f = engine._loading_futures.pop(rk, None)   # wake anyone queued behind the ghost load
+                if _f is not None and not _f.done():
+                    _f.set_result(engine.models.get(rk))
+                gb = sum(int(b.get("vram", 0)) + int(b.get("ram", 0))
+                         for b in (res or {}).values()) / (1 << 30)
+                why = ("its owner load finished without releasing it" if done_owner
+                       else f"orphaned {age:.0f}s (> ttl {ttl:.0f}s) with no live load")
+                log_activity(f"reservation-reconcile: freed a phantom in-flight reservation for "
+                             f"'{rk}' — {why}; returned ~{gb:.1f} GB of placement budget that was "
+                             f"making its node(s) read 'no room' (no restart needed)")
+        except Exception as exc:   # a hygiene loop must never die
+            print(f"[reservation-reconcile] sweep error: {exc!r}", flush=True)
+
+
 async def gen_stall_watchdog() -> None:
     """#gen-stall-watchdog: reclaim a model WEDGED on a dead pipeline hop. When an inter-worker hop of
     a distributed generation dies (idle-socket death / a flaky node), the decode produces 0 tokens with

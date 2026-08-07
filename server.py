@@ -1452,7 +1452,7 @@ except Exception:
 import control_plane
 from control_plane import (_read_frame, _write_frame, _enc, ControlLink, _ResilientServer,
                            _resilient_serve, _resolve_pending, handle_control, reaper_loop,
-                           gen_stall_watchdog)   # noqa: E402,F401
+                           gen_stall_watchdog, reservation_reconcile_loop)   # noqa: E402,F401
 
 
 # ---------------------------------------------------------------------------
@@ -2064,6 +2064,12 @@ class Engine(EngineLoadMixin, EngineGenMixin, EngineLifecycleMixin, EngineSpeech
         # over-provision a node — allocation is serialized ("as if one after the other") even though
         # the streaming overlaps. Cleared when the load finalizes into self.models (or fails).
         self._reservations: dict[str, dict] = {}
+        # #reservation-reconcile: first-seen wall-clock per reservation key, stamped lazily by the
+        # reconcile sweep (control_plane.reservation_reconcile_loop). Lets a LEAKED in-flight-load
+        # reservation — a cancelled/failed load that skipped the load() finally, or a sub-load key the
+        # wrapper never popped — be aged out and dropped WITHOUT a controller restart, so a phantom
+        # entry can't wedge placement into a permanent "no room". Empty in steady state.
+        self._reservation_seen: dict[str, float] = {}
         # #distributed-packing: in-flight remote-pack requests. req_id -> Future (resolved by the
         # worker's POST /pack_result) and req_id -> {"bytes", "mtensors", ...} the received unit.
         self._pack_futures: dict[str, asyncio.Future] = {}
@@ -2583,6 +2589,7 @@ def build_app() -> FastAPI:
         reaper = asyncio.create_task(reaper_loop())
         sampler = asyncio.create_task(metrics_sampler())
         stall_wd = asyncio.create_task(gen_stall_watchdog())   # #gen-stall-watchdog: reclaim wedged-gen slots
+        reservation_reconcile = asyncio.create_task(reservation_reconcile_loop())   # #reservation-reconcile: free leaked in-flight-load reservations live (no restart)
         async def _idle_unload_loop():
             # #idle-unload: unload any model with NO requests for > idle_unload_m minutes
             # (ENGINE_CONFIG knob, dashboard "Idle unload"; 0 = the default = loaded forever).
