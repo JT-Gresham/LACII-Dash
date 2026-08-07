@@ -70,8 +70,9 @@ install\start-client.bat --device cpu          # force CPU (no GPU notice)
 ./install/start-client.sh --controller 10.0.0.5  # different controller
 ./install/start-client.sh --name fieldbox        # override hostname
 ```
-Default controller is **192.168.15.103:50100** (BEAST). Edit the `start-client.*`
-launcher to change the default, or override per‑run with `--controller`.
+The controller is **auto-discovered** by default (`controller_host: "auto"` → UDP
+broadcast; no edit needed when the controller moves). Override per‑run with
+`--controller <host>`, or edit the `start-client.*` launcher's default.
 
 ## Why a venv is built on the target instead of shipped pre‑built
 A Python venv bakes **absolute paths** (drive letter / mount point) into

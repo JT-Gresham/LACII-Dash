@@ -56,11 +56,11 @@ python3 -m venv ~/imenv
 Launch `client.py` pointed at the controller, with `--device cpu`:
 
 ```bash
-~/imenv/bin/python client.py --device cpu --controller <beast-ip>
+~/imenv/bin/python client.py --device cpu --controller <controller-ip>
 ```
 
 `--controller` overrides `config.json`'s `controller_host`; prefer the flag over editing
-`config.json` (the controller is BEAST at its LAN IP, control port 50100 by default —
+`config.json` (the controller is a host on your LAN, control port 50100 by default —
 quote the IP your fleet uses).
 
 ### Persistence — systemd unit with a memory cap
@@ -81,7 +81,7 @@ Wants=network-online.target
 [Service]
 User=<user>
 WorkingDirectory=%h/infinitemodel
-ExecStart=%h/imenv/bin/python client.py --device cpu --controller <beast-ip>
+ExecStart=%h/imenv/bin/python client.py --device cpu --controller <controller-ip>
 Restart=always
 RestartSec=5
 # Memory safety — clean OOM-kill -> controller replan, never a host freeze:
@@ -141,7 +141,7 @@ without an active login (per [../ROCM.md](../ROCM.md)).
    ```
    (Adapted from the ROCm sanity check in [../ROCM.md](../ROCM.md), with the device left on CPU.)
 2. **Worker registered with the controller:** check the controller dashboard / `GET /status`
-   on `<beast-ip>:21434` and confirm the node's hostname appears with its CPU/RAM.
+   on `<controller-ip>:21434` and confirm the node's hostname appears with its CPU/RAM.
 3. **Logs:** `GET /logs?node=<host>` on the controller streams this worker's log on its
    heartbeat (per [../ACCELERATION.md](../ACCELERATION.md)'s log reference).
 4. **Gen test:** place/load a model that spans this node and run one short generation through

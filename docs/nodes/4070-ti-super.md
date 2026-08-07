@@ -1,4 +1,4 @@
-# Node: RTX 4070 Ti SUPER — `beast` (controller + GPU worker)
+# Node: RTX 4070 Ti SUPER — `beast` (GPU worker)
 
 > **⚠ Migrated to Linux (Proxmox VE).** This box no longer runs Windows: it is now a
 > Proxmox VE host running the controller + worker as systemd units with the CUDA stack on
@@ -7,8 +7,10 @@
 > controller+worker box; the hardware facts (GPU, VRAM, bandwidth, placement guidance)
 > still apply.
 
-The fleet's primary box. It runs **both** the InfiniteModel **controller** (`:21434`,
-serving the Ollama + OpenAI + Anthropic APIs) **and** a GPU worker on the same machine.
+On the current fleet the **controller has moved to a dedicated host** and `beast` is a
+**GPU worker only**. This box *can* still run **both** the InfiniteModel controller (`:21434`,
+serving the Ollama + OpenAI + Anthropic APIs) **and** a GPU worker on one machine — the recipe
+below covers that combined setup — but it is no longer the fleet controller.
 
 See also: [../ACCELERATION.md](../ACCELERATION.md) (int4 decode kernel matrix, the
 Windows + NVIDIA MoE setup, prefill chunking) and [../ROCM.md](../ROCM.md) (AMD recipe —
@@ -165,16 +167,16 @@ it's optional polish for dense.
    ```
    Expect `True  NVIDIA GeForce RTX 4070 Ti SUPER`. (verify — exact device-name string.)
 
-2. **Worker registered:** the controller dashboard at `http://<beast>:21434` should list
+2. **Worker registered:** the controller dashboard at `http://<controller>:21434` should list
    this node, or check the controller ring log:
    ```
-   curl http://<beast>:21434/logs?node=beast
+   curl http://<controller>:21434/logs?node=beast
    ```
 
 3. **Generation test:** load a small int4 model and generate via the Ollama-compatible API
    on the controller, e.g.:
    ```bat
-   curl http://<beast>:21434/api/generate -d "{\"model\":\"<model>\",\"prompt\":\"The capital of France is\"}"
+   curl http://<controller>:21434/api/generate -d "{\"model\":\"<model>\",\"prompt\":\"The capital of France is\"}"
    ```
    A coherent completion confirms the path end-to-end.
 

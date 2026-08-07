@@ -58,7 +58,7 @@ git clone https://github.com/SixOfFive/infiniteModel ~/infinitemodel
 
 ## 3. Run the worker
 
-Launch `client.py` as a **CPU** worker pointed at the fleet controller (BEAST `:21434` —
+Launch `client.py` as a **CPU** worker pointed at the fleet controller (`:21434` —
 control port `50100`). The Deck does **not** run a controller; it only joins an existing
 fleet. The `--controller` flag overrides `config.json`'s `controller_host` (don't edit
 `config.json` — it's in `EXTRA_UPDATE_FILES` and a self-update would revert it; per
@@ -70,7 +70,7 @@ setsid ~/imenv/bin/python client.py --controller <controller-ip> --device cpu \
     >~/worker.log 2>&1 </dev/null &
 ```
 
-`<controller-ip>` is the BEAST controller's LAN address. `--device cpu` keeps everything
+`<controller-ip>` is the fleet controller's LAN address. `--device cpu` keeps everything
 off the iGPU.
 
 > The `--control-port 50100` flag form is shown for NVIDIA boxes in

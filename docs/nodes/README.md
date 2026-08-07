@@ -1,7 +1,8 @@
 # Per-device node setup
 
 Practical, per-device setup guides for joining a machine to an InfiniteModel fleet as a
-**worker** (or, for `beast`, as the controller + worker). Each guide covers install → run
+**worker**. (The controller is a separate role — any reachable host running `server.py`;
+it need not be one of these worker boxes.) Each guide covers install → run
 the worker → persistence → optimal quant/ctx/placement for that VRAM tier → verify →
 gotchas, grounded in the cross-platform references:
 
@@ -13,7 +14,7 @@ gotchas, grounded in the cross-platform references:
 
 | Doc | Host(s) | GPU / SoC | Arch | VRAM | OS | Role |
 |---|---|---|---|---|---|---|
-| [4070-ti-super.md](4070-ti-super.md) | `beast` | RTX 4070 Ti SUPER | Ada `sm_89` | 16 GB | Linux (Proxmox VE — see [../PROXMOX9_NVIDIA.md](../PROXMOX9_NVIDIA.md)) | **controller** + GPU worker |
+| [4070-ti-super.md](4070-ti-super.md) | `beast` | RTX 4070 Ti SUPER | Ada `sm_89` | 16 GB | Linux (Proxmox VE — see [../PROXMOX9_NVIDIA.md](../PROXMOX9_NVIDIA.md)) | GPU worker |
 | [3060.md](3060.md) | `amdcomp`, `mobile` | RTX 3060 / 3060 Laptop | Ampere `sm_86` | 12 GB / 6 GB | Linux / Windows | GPU worker |
 | [p620.md](p620.md) | `work` | Quadro P620 | Pascal `sm_61` | ~4 GB | Linux | small GPU helper |
 | [strix-halo.md](strix-halo.md) | `om3nbox` | Ryzen AI Max+ 395 (gfx1151) | RDNA3.5 (ROCm) | ~60 GB unified | Ubuntu | standalone controller+worker |
@@ -22,8 +23,8 @@ gotchas, grounded in the cross-platform references:
 
 ## Fleet shape, in one line
 
-A **controller** (on `beast`, `:21434`) splits one model's transformer layers across
-worker nodes over plain TCP and serves the Ollama + OpenAI + Anthropic APIs. GPU workers
+A **controller** (any host running `server.py`, `:21434`) splits one model's transformer
+layers across worker nodes over plain TCP and serves the Ollama + OpenAI + Anthropic APIs. GPU workers
 contribute VRAM (run layers fast); CPU/RAM workers add **capacity** (fit bigger models when
 distributed), not single-stream speed. `om3nbox` is a separate, self-contained
 controller+worker on its own ~60 GB APU. Decode speed tracks a model's **active** params
