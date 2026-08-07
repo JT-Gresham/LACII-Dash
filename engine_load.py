@@ -3104,6 +3104,18 @@ class EngineLoadMixin:
         except Exception:
             return 0.0
 
+    def _model_cpu_gb(self, m) -> float:
+        """GB of a resident model's WEIGHTS on CPU (0.0 = fully on GPU) — the absolute companion to
+        _model_cpu_frac, used to size the juggler's anti-churn deficit (how much MORE VRAM the fleet
+        must free before re-placing this model could plausibly help)."""
+        try:
+            vram = sum(s.gpu_bytes for s in m.plan.stages)
+            total = (sum(getattr(s, "loaded_bytes", 0) or 0 for s in m.plan.stages)
+                     or m.spec.total_weight_bytes)
+            return max(0.0, (total - vram)) / GB
+        except Exception:
+            return 0.0
+
     def _node_live_free_vram_gb(self, n, *, own_bytes: int = 0,
                                 res_vram: Optional[dict] = None) -> float:
         """The single source of truth for 'how much VRAM can a (re)placement actually use on
@@ -3291,9 +3303,9 @@ class EngineLoadMixin:
             try:
                 if any((r.active or 0) > 0 or (r.queued or 0) > 0 for r in self.replicas_of(base)):
                     return                                   # became busy — try again next sweep at a gap
+                of = self._model_cpu_frac(m)                # CPU fraction BEFORE the re-place
                 log_activity(f"juggler: promoting {fr} to VRAM-only "
-                             f"({self._model_cpu_frac(m)*100:.0f}% was on CPU) [{reason}] — "
-                             f"hitless re-place")
+                             f"({of*100:.0f}% was on CPU) [{reason}] — hitless re-place")
                 await self.reconfigure(fr, tp=getattr(m, "tp_size", 1), ctx=m.ctx,
                                        quant=(m.quant or "none"), consolidate=True,
                                        prefer_vram=True, cpu_only=False)
@@ -3302,15 +3314,29 @@ class EngineLoadMixin:
                 if nf <= 0.02:
                     self._juggle_stuck.pop(base, None)      # success — clear any anti-churn record
                     log_activity(f"juggler: {fr} re-placed — now fully on GPU")
-                else:
-                    # #anti-churn: the re-place couldn't reach full-GPU (the fit-check was optimistic /
-                    # the fleet can't hold it all on VRAM right now). Record the room level so the sweep
-                    # won't re-place it to the same spot every ~60s — it retries only once the fleet
-                    # frees meaningfully MORE VRAM than this.
+                elif nf < of - 0.02:
+                    # #anti-churn: a GENUINE improvement (CPU share dropped) that still isn't all-GPU
+                    # (the fleet can't hold the rest on VRAM yet). Record the room level so the sweep
+                    # won't re-place it every ~60s — it retries once the fleet frees a bit (+0.5 GB)
+                    # more, which may let the remainder land on GPU.
                     self._juggle_stuck[base] = _fleet_free
                     log_activity(f"juggler: {fr} re-placed to {(1.0 - nf) * 100:.0f}% on GPU "
-                                 f"({nf * 100:.0f}% still on CPU) — best fit for now; won't retry "
-                                 f"until the fleet frees more VRAM")
+                                 f"({nf * 100:.0f}% still on CPU) — improved; will retry when the "
+                                 f"fleet frees more VRAM")
+                else:
+                    # #juggle-inert: the re-place did NOT reduce the CPU share — the fit-check was
+                    # optimistic and the model landed on the SAME (or no-better) placement. Repeating it
+                    # is pure churn: a ~10-20s barrier + reload that changes nothing, re-triggered every
+                    # time free VRAM merely WOBBLES past the +0.5 GB retry margin. Stop retrying until
+                    # the fleet frees at least the still-spilled amount (the real deficit) MORE than now
+                    # — a level VRAM noise can't cross, but a genuine big unload can. Stored inflated so
+                    # the skip guard above (`_fleet_free <= _stuck + 0.5`) enforces it; a later fully-GPU
+                    # promotion still clears it.
+                    deficit = max(1.0, self._model_cpu_gb(newm) if newm else 1.0)
+                    self._juggle_stuck[base] = _fleet_free + deficit
+                    log_activity(f"juggler: {fr} re-place did NOT reduce CPU share "
+                                 f"({nf * 100:.0f}% on CPU, was {of * 100:.0f}%) — not retrying until "
+                                 f"the fleet frees ~{deficit:.0f} GB more (anti-churn)")
             except Exception as exc:
                 log_activity(f"juggler: promote {fr} FAILED ({exc!r})")
             finally:

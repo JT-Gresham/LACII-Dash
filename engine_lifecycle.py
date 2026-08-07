@@ -185,6 +185,8 @@ class EngineLifecycleMixin:
             _free_mtp_cuda()          # the GPU head's VRAM isn't released until empty_cache()
         self.models.clear()
         REQUEST_HISTORY.clear()   # #ctx-history: history is only meaningful while a model is resident
+        if getattr(self, "_juggle_stuck", None):
+            self._juggle_stuck.clear()   # #juggle-inert: teardown freed VRAM — drop stale anti-churn bars
         for fut in self.pending.values():
             if not fut.done():
                 fut.set_exception(RuntimeError("pipeline invalidated"))
@@ -204,6 +206,8 @@ class EngineLifecycleMixin:
         if m is None:
             return
         print(f"[!] {friendly} invalidated: {reason} (reload required)")
+        if getattr(self, "_juggle_stuck", None):
+            self._juggle_stuck.clear()   # #juggle-inert: node-drop freed the survivors' VRAM — drop stale bars
         # #5 replica-precise recovery: a node that LEFT/was reaped serves exactly THIS replica (the
         # caller filtered by node_id in m.stage_node_ids). Its in-flight generate() is blocked in
         # _send's wait_for(fut, GEN_TIMEOUT ~600s) with no upstream error frame, so fail this
@@ -406,6 +410,15 @@ class EngineLifecycleMixin:
             _free_mtp_cuda()          # #91 release the GPU head's VRAM (empty_cache); else it leaks
         self.models.pop(friendly, None)
         REQUEST_HISTORY.pop(friendly, None)   # #ctx-history
+        # #juggle-inert: a REAL removal frees fleet VRAM, so any anti-churn bars the juggler latched
+        # ("this hybrid won't fit VRAM-only, don't retry until the fleet frees more") are now stale —
+        # the freed room may let a stranded model fit. Clear them so the next sweep re-evaluates every
+        # promotable hybrid, INCLUDING this model's own bar (else a later reload inherits it). The
+        # juggler's fit-check still gates the actual re-place, so this re-arms eligibility without
+        # forcing churn. A "reload*" unload is a load's / the juggler's OWN re-place — it frees nothing
+        # net and must NOT clear peers' bars mid-juggle, so skip it.
+        if getattr(self, "_juggle_stuck", None) and not reason.startswith("reload"):
+            self._juggle_stuck.clear()
         _release_ram()
         print(f"[unload] evicted {friendly} ({reason})")
 
