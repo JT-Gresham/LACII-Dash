@@ -185,8 +185,16 @@ Real walls hit bringing this up on beast, amdcomp, and furnace, with their fixes
 - **GPU-resident** (bf16, holds ~10 GB VRAM, marginally faster — no per-render weight hop) is now
   opt-**out**: `POST /config?t2a_offload_default=0` (persisted). Only worth it on a card with VRAM to
   spare.
-- Offload still needs ~8 GB **free** VRAM at render time for the hop. A genuinely full card returns a
-  clean `503` for that render — it never OOMs, and it never holds VRAM at rest.
+- Offload still needs ~8 GB **free** VRAM at render time for the hop, and it holds **0 GB at rest**.
+  The load-time placement gate refuses a load that can't reach that (clean `503`). But because an
+  offloaded model reserves **no** resting VRAM, a co-resident LLM can load onto the same card *after*
+  ace-step — so the card is full when the render fires and the DiT hop **OOMs** (observed: an ace-step
+  offload render on a beast whose 4070 Ti SUPER had filled with two 14B LLMs → `CUDA out of memory`).
+  iM never evicts a running model or grows VRAM, so that render fails — but the failure is now
+  reported **explicitly** as `insufficient_vram` (`code: out_of_vram`, HTTP 500) with the raw GPU
+  detail, **and** written to `/logs` (`… render FAILED — NOT ENOUGH VRAM …`) instead of a
+  content-free 500 that only `print()`s to controller stdout. For reliable music, keep ~8 GB free on
+  a can_t2a card (don't co-load LLMs that fill it).
 - int4 is **not** a t2a tier in M1 (bf16 only).
 
 ### CPU-only (`cpu_only=1`) — plumbed, but ACE-Step does not render on CPU

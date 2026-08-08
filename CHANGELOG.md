@@ -6,6 +6,16 @@ single squashed commit, so the detail below is grouped by milestone rather than 
 
 ## Recent — VRAM-accounting hygiene + KV-quant in the Load UI
 
+- **Media render errors are now legible** — a t2a / t2music / t2i / tts render that failed *after* the
+  model was already resident used to `print()` to controller stdout and return a **content-free 500**,
+  so a caller saw only "500 Internal Server Error" and nothing landed in `/logs`. New
+  `_media_render_error` helper (routes_api.py), wired into the music, images and speech render paths:
+  it writes the failure to the **activity log**, and reports a CUDA/HIP **out-of-memory** *explicitly*
+  as `insufficient_vram` (`code: out_of_vram`, still HTTP 500) with the raw GPU detail and operator
+  guidance (free the pool / use a smaller model) — the #1 media render failure, since an offloaded
+  model hops onto a GPU per render and a card full of co-resident LLMs has no transient room. iM never
+  evicts a running model or grows VRAM; this makes the *cause* visible instead of a naked 500.
+  Reporting-only — placement / OOM behaviour is unchanged.
 - **#reservation-reconcile** — the controller's in-flight-load ledger (`engine._reservations`) is the
   planned per-node VRAM/RAM that *every* placement subtracts (`_reserved_bytes`) so two concurrent
   loads never over-provision a node. Each entry is set at load start and popped in the `load()`
