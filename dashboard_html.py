@@ -492,7 +492,7 @@ function modelRow(m,s){
       +(m.t2i_step?(' step '+m.t2i_step+'/'+(m.t2i_total||'?')):'')+'</span>');
     // #models-usage-graph: t2i has no tok/s — show a request-activity graph (renders over time)
     meta=parts.join(' · ')+'<div class="mspark" data-model="'+esc(m.name)+'" title="render activity over time (in-flight / recent renders) — hover a point for details, click to expand"></div>';
-    acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
+    acts=unloadBtn(m.name);
   } else if(s.k==='loaded'){
     const parts=[];
     if(m.quant)parts.push(esc(m.quant));
@@ -520,7 +520,7 @@ function modelRow(m,s){
       ? '<div class="mspark" data-model="'+esc(m.name)+'" title="request activity over time (in-flight / recent requests) — hover a point for details, click to expand"></div>'
       : '<div class="mspark" data-model="'+esc(m.name)+'" title="decode throughput (tok/s) — hover a point for details, click to expand"></div>';
     meta=parts.join(' · ')+graphG;
-    acts='<button class="btn sm" onclick="unload(\''+esc(m.name)+'\')">Unload</button>';
+    acts=unloadBtn(m.name);
   } else if(s.k==='loading'){
     const ld=s.ld||{};
     // #load-queue: only ONE model streams at a time. A model still waiting for the gate shows
@@ -842,9 +842,19 @@ async function setPin(name,kind,on){
 }
 // #unload-feedback: unload can take a few seconds (multi-stage teardown), and the ~2s poll keeps
 // re-rendering the row meanwhile — so a feedback-less await looked like "nothing happened" and users
-// double-clicked. Toast immediately, and IGNORE a re-click while one is in flight (per model).
+// double-clicked. The BUTTON itself now shows the in-flight state: unloadBtn() renders a disabled
+// "Unloading…" whenever _unloading[name] is set (so it survives every poll re-render), unload() flips
+// the clicked button instantly, and a re-click while in flight is ignored (per model).
 const _unloading={};
-async function unload(name){ closeOv(); if(_unloading[name])return; _unloading[name]=1; toast('unloading '+name+'…'); try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); }catch(e){ toast(String(e.message||e),1);} finally{ delete _unloading[name]; } tick(); }
+function unloadBtn(name){ return _unloading[name]
+  ? '<button class="btn sm" disabled title="tearing down shards…">Unloading…</button>'
+  : '<button class="btn sm" onclick="unload(\''+esc(name)+'\',this)">Unload</button>'; }
+async function unload(name,btn){ closeOv(); if(_unloading[name])return; _unloading[name]=1;
+  if(btn){try{btn.disabled=true;btn.textContent='Unloading…';}catch(e){}}
+  toast('unloading '+name+'…');
+  try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); }
+  catch(e){ toast(String(e.message||e),1);}
+  finally{ delete _unloading[name]; } tick(); }
 async function cancelLoad(name){ try{ await api('/cancel_load?model='+encodeURIComponent(name),{method:'POST'}); toast('cancelled load'); tick(); }catch(e){ toast(String(e.message||e),1);} }
 async function dl(name,action){ try{ await api('/download'+(action==='start'?'':'/'+action)+'?model='+encodeURIComponent(name),{method:'POST'}); toast(action+' '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
 
@@ -1156,9 +1166,9 @@ async function openDetail(name){
   const _isT2i=(m.capabilities||[]).includes('t2i');
   const _isT2a=(m.capabilities||[]).includes('t2a');
   const _isT2m=(m.capabilities||[]).includes('t2music');
-  if(m.loaded&&(_isT2i||_isT2a||_isT2m)) acts='<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button>';
+  if(m.loaded&&(_isT2i||_isT2a||_isT2m)) acts=unloadBtn(name);
   else if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
-    +'<button class="btn sm" onclick="unload(\''+esc(name)+'\')">Unload</button> '
+    +unloadBtn(name)+' '
     +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
     +'<button class="btn sm ghost" onclick="reconf(\''+esc(name)+'\')">Reconfigure…</button>';
   else if(_isT2i) acts='<button class="btn sm pri" onclick="t2iLoadDlg(\''+esc(name)+'\')">Load 🖼</button> '
