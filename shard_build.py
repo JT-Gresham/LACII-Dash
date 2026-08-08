@@ -919,13 +919,26 @@ class ShardBuildMixin:
             import copy as _copy
             from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
             _rcfg = _copy.deepcopy(self.cfg)
-            _rdim = int(getattr(self.cfg, "rotary_dim", 0) or 0)
+            # Rotary WIDTH. Prefer an explicit partial-rotary width over head_dim:
+            #   rotary_dim        - MiniMax-M2 style partial rotary (64 < head_dim 128)
+            #   qk_rope_head_dim  - MLA/DeepSeek style split (Kimi-Linear: rope 64, nope 128,
+            #                       head_dim 72 — head_dim is NOT the rotary width here)
+            _rdim = int(getattr(self.cfg, "rotary_dim", 0) or 0) or \
+                int(getattr(self.cfg, "qk_rope_head_dim", 0) or 0)
             _hd = int(getattr(self.cfg, "head_dim", 0) or 0)
-            if _rdim and _hd and _rdim < _hd:
+            if _rdim and _rdim != _hd:
                 _rcfg.head_dim = _rdim                      # 5.x rotary width comes from head_dim
             if getattr(_rcfg, "rope_parameters", None) is None:
                 _rcfg.rope_parameters = {"rope_type": "default",
                                          "rope_theta": float(getattr(self.cfg, "rope_theta", 10000.0))}
+            # LlamaRotaryEmbedding.__init__ reads config.max_position_embeddings. Remote-code configs
+            # need not define it (KimiLinearConfig carries model_max_length instead) -> AttributeError,
+            # which the suppress() below turned into a MISSING model.model.rotary_emb and a much later
+            # "object has no attribute 'rotary_emb'" at the first generate. Fill it in.
+            if getattr(_rcfg, "max_position_embeddings", None) is None:
+                _rcfg.max_position_embeddings = int(
+                    getattr(self.cfg, "model_max_length", 0)
+                    or getattr(self.cfg, "max_seq_len", 0) or 131072)
             def _mk_rotary():
                 return LlamaRotaryEmbedding(_rcfg)
             for _lyr in self.owned_layers:                 # materialize (real) + correct-width per-layer
@@ -934,8 +947,16 @@ class ShardBuildMixin:
                     with contextlib.suppress(Exception):
                         _sa.rotary_emb = _mk_rotary()
             if getattr(model.model, "rotary_emb", None) is None:   # model-level for the shared forward
-                with contextlib.suppress(Exception):
+                # NOT silently suppressed: the shared forward calls model.model.rotary_emb, so failing
+                # here means the model loads fine and then dies on the FIRST generate with a bare
+                # AttributeError — the failure has to be visible at build time to be diagnosable.
+                try:
                     model.model.rotary_emb = _mk_rotary()
+                except Exception as _rexc:
+                    _mt = getattr(self.cfg, "model_type", "?")
+                    print(f"[build] WARNING: could not synthesize model-level rotary_emb for "
+                          f"model_type={_mt} ({_rexc!r}) — generation will fail if the shared "
+                          f"forward needs position_embeddings", flush=True)
         # Gemma-family scaled embeddings register a NON-persistent `embed_scale` (= sqrt(hidden_size))
         # buffer computed in __init__; the streamed build loads checkpoint weights but never fills it,
         # so it stays on META and trips the meta-guard below (would crash .to(device)). Recompute any
