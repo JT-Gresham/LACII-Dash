@@ -35,6 +35,12 @@ pillow            # images — required for ANY vision model
 # back to stdlib `wave` for PCM WAV, and TTS/speech-out already writes WAV via stdlib `wave`.
 soundfile         # optional — audio-in for WAV/FLAC/OGG
 # librosa         # optional — audio-in for mp3 + high-quality resample
+# fla-core: LINEAR-ATTENTION architectures whose trust_remote_code modeling file imports `fla`
+# (flash-linear-attention). Kimi-Linear-48B-A3B is the first: without it the remote module raises
+# ImportError at import, the meta SKELETON never builds, and an int4 compile fails with the
+# misleading "per-expert MoE shard compile needs the model skeleton". Needed on whichever box
+# BUILDS the skeleton (controller for /compile_shards, worker for a cold serve-from-source load).
+# fla-core       # optional — Kimi-Linear / other flash-linear-attention archs
 
 # --- Worker (client.py) — Milestone 1 ---
 psutil

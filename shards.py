@@ -52,6 +52,28 @@ def _has_moe_experts(wm: dict) -> bool:
     return False
 
 
+def _tf_compat_shims() -> None:
+    """Back-fill transformers symbols that MOVED, so trust_remote_code modeling files still import.
+
+    A checkpoint's remote code is pinned to the transformers API of its release. When a symbol later
+    moves, the remote module raises ImportError at import time — and every caller sees only "the
+    skeleton failed to build", which reads like a broken checkpoint rather than a library mismatch.
+    Concretely (2026-08, transformers 5.12): Kimi-Linear's modeling_kimi.py does
+    `from transformers.utils.generic import OutputRecorder, check_model_inputs`; check_model_inputs
+    is still there but OutputRecorder moved to transformers.modeling_utils, so the per-expert MoE
+    compile failed with "no fused-3D layout to fuse into nor per-expert scope to pack".
+
+    Re-exporting under the OLD name is safe: same object, and we only ever ADD an attribute that is
+    missing (never shadow a live one). Best-effort — a shim failing must not break the build."""
+    try:
+        import transformers.utils.generic as _g
+        if not hasattr(_g, "OutputRecorder"):
+            from transformers.modeling_utils import OutputRecorder as _OR
+            _g.OutputRecorder = _OR
+    except Exception:
+        pass
+
+
 def _skeleton_from_cfg(cfg):
     """Build the META model skeleton from an AutoConfig — the SHARED build used by both `_quant_scope`
     (controller, config from the model dir) and `build_skeleton_from_config` (worker, config from
@@ -66,6 +88,7 @@ def _skeleton_from_cfg(cfg):
         from accelerate import init_empty_weights
     except Exception:
         init_empty_weights = None
+    _tf_compat_shims()
     if (getattr(cfg, "thinker_config", None) is not None
             or getattr(cfg, "text_config", None) is not None):
         cfg = cfg.get_text_config()
