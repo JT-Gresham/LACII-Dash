@@ -109,6 +109,33 @@ def register(app):
         return JSONResponse({"error": _err}, status_code=503,
                             headers=({} if _term else {"Retry-After": "3"}))
 
+    def _media_render_error(exc: Exception, model: str, media: str) -> JSONResponse:
+        """A media RENDER failed AFTER the model was already resident — distinct from
+        _media_load_error (a LOAD/placement refusal). Two fixes over the old bare `print()` +
+        content-free 500: (1) the failure is written to the ACTIVITY LOG — render errors used to
+        print to controller stdout ONLY, so they were invisible in /logs and an operator saw a
+        naked 500 with no cause; (2) a CUDA/HIP out-of-memory is reported EXPLICITLY as insufficient
+        VRAM. OOM is the #1 media render failure: offload hops the model onto the GPU per render, so
+        a GPU already full of other residents has no transient room. iM never evicts a running model
+        or 'grows' VRAM, so the message states the actual cause AND the operator's options (free the
+        pool / use a smaller model) instead of leaving them guessing."""
+        import traceback
+        s = str(exc)
+        oom = ("out of memory" in s.lower() or "outofmemory" in type(exc).__name__.lower()
+               or "hiperroroutofmemory" in s.lower())
+        print(f"[{media}] render error for {model!r}: {exc!r}\n{traceback.format_exc()[-1500:]}")
+        if oom:
+            log_activity(f"{media} {model}: render FAILED — NOT ENOUGH VRAM ({s[:220]})")
+            _msg = (f"Not enough GPU VRAM to render '{model}'. The render needs free VRAM on a "
+                    f"capable GPU, but the target GPU was full — iM never evicts a running model or "
+                    f"grows VRAM. Free VRAM on that pool (unload an idle model) or use a smaller "
+                    f"model. GPU detail: {s[:400]}")
+            return JSONResponse({"error": {"message": _msg, "type": "insufficient_vram",
+                                           "code": "out_of_vram"}}, status_code=500)
+        log_activity(f"{media} {model}: render FAILED — {type(exc).__name__}: {s[:220]}")
+        return JSONResponse({"error": {"message": f"{media} render failed: {type(exc).__name__}: {s}",
+                                       "type": "render_error"}}, status_code=500)
+
     @app.post("/v1/images/generations")   # OpenAI Images API (#t2i-serve, task #37)
     async def v1_images_generations(req: Request) -> JSONResponse:
         """Text-to-image via the OpenAI images shape: {model?, prompt, size?, n?,
@@ -177,8 +204,7 @@ def register(app):
             return JSONResponse({"error": {"message": "image generation timed out",
                                            "type": "server_error"}}, status_code=504)
         except Exception as exc:
-            return JSONResponse({"error": {"message": f"image generation failed: {exc}",
-                                           "type": "server_error"}}, status_code=500)
+            return _media_render_error(exc, friendly, "t2i")
         return JSONResponse({"created": int(time.time()), "data": data,
                              "infinitemodel": {"model": friendly, **meta}})
 
@@ -621,10 +647,7 @@ def register(app):
             audio_bytes, media = await asyncio.to_thread(_encode_audio_response, wav, fmt)
             return Response(content=audio_bytes, media_type=media)
         except Exception as exc:
-            import traceback
-            print(f"[v1/audio/speech] error: {exc!r}\n{traceback.format_exc()[-1200:]}")
-            return JSONResponse({"error": {"message": f"{type(exc).__name__}: {exc}"}},
-                                status_code=500)
+            return _media_render_error(exc, friendly, "tts")
         finally:
             _inflight_release(rec)
 
@@ -694,10 +717,10 @@ def register(app):
                   f"-> render {meta.get('seconds')}s")
             return Response(content=audio_bytes, media_type=_media)
         except Exception as exc:
-            import traceback
-            print(f"[v1/audio/music] error: {exc!r}\n{traceback.format_exc()[-1200:]}")
-            return JSONResponse({"error": {"message": f"{type(exc).__name__}: {exc}"}},
-                                status_code=500)
+            _eng = ("t2music" if (engine.models.get(friendly)
+                                  and getattr(engine.models.get(friendly), "is_t2music", False))
+                    else "t2a")
+            return _media_render_error(exc, friendly, _eng)
         finally:
             _inflight_release(rec)
 
