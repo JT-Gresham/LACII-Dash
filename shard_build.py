@@ -466,6 +466,16 @@ class ShardBuildMixin:
         import torch
         from transformers import AutoConfig, AutoModelForCausalLM
         from safetensors.torch import load as st_load
+        # #tf-compat: the WORKER builds the arch here, on its own path (not shards._skeleton_from_cfg),
+        # so it needs the same back-fill for transformers symbols that MOVED — otherwise a
+        # trust_remote_code modeling file pinned to an older API dies at import and the load surfaces
+        # as an unrelated error. Kimi-Linear: modeling_kimi.py imports OutputRecorder from
+        # transformers.utils.generic, which moved to transformers.modeling_utils in 5.x.
+        try:
+            from shards import _tf_compat_shims as _tfcs
+            _tfcs()
+        except Exception:
+            pass
         self = cls.__new__(cls)
         self.torch = torch
         d = tempfile.mkdtemp(prefix="im_cfg_")          # config (+ any remote modeling .py) dir
