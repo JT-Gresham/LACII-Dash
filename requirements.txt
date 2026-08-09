@@ -40,7 +40,18 @@ soundfile         # optional — audio-in for WAV/FLAC/OGG
 # ImportError at import, the meta SKELETON never builds, and an int4 compile fails with the
 # misleading "per-expert MoE shard compile needs the model skeleton". Needed on whichever box
 # BUILDS the skeleton (controller for /compile_shards, worker for a cold serve-from-source load).
-# fla-core       # optional — Kimi-Linear / other flash-linear-attention archs
+#
+# ⚠ PIN 0.4.0 — do NOT `pip install -U fla-core`. fla changed the fused_kda_gate API one release
+# after Kimi-Linear shipped; 0.4.1+ fail at the FIRST DECODE STEP with
+#   TypeError: fused_kda_gate() got an unexpected keyword argument 'g_bias'
+# 0.4.0:  (g, A, head_k_dim, g_bias=None, beta, threshold)   <- what modeling_kimi.py calls
+# 0.4.1+: (g, A_log, dt_bias=None, lower_bound, output_dtype)
+# The SHAPE contract changed with it, so a compat shim is not provably equivalent -> pin, don't shim.
+# Verified safe for transformers' own fla users (qwen3_next / qwen3_5 / qwen3_5_moe / olmo_hybrid):
+# they import only FusedRMSNormGated + chunk/fused_recurrent_gated_delta_rule, unchanged in 0.4.0.
+# Also needs `triton` on the SAME box (fla.modules.convolution imports it at import time) — a
+# CPU-only controller therefore cannot build this arch at all; compile it on a GPU box.
+# fla-core==0.4.0   # optional — Kimi-Linear / other flash-linear-attention archs (GPU + triton)
 
 # --- Worker (client.py) — Milestone 1 ---
 psutil

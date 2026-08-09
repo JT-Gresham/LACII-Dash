@@ -31,19 +31,53 @@ vocab 163840):
 
 ## Requirements
 
-### 1. `fla-core` (flash-linear-attention) — mandatory
+### 1. `fla-core` — **pin `==0.4.0`, and `-U` is actively wrong**
 
 ```bash
-<venv>/bin/pip install -U fla-core        # installs the `fla` module (0.5.2 verified)
+<venv>/bin/pip install 'fla-core==0.4.0'      # NOT -U: 0.4.1+ break this checkpoint
 ```
 
-`modeling_kimi.py` imports `fla` for the KDA kernels and raises
-`ImportError("Plese run pip install -U fla-core")` without it.
+The model card says `pip install -U fla-core`. **Do not follow it.** `fla-core` changed the
+`fused_kda_gate` API one release after Kimi-Linear shipped, and every later version fails at the
+first decode step:
 
-**Install it on every box that BUILDS the architecture**, which is more than people expect:
+```
+TypeError: fused_kda_gate() got an unexpected keyword argument 'g_bias'. Did you mean 'dt_bias'?
+```
 
-* the **controller** — `/compile_shards` builds the meta skeleton to derive the per-expert scope
-* every **worker** that may hold a shard — `shard_build.from_stream` builds the real arch there
+`modeling_kimi.py:560` calls `fused_kda_gate(g, self.A_log, self.head_dim, g_bias=self.dt_bias)`:
+
+| `fla-core` | `fused_kda_gate` signature | Kimi |
+|---|---|---|
+| 0.3.2 | *(no `ops/kda/gate.py` at all)* | ✗ |
+| **0.4.0** (2025-10-27) | `(g, A, head_k_dim, g_bias=None, beta=1.0, threshold=20.0)` | ✅ **the only match** |
+| 0.4.1 → 0.5.2 | `(g, A_log, dt_bias=None, lower_bound=None, output_dtype=…)` | ✗ |
+
+It is not just a rename — the **shape contract** changed too (0.4.0 takes `g` as
+`[…, H*K]` plus an explicit `head_k_dim`; 0.4.1+ take `[…, H, K]`), and the softplus
+parameterisation went from `beta`/`threshold` to `lower_bound`. So a compat shim is **not** provably
+equivalent, and a wrong one yields plausible-but-wrong gates with no error. Pin the version.
+
+**Safe for the rest of the fleet:** transformers' own `fla` consumers (`qwen3_next`, `qwen3_5`,
+`qwen3_5_moe`, `olmo_hybrid`) import only `FusedRMSNormGated`, `chunk_gated_delta_rule` and
+`fused_recurrent_gated_delta_rule`, which are signature-compatible in 0.4.0 — verified by importing
+both transformers modules under it.
+
+### 1b. Where each piece is needed — the split that costs time
+
+| Box role | Needs | Why |
+|---|---|---|
+| **GPU worker holding KDA layers** | `fla-core==0.4.0` **+ `triton`** | runs the KDA kernels. This is the box that must have the *pinned* version |
+| **Box that COMPILES shards** (`/compile_shards`) | `fla` **+ `triton`** | building the skeleton executes `modeling_kimi.py`'s module-level imports, and `fla.modules.convolution` imports `triton` **at import time** |
+| **CPU-only controller** | *cannot build this arch at all* | no `triton` → `ModuleNotFoundError: No module named 'triton'` on **any** `fla` version. Compile Kimi on a GPU box (`#compile-picker` → one-node), not on the controller |
+
+> ⚠️ The iM controller (VM, CPU-only) has `fla-core` installed but **no `triton`**, so it can never
+> build the Kimi skeleton. That is why the int4 compile was run on om3nbox. Installing `fla` alone on
+> a controller is *not* sufficient and gives a misleading sense that the box is ready.
+
+⚠️ A KDA layer placed on **CPU** cannot run either — `chunk_kda` / `fused_recurrent_kda` /
+`fused_kda_gate` are Triton kernels with no CPU fallback. The loader logs a build-time WARNING naming
+the offending global layer indices.
 
 ### 2. transformers compat shim — shipped in-repo
 
