@@ -603,6 +603,15 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
         # dense/standard model (no layer_types) — incl. the Omni Thinker.
         _lt = getattr(self.cfg, "layer_types", None)
         self._hybrid = bool(_lt) and any(t != "full_attention" for t in _lt)
+        # #kimi-linear: mirror shard_build's sniff so the two constructors can't disagree about what
+        # a config means. DEFENSIVE ONLY on this path — Shard.__init__ has no trust_remote_code
+        # branch, so a remote-code arch like Kimi cannot actually be constructed here; the flag
+        # exists so shard_forward's cache selection reads the same attribute wherever it runs.
+        _lac = getattr(self.cfg, "linear_attn_config", None)
+        self._linattn_flat = (not self._hybrid) and bool(
+            isinstance(_lac, dict) and _lac.get("kda_layers"))
+        if self._linattn_flat:
+            self._hybrid = True
         # Qwen2.5-Omni uses CLASSIC multimodal RoPE (apply_multimodal_rotary_pos_emb does
         # cos[i % 3]), so cos/sin MUST be [3, bs, seq, dim] — the worker has to feed the rotary
         # 3D positions [3, bs, seq] even for plain TEXT (all three sections = the same sequential

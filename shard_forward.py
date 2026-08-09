@@ -132,7 +132,14 @@ def _prealloc_kv_cache_cls():
                     ncap = min(ncap, max(end, self._MAX_CAP))
                 b, h, _, d = key_states.shape
                 nk = key_states.new_empty((b, h, ncap, d))
-                nv = value_states.new_empty((b, h, ncap, d))
+                # V is sized from V's OWN geometry, never the key's: MLA (Kimi-Linear, DeepSeek)
+                # caches an ASYMMETRIC head_dim — K is qk_nope+qk_rope (128+64=192) while V is
+                # v_head_dim (128) — and the old (b, h, ncap, d) borrowed the key's d, so the
+                # copy_ below raised "size of tensor a (192) must match tensor b (128)" on the
+                # first full-attention layer. Every symmetric model has V.shape == K.shape, so
+                # this allocation is byte-identical for them.
+                nv = value_states.new_empty(
+                    (*value_states.shape[:-2], ncap, value_states.shape[-1]))
                 if self._len:                            # migrate the live prefix into the bigger buffer
                     nk[:, :, :self._len, :].copy_(self._kbuf[:, :, :self._len, :])
                     nv[:, :, :self._len, :].copy_(self._vbuf[:, :, :self._len, :])
@@ -342,6 +349,29 @@ class ShardForwardMixin:
             print(f"[kv_prealloc] unavailable ({exc!r}) -> plain DynamicCache", flush=True)
             return DynamicCache()
 
+    def _make_linattn_kv(self):
+        """#kimi-linear: cache for fla-style hybrids whose layers address their conv/recurrent state
+        as FLAT top-level lists indexed by the GLOBAL layer index — cache.conv_states[gi] (a q/k/v
+        short-conv 3-tuple) and cache.recurrent_states[gi] — i.e. Kimi's KimiDynamicCache contract,
+        NOT transformers' per-layer cache.layers[i].* shape.
+
+        Their FULL-attention layers still call the ordinary Cache.update(k, v, layer_idx), so this is
+        just the #kv-prealloc cache (index-write append, no per-token torch.cat) with the two state
+        lists bolted on. The model's own KimiDynamicCache is deliberately NOT used: its isinstance
+        assert lives in KimiLinearModel.forward, which a shard never calls, and its update() does a
+        per-token torch.cat — the O(cache) memcpy #kv-prealloc exists to avoid.
+
+        Sized num_hidden_layers so a mid/tail stage writes ONLY its own global slots and leaves the
+        rest None — the same untouched-placeholder pattern DynamicCache already has. The cache object
+        is per-slot (#kv-slots binds self.kv from _kv_by_slot before each forward), so the recurrent
+        state is per-request for free. NOT rewindable: see Shard.crop."""
+        kv = self._make_prealloc_kv()
+        n = int(getattr(self.cfg, "num_hidden_layers", 0) or 0)
+        kv.conv_states = [None] * n
+        kv.recurrent_states = [None] * n
+        kv.im_no_crop = True      # Shard.crop DROPS rather than silently no-op'ing (see there)
+        return kv
+
     def _forward_impl(self, x, cache_start: int = 0, reset: bool = True,
                       all_logits: bool = False, inject=None, position_ids=None,
                       capture_hidden: bool = False, capture_pre_norm: bool = False,
@@ -384,7 +414,14 @@ class ShardForwardMixin:
             # Gated-DeltaNet layers can store/read state instead of IndexError-ing on
             # an empty generic cache. Reused across prefill + every decode step.
             _kvq = getattr(self, "kv_quant", "none")
-            if self._hybrid:
+            if getattr(self, "_linattn_flat", False):
+                # #kimi-linear: MUST precede the _hybrid branch — _linattn_flat implies _hybrid (it
+                # is OR-ed in at build so every existing linear-attn safety gate fires), but this
+                # arch has no cfg.layer_types, so DynamicCache(config=...) would fabricate all-
+                # full_attention layers and still have no conv_states. getattr default False keeps
+                # every other model byte-identical.
+                self.kv = self._make_linattn_kv()
+            elif self._hybrid:
                 self.kv = DynamicCache(config=self.cfg)
             elif _kvq and _kvq != "none":
                 # #172 TurboQuant: quantized resting KV (un-rotated on read -> attention unchanged).

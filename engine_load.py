@@ -291,8 +291,9 @@ class EngineLoadMixin:
                 _cfg = json.load(fh)
             _tc = _cfg.get("text_config", _cfg)
             _mt = str(_cfg.get("model_type") or _tc.get("model_type") or "").lower()
+            from engine_gen import _linear_attn_arch      # leaf module, never imports engine_load
             if (_tc.get("layer_types") or []) or _cfg.get("thinker_config") is not None \
-                    or _mt in ("qwen2_5_vl", "qwen2_5_vl_text"):
+                    or _mt in ("qwen2_5_vl", "qwen2_5_vl_text") or _linear_attn_arch(_cfg):
                 return 1, ("hybrid/per-type/mrope architecture (recurrent or per-type state "
                            "is not slot-keyed)")
         except Exception:

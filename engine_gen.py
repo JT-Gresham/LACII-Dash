@@ -7,6 +7,32 @@ across all mixins by MRO. Controller-only leaf module; in EXTRA_UPDATE_FILES.
 from __future__ import annotations
 
 
+def _linear_attn_arch(cfg: dict) -> bool:
+    """#kimi-linear: does this checkpoint hold LINEAR-ATTENTION layers, whose recurrent +
+    short-convolution state is NOT rewindable? Two config shapes announce it: qwen3-next style
+    (text_config.layer_types carrying a 'linear*' entry) and Kimi-Linear style
+    (linear_attn_config.kda_layers, with no layer_types at all — which is why every existing
+    layer_types sniff reads Kimi as a plain dense model and leaves the dangerous features ON).
+
+    Every crop / resume / rollback feature must be OFF for these: _crop truncates the KV layers
+    only, leaving the recurrent state at its PRE-crop position — silently divergent decode rather
+    than a crash, which is the worst failure mode we have. CONSERVATIVE: any sniff failure -> True.
+    Takes the raw config dict (callers already read config.json)."""
+    try:
+        tc = cfg.get("text_config", cfg)
+        if any("linear" in str(x) for x in (tc.get("layer_types") or [])):
+            return True
+        for _s in (tc, cfg):
+            _lac = _s.get("linear_attn_config")
+            if isinstance(_lac, dict) and _lac.get("kda_layers"):
+                return True
+        if str(cfg.get("model_type") or tc.get("model_type") or "").lower() == "kimi_linear":
+            return True
+    except Exception:
+        return True
+    return False
+
+
 def _bidir_spans_from_positions(positions):
     """#gemma4-bidir: group the image-embed slot positions (row-major, ascending) into contiguous
     half-open [start,end) runs — one per image block. Mirrors the reference's contiguous vision
@@ -441,10 +467,37 @@ class EngineGenMixin:
             _mt = str(cfg.get("model_type") or tc.get("model_type") or "").lower()
             ok = (not (tc.get("layer_types") or [])                    # hybrid / per-type
                   and cfg.get("thinker_config") is None                # _omni (multimodal.py:is_omni)
-                  and _mt not in ("qwen2_5_vl", "qwen2_5_vl_text"))    # _mrope3d (client.py twin)
+                  and _mt not in ("qwen2_5_vl", "qwen2_5_vl_text")     # _mrope3d (client.py twin)
+                  # #kimi-linear: Kimi declares its linear layers via linear_attn_config, NOT
+                  # layer_types, so the test above reads it as dense. This one term kills BOTH
+                  # cross-stage #pipefill and #prefix-kv cross-request resume (_prefix_kv_ok
+                  # delegates here) — the latter is the top silent-corruption path: turn 2 would
+                  # send crop(L) then a reset=False suffix, and the KDA layers would keep folding
+                  # tokens into a recurrent state that still holds all of turn 1.
+                  and not _linear_attn_arch(cfg))
         except Exception:
             ok = False
         model._pipefill_arch = ok
+        return ok
+
+    def _rewindable_kv_ok(self, model) -> bool:
+        """#kimi-linear: may this model's worker-side cache be ROLLED BACK (Shard.crop)? False only
+        for linear-attention archs, whose recurrent + short-conv state folds tokens in irreversibly
+        — a crop there truncates the full-attention KV layers and silently leaves the linear layers
+        at the pre-crop position. Deliberately NARROWER than _pipefill_arch_ok, which also excludes
+        per-type/omni/mrope archs: those rewind fine, so Gemma-4 / Omni / Qwen2.5-VL speculative
+        decode is untouched. CONSERVATIVE: any sniff failure -> False. Cached per load."""
+        ok = getattr(model, "_rewind_ok", None)
+        if ok is not None:
+            return ok
+        ok = False
+        try:
+            with open(os.path.join(MODELS_DIR, _safe_name(model.target_id), "config.json"),
+                      encoding="utf-8") as fh:
+                ok = not _linear_attn_arch(json.load(fh))
+        except Exception:
+            ok = False
+        model._rewind_ok = ok
         return ok
 
     def _pipefill_chunk(self, model, q: int, mm, position_ids) -> int:
@@ -1126,8 +1179,12 @@ class EngineGenMixin:
                             and _lease.token is None):
                         with contextlib.suppress(Exception):
                             mtp_head = await self._ensure_mtp_head(model)
+                    # #kimi-linear: _decode_spec appends K+1 tokens then crop()s back the rejected
+                    # tail. On a linear-attention arch those tokens are already folded into the
+                    # recurrent state and the crop cannot undo it — accepted output would silently
+                    # diverge. There was no architecture gate here at all before.
                     if (speculative and model.draft_model is not None and greedy and mm is None
-                            and _lease.token is None):
+                            and _lease.token is None and self._rewindable_kv_ok(model)):
                         async for item in self._decode_spec(model, prompt_ids, max_new, spec_k):
                             if item[0] is not None:
                                 _ntoks += 1
@@ -1560,8 +1617,12 @@ class EngineGenMixin:
                 # (chunked vs recurrent kernels), so accepted drafts follow a slightly-different
                 # trajectory than plain greedy. Gate MTP off for hybrid checkpoints unless explicitly
                 # allowed (mtp_allow_hybrid) — qwen3.6 is hybrid, so MTP self-spec is OFF by default.
+                # #kimi-linear: _linear_attn_arch also catches the linear_attn_config shape (Kimi
+                # has no layer_types). Kimi is already MTP-off via the mtp_num_hidden_layers
+                # early-return above, but the guard must fire on its own merits if a variant ever
+                # ships an MTP head — the recorded root cause here IS the non-rewindable state.
                 lt = tc.get("layer_types") or []
-                if (any("linear" in str(x) for x in lt)
+                if ((any("linear" in str(x) for x in lt) or _linear_attn_arch(cfg))
                         and not ENGINE_CONFIG.get("mtp_allow_hybrid", False)):
                     with contextlib.suppress(Exception):
                         log_activity(f"{model.friendly}: MTP self-spec OFF (hybrid linear-attn; q>1 "

@@ -864,11 +864,30 @@ def _spec_from_config(model_dir: str, name: str) -> Optional[ModelSpec]:
                          or (bool(_archs) and all(("ForCausalLM" not in a and "ForConditionalGeneration" not in a
                                                    and "LMHead" not in a) for a in _archs)
                              and any(a.endswith("Model") for a in _archs))))
+    # #kimi-linear: a linear-attention hybrid declares its KDA layers via linear_attn_config
+    # (kda_layers, 1-INDEXED) rather than layer_types, and its FULL-attention layers are MLA —
+    # K is cached at qk_nope+qk_rope and V at v_head_dim, neither of which is cfg.head_dim.
+    # Fold the asymmetric pair into an effective head_dim (so the planner's uniform
+    # 2*nkv*hd formula lands on the true nkv*(K+V) bytes) and record what fraction of layers
+    # actually grow a KV at all. Kimi-48B: head_dim 72 -> 160, frac 7/27 — without BOTH the
+    # planner is out by 2.2x low per layer and 3.9x high on layer count. Untouched for every
+    # config without linear_attn_config.
+    kv_layer_frac = 1.0
+    _lac = c.get("linear_attn_config")
+    if isinstance(_lac, dict) and _lac.get("kda_layers"):
+        _kd = int(c.get("qk_nope_head_dim", 0) or 0) + int(c.get("qk_rope_head_dim", 0) or 0)
+        _vd = int(c.get("v_head_dim", 0) or 0)
+        if _kd > 0 and _vd > 0:
+            head_dim = -(-(_kd + _vd) // 2)               # ceil: never under-plan
+        _nkda = len({int(v) for v in (_lac.get("kda_layers") or [])})
+        if layers > 0 and 0 < _nkda < layers:
+            kv_layer_frac = (layers - _nkda) / float(layers)
     return ModelSpec(name, hidden, layers, heads, kv, head_dim, inter, vocab,
                      tie_embeddings=bool(c.get("tie_word_embeddings", False)),
                      arch=str(c.get("model_type") or "llama"),
                      attn_bias=bool(c.get("attention_bias", c.get("qkv_bias", False))),
-                     max_ctx=max_ctx, is_embedding=is_embedding)
+                     max_ctx=max_ctx, is_embedding=is_embedding,
+                     kv_layer_frac=kv_layer_frac)
 
 
 # ---------------------------------------------------------------------------

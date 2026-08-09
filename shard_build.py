@@ -42,7 +42,9 @@ class ShardBuildMixin:
                    if t.device.type == "cuda")
 
     def _kv_dims(self, ctx: int):
-        """(num_kv_heads, head_dim) from cfg for full-ctx KV sizing, or (0, 0) if ctx<=0 / unknown."""
+        """(num_kv_heads, head_dim) from cfg for full-ctx KV sizing, or (0, 0) if ctx<=0 / unknown.
+        head_dim is EFFECTIVE — the value that makes the uniform `2 * ctx * nkv * hd * 2` formula
+        every caller uses come out right, which for MLA is not cfg.head_dim (see below)."""
         if not ctx or ctx <= 0:
             return 0, 0
         cfg = self.cfg
@@ -50,9 +52,42 @@ class ShardBuildMixin:
         nkv = int(getattr(cfg, "num_key_value_heads", nh) or nh or 0)
         hidden = int(getattr(cfg, "hidden_size", 0) or 0)
         hd = int(getattr(cfg, "head_dim", 0) or (hidden // nh if nh else 0))
+        # #kimi-linear: MLA caches K and V at DIFFERENT widths, and neither is cfg.head_dim. Kimi
+        # caches K as qk_nope_head_dim + qk_rope_head_dim (128+64=192) and V as v_head_dim (128),
+        # while cfg.head_dim is 72 — the per-token truth is 32*(192+128)*2 = 20,480 B/layer against
+        # the uniform formula's 2*32*72*2 = 9,216, a 2.22x UNDER-reserve that false-fits narrow
+        # stages and OOMs during decode. Fold the asymmetric pair into one effective head_dim so
+        # every existing caller (_kv_bf16_per_layer, kv_reserve_probe, the placement mirror) stays
+        # a one-line formula. Round UP: never under-reserve. Gated on _linattn_flat, and each dim
+        # must be present, so no other arch's numbers move.
+        if getattr(self, "_linattn_flat", False):
+            k_dim = (int(getattr(cfg, "qk_nope_head_dim", 0) or 0)
+                     + int(getattr(cfg, "qk_rope_head_dim", 0) or 0))
+            v_dim = int(getattr(cfg, "v_head_dim", 0) or 0)
+            if k_dim > 0 and v_dim > 0:
+                hd = -(-(k_dim + v_dim) // 2)      # ceil, so 2*nkv*hd*2 >= nkv*(k+v)*2
         if nkv <= 0 or hd <= 0:
             return 0, 0
         return nkv, hd
+
+    def _linattn_state_bytes(self) -> int:
+        """#kimi-linear: bytes ONE linear-attention (KDA) layer's state rests at — a fixed
+        short-convolution cache plus a recurrent state, INDEPENDENT of context length (that O(1)
+        growth is the whole point of the architecture). Small (~1.1 MiB/layer for Kimi-48B) but not
+        zero, and it is real VRAM: fund it explicitly rather than letting it ride on slack, because
+        a silent shortfall here shows up as a decode-time OOM. 0 for every non-linattn model."""
+        if not getattr(self, "_linattn_flat", False):
+            return 0
+        lac = getattr(self.cfg, "linear_attn_config", None) or {}
+        nh = int(lac.get("num_heads") or getattr(self.cfg, "num_attention_heads", 0) or 0)
+        hd = int(lac.get("head_dim") or 0)
+        k = int(lac.get("short_conv_kernel_size") or 0)
+        if nh <= 0 or hd <= 0:
+            return 0
+        proj = nh * hd                                    # q/k/v conv width
+        conv = 3 * proj * max(1, k) * 2                   # 3 short-conv caches, bf16
+        recur = nh * hd * hd * 2                          # [heads, head_dim, head_dim], bf16
+        return conv + recur
 
     def _kv_bf16_per_layer(self, ctx: int) -> int:
         """Full-ctx bf16 KV bytes ONE layer grows into (k+v). Also the per-layer TRANSIENT peak under
@@ -72,6 +107,13 @@ class ShardBuildMixin:
         bf16 (conservative — never under-reserve -> decode OOM)."""
         name = (getattr(self, "kv_quant", "none") or "none")
         slots = max(1, int(getattr(self, "kv_slots", 1) or 1))   # #kv-slots: C streams
+        # #kimi-linear: a HYBRID shard never actually builds a TurboQuant cache — shard_forward's
+        # if/elif puts the hybrid branch ABOVE kv_quant, so it allocates full bf16 while this
+        # function was happily reserving the smaller packed footprint. That ~4x under-reserve is a
+        # decode OOM waiting to happen; size what the shard will really allocate. (Latent for
+        # qwen3-next too, not just Kimi — the fix is deliberately arch-agnostic.)
+        if name != "none" and getattr(self, "_hybrid", False):
+            name = "none"
         if name != "none":
             try:
                 nkv, hd = self._kv_dims(ctx)
@@ -94,10 +136,28 @@ class ShardBuildMixin:
         out-of-range index, parse error): default a layer to True so we never under-reserve
         and risk decode OOM. owned layer i = global layer self.layer_start + i."""
         n = len(self.owned_layers)
+        base = int(getattr(self, "layer_start", 0) or 0)
+        # #kimi-linear: the same idea, for archs that declare their linear layers via
+        # linear_attn_config instead of layer_types. Prefer the module's own is_linear_attn (it
+        # built itself from the config) and fall back to the 1-INDEXED kda_layers list. Without
+        # this the mask is all-True and every KDA layer is funded at the full MLA per-token figure —
+        # a ~2.5 GB over-reserve at ctx 8192 on Kimi-48B that can block placement on a tight stage.
+        if getattr(self, "_linattn_flat", False):
+            kda = {int(v) for v in
+                   ((getattr(self.cfg, "linear_attn_config", None) or {}).get("kda_layers") or [])}
+            mask = []
+            for i, lyr in enumerate(self.owned_layers):
+                lin = getattr(lyr, "is_linear_attn", None)
+                if lin is None:
+                    try:
+                        lin = bool(self.cfg.is_kda_layer(base + i))
+                    except Exception:
+                        lin = (base + i + 1) in kda if kda else False   # unknown -> reserve
+                mask.append(not lin)
+            return mask
         lt = getattr(self.cfg, "layer_types", None)
         if not getattr(self, "_hybrid", False) or not lt:
             return [True] * n
-        base = int(getattr(self, "layer_start", 0) or 0)
         mask = []
         for i in range(n):
             gi = base + i
@@ -172,13 +232,19 @@ class ShardBuildMixin:
                         if (getattr(self, "kv_quant", "none") or "none") != "none" else 0)
         # #kv-offload: the KV cache lives in system RAM (OffloadedCache), so NO per-layer KV — nor the
         # dequant transient — is reserved against VRAM; that headroom goes to model layers instead.
-        if getattr(self, "kv_offload", False):
+        # #kimi-linear: hybrid shards never take shard_forward's kv_offload branch (the hybrid
+        # branch precedes it), so their KV really does rest on the layer device -- zeroing the
+        # per-layer reserve here would under-fund them.
+        if getattr(self, "kv_offload", False) and not getattr(self, "_hybrid", False):
             kv_per_layer = 0
             kv_transient = 0
         # #7: only full-attention layers grow a full-ctx KV; hybrid linear-attn layers don't.
         # kv_lyr[i] = the KV bytes owned layer i actually reserves (kv_per_layer or 0). For a
         # dense model this is kv_per_layer for every layer (unchanged). Mirrors kv_reserve_probe.
-        kv_lyr = [kv_per_layer if h else 0 for h in self._kv_layer_mask()]
+        # #kimi-linear: a linear-attn layer's state is FIXED-SIZE, not 0 — fund it explicitly so a
+        # KDA-heavy stage isn't quietly short by ~1.1 MiB/layer. 0 for every other arch.
+        _lin_state = self._linattn_state_bytes()
+        kv_lyr = [kv_per_layer if h else _lin_state for h in self._kv_layer_mask()]
         live_free = max(0, int(free) - GPU_SAFETY)
         nlyr = len(self.owned_layers)
         # #moe-offload: when enabled, a MoE layer that can't fit GPU whole is SPLIT — attention+norms
@@ -499,6 +565,20 @@ class ShardBuildMixin:
                 self.cfg = cfg
             _lt = getattr(self.cfg, "layer_types", None)
             self._hybrid = bool(_lt) and any(t != "full_attention" for t in _lt)
+            # #kimi-linear: fla-style hybrids that declare their linear-attention layers via
+            # linear_attn_config (kda_layers — 1-INDEXED: is_kda_layer tests layer_idx+1) instead of
+            # transformers' layer_types. Their layers address conv/recurrent state as FLAT top-level
+            # lists on the cache, keyed by GLOBAL layer index, not cache.layers[i].* — hence a
+            # separate flag from _hybrid, which selects DynamicCache(config=...). layer_types wins
+            # when a config somehow carries both (it is the transformers-native signal).
+            _lac = getattr(self.cfg, "linear_attn_config", None)
+            self._linattn_flat = (not self._hybrid) and bool(
+                isinstance(_lac, dict) and _lac.get("kda_layers"))
+            if self._linattn_flat:
+                # Every linear-attn SAFETY gate already keys off _hybrid (no intra-stage
+                # #prefill-chunk, no CUDA/HIP-graph decode, kv_quant/kv_offload unreachable), so
+                # OR-ing in buys all of them with no new gate code.
+                self._hybrid = True
             self._omni = omni_thinker is not None
             # #vl-vision: Qwen2.5-VL's rotary (like Omni's) unconditionally indexes 3D position_ids
             # [3,bs,seq] — even a text-only forward crashes if fed 2D. Flag it so shard_forward builds
@@ -592,6 +672,19 @@ class ShardBuildMixin:
                             self.cfg, trust_remote_code=True, attn_implementation="eager")
                     except TypeError:   # older transformers: not a from_config kwarg -> config attr set above
                         model = AutoModelForCausalLM.from_config(self.cfg, trust_remote_code=True)
+                # #kimi-linear: KimiLinearModel.__init__ FORCE-overwrites config._attn_implementation
+                # to "flash_attention_2" (logging "Ignoring the provided attention implementation")
+                # on the SAME object as self.cfg — transformers does not deepcopy it — discarding
+                # both the attr and the kwarg set above. KimiMLAAttention.forward re-reads it from
+                # self.config on EVERY forward, so it would dispatch to flash_attention_forward,
+                # which cannot consume the 4D additive mask the shard builds (and needs flash-attn
+                # installed at all). Restore an implementation we actually feed. sdpa, not eager:
+                # MLA's q_head_dim (192) != v_head_dim (128) and eager would materialize a
+                # [1,32,q,total] score tensor on a prefill the hybrid path deliberately does NOT
+                # chunk (~8.6 GB at q=total=8192). Only fires when the model really clobbered it.
+                if getattr(self, "_linattn_flat", False) and \
+                        getattr(self.cfg, "_attn_implementation", None) == "flash_attention_2":
+                    self.cfg._attn_implementation = attn = "sdpa"
                 # do NOT model.to(dt): it would cast the real fp32 rotary inv_freq buffers to bf16.
             else:
                 with torch.device("meta"):
@@ -625,6 +718,27 @@ class ShardBuildMixin:
             _tp_make_structure_(model, tp_rank, tp_size, self.cfg, tp_weights)
         self.model = model
         self.owned_layers = [model.model.layers[i] for i in range(layer_start, layer_end)]
+        # #kimi-linear: stamp the transformers-native per-layer discriminator so shard_forward's
+        # EXISTING hybrid mask dispatch works UNCHANGED — Kimi's KimiDecoderLayer carries
+        # `is_linear_attn`, not `layer_type`. Editing shard_forward's two layer loops instead would
+        # be the highest-regression-risk change in the repo (Gemma-4 per-type, Omni and VL share
+        # them), so the flag comes to the loop rather than the loop to the flag.
+        # Defense-in-depth, not a crash fix: KimiDeltaAttention silently drops a non-2D mask to
+        # kwargs["padding_mask"] (absent here) -> None, so an unstamped layer behaves identically;
+        # stamping keeps the intent explicit and skips the mask's unpad path.
+        # owned_layers is a SLICE of the full ModuleList, so every module already knows its GLOBAL
+        # index (global = layer_start + i) — the cache's flat lists are keyed by exactly that.
+        if getattr(self, "_linattn_flat", False):
+            _kda = {int(v) for v in
+                    ((getattr(self.cfg, "linear_attn_config", None) or {}).get("kda_layers") or [])}
+            for _i, _l in enumerate(self.owned_layers):
+                _lin = getattr(_l, "is_linear_attn", None)     # the module built itself -> trust it
+                if _lin is None:
+                    try:
+                        _lin = bool(self.cfg.is_kda_layer(layer_start + _i))
+                    except Exception:
+                        _lin = (layer_start + _i + 1) in _kda      # config lists are 1-INDEXED
+                _l.layer_type = "linear_attention" if _lin else "full_attention"
         self.embed = model.model.embed_tokens if has_embed else None
         self.norm = _final_norm_module(model.model) if has_head else None
         self.head = model.lm_head if has_head else None
@@ -1096,9 +1210,27 @@ class ShardBuildMixin:
         slot = int(slot or 0)
         kvmap = getattr(self, "_kv_by_slot", None) or {}
         kv = kvmap.get(slot, self.kv if slot == 0 else None)
-        if kv is not None:
-            with contextlib.suppress(Exception):
-                kv.crop(length)
+        if kv is None:
+            return
+        # #kimi-linear: a linear-attention recurrent + short-conv state CANNOT be rewound — the
+        # tokens are folded into it irreversibly, so cropping only the full-attention KV layers
+        # would leave every KDA layer sitting at the PRE-crop position and decode plausible garbage
+        # with no exception raised. The blanket suppress() below would happily turn "this cache has
+        # no crop()" into "the controller believes it was cropped". DROP the cache instead: the next
+        # reset=False frame then rebuilds at cache_start>0 against an empty KV, whose mask width
+        # mismatches -> a loud shape error rather than silent divergence. Belt-and-braces behind the
+        # controller-side gates (_linear_attn_arch), and scoped to im_no_crop so qwen3-next's
+        # existing crop behaviour is untouched.
+        if getattr(kv, "im_no_crop", False):
+            kvmap.pop(slot, None)
+            if slot == 0:
+                self.kv = None
+            print(f"[crop] linear-attention shard: recurrent state is not rewindable — slot {slot} "
+                  f"cache DROPPED (crop/resume/spec-rollback are gated OFF for this arch)",
+                  flush=True)
+            return
+        with contextlib.suppress(Exception):
+            kv.crop(length)
 
     def _splice_mm(self, h, inject):
         """#22 increment 3 (embed-injection): replace the token embeddings at multimodal
@@ -1145,7 +1277,9 @@ class ShardBuildMixin:
         # device is (sum of packed resting) + one bf16 layer. Track the max bf16 layer per device and
         # add it once below. kv_quant='none' -> resting == pl (bf16), transient 0 -> bit-identical.
         _kvq = (getattr(self, "kv_quant", "none") or "none")
-        _kvq_on = _kvq != "none"
+        # #kimi-linear: a hybrid shard allocates a plain bf16 cache regardless of kv_quant /
+        # kv_offload (shard_forward's if/elif order), so probe what it will really allocate.
+        _kvq_on = _kvq != "none" and not getattr(self, "_hybrid", False)
         # #kv-slots: C independent per-request KV streams each grow to full ctx — reserve C x the
         # per-slot resting figure (the load must FAIL here, clean and replannable, if C streams
         # can't fit; never OOM mid-decode). The bf16 dequant transient stays x1 (kv_quant is
@@ -1156,10 +1290,15 @@ class ShardBuildMixin:
         # for a dense model). _kv_layer_mask is conservative (unknown -> True) so we never
         # under-reserve and risk decode OOM.
         kv_mask = self._kv_layer_mask()
+        # #kimi-linear: a linear-attn layer holds a FIXED-SIZE conv+recurrent state (0 for every
+        # other arch) — charge it to the layer's own device instead of skipping the layer outright.
+        _lin_state = self._linattn_state_bytes()
         by_dev: dict = {}
         max_bf16: dict = {}
         for layer, d, holds_kv in zip(self.owned_layers, self.layer_devices, kv_mask):
             if not holds_kv:
+                if _lin_state and getattr(d, "type", "") == "cuda":
+                    by_dev[d] = by_dev.get(d, 0) + _lin_state * _slots
                 continue
             # #gemma4-kv: size each layer's KV from ITS OWN attention geometry. head_dim and
             # num_key_value_groups are set at module construction and are quant-invariant, so this
@@ -1193,7 +1332,7 @@ class ShardBuildMixin:
         # #kv-offload: the KV lives in system RAM regardless of where the layers sit, so probe the
         # WHOLE reservation against CPU RAM (allocate+free there) instead of the layer devices —
         # a GPU that can't hold the KV is exactly the case this mode exists for.
-        if getattr(self, "kv_offload", False) and by_dev:
+        if getattr(self, "kv_offload", False) and not getattr(self, "_hybrid", False) and by_dev:
             by_dev = {self.cpu: sum(by_dev.values())}
         held = []
         try:

@@ -61,6 +61,13 @@ class ModelSpec:
     # card — reserves C x per-stream KV automatically, exactly mirroring the worker's own
     # shard_build._kv_bytes_per_layer xC choke point.
     kv_slots: int = 1
+    # #kimi-linear: fraction of decoder layers that actually grow a full-ctx KV cache. <1.0 only
+    # for linear-attention hybrids, where the remaining layers hold a FIXED-SIZE recurrent +
+    # short-conv state instead (Kimi-Linear: 7 of 27 full-attention -> 0.259). An average, applied
+    # uniformly per stage: the planner is an ESTIMATOR and the worker's kv_reserve_probe is the
+    # exact per-layer enforcer that fails a stage cleanly and triggers a replan. 1.0 = every
+    # existing model, bit-identical.
+    kv_layer_frac: float = 1.0
 
     @property
     def per_layer_weight_bytes(self) -> int:
@@ -95,8 +102,8 @@ class ModelSpec:
 
     def kv_bytes_per_layer(self, ctx_len: int) -> int:
         # #kv-slots: C independent per-request streams each grow their own full-ctx KV -> xC.
-        return (2 * self.num_kv_heads * self.head_dim * ctx_len * KV_DTYPE_BYTES
-                * max(1, int(self.kv_slots or 1)))
+        return int(2 * self.num_kv_heads * self.head_dim * ctx_len * KV_DTYPE_BYTES
+                   * max(1, int(self.kv_slots or 1)) * float(self.kv_layer_frac or 1.0))
 
     def per_layer_total_bytes(self, ctx_len: int) -> int:
         return self.per_layer_weight_bytes + self.kv_bytes_per_layer(ctx_len)
@@ -458,7 +465,8 @@ def _assess_placement(spec: ModelSpec, ctx: int, mems: list, stages: list,
     Mirrors the worker's fill order (VRAM holds weights first, then KV). Returns metrics + human
     warnings + suggested_ctx (largest tidy ctx that keeps KV in VRAM on the tightest GPU stage)."""
     vram_by_id = {m.node_id: m.vram_bytes for m in mems}
-    kv_layer_tok = 2 * spec.num_kv_heads * spec.head_dim * KV_DTYPE_BYTES   # KV bytes / layer / token
+    kv_layer_tok = int(2 * spec.num_kv_heads * spec.head_dim * KV_DTYPE_BYTES
+                       * float(spec.kv_layer_frac or 1.0))   # KV bytes / layer / token
     tot_w = tot_w_ram = tot_kv = tot_kv_ram = 0
     gpu_stage_max_ctx = []
     for s in stages:
