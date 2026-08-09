@@ -310,6 +310,23 @@ class ShardBuildMixin:
                               + f" (budget {budget / GB:.1f} GB of {free / GB:.1f} free, "
                               f"+{kv_per_layer * ng / GB:.1f} GB KV)")
 
+        # #kimi-linear: a linear-attention layer's kernels (chunk_kda / fused_recurrent_kda /
+        # fused_kda_gate, from fla) are TRITON — GPU only. A KDA layer placed on CPU does not fall
+        # back, it dies at the first forward with an opaque Triton error, which is exactly the class
+        # of misdirecting failure docs/KIMI-LINEAR.md exists to catalogue. Name it at BUILD time, so
+        # this reads as a placement decision instead of a mid-generation mystery.
+        if getattr(self, "_linattn_flat", False):
+            _base = int(getattr(self, "layer_start", 0) or 0)
+            _cpu_lin = [_base + i for i, (l, d) in
+                        enumerate(zip(self.owned_layers, self.layer_devices))
+                        if getattr(d, "type", "") != "cuda"
+                        and (getattr(l, "layer_type", "") == "linear_attention"
+                             or getattr(l, "is_linear_attn", False))]
+            if _cpu_lin:
+                print(f"[load] #kimi-linear WARNING: {len(_cpu_lin)} linear-attention layer(s) "
+                      f"{_cpu_lin} placed on CPU. Their fla kernels are Triton (GPU-only) and have "
+                      f"NO CPU fallback — generation will fail at the first forward. This arch needs "
+                      f"its KDA layers GPU-resident.", flush=True)
         if self.has_embed:
             self.embed.to(self.embed_device)
         for i, (lyr, d) in enumerate(zip(self.owned_layers, self.layer_devices)):
