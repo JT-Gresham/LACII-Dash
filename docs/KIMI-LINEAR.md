@@ -5,9 +5,13 @@ ingested. It exercises code paths no dense/MoE model touches, and it fails in wa
 messages point somewhere else entirely. This documents every requirement so an install can be
 reproduced without rediscovering them.
 
-**Status (2026-08-09):** downloads ✅ · int4 shard-compile ✅ · load ✅ (25.4 GB, fully GPU-resident)
-· hybrid cache + reservation **shipped** (commit `a11a784`) · **generation not yet proven end-to-end**
-on the real model — see ["What shipped"](#what-shipped-the-hybrid-cache).
+**Status (2026-08-09): SERVING ✅** — downloads · int4 shard-compile · load · **generation**, all
+validated end-to-end on om3nbox. Coherent output on `/api/generate` and `/v1/chat/completions`,
+clean `stop`, **~6.5 tok/s** steady-state.
+
+> **Two hard requirements or it will not generate:** `fla-core==**0.4.0**` (NOT `-U` — see below)
+> and `triton` on the same box. Both compile and load succeed on the wrong `fla`, so *"it loads"*
+> proves nothing.
 
 > **Placement constraint:** the KDA layers' `fla` kernels (`chunk_kda`, `fused_recurrent_kda`,
 > `fused_kda_gate`) are **Triton — GPU only, no CPU fallback**. A KDA layer that lands on CPU dies at
@@ -231,6 +235,16 @@ the flat-list cache contract.
 |---|---|
 | bf16 source | ~96 GB on disk |
 | int4 shard cache | **25.4 GB**, 29 units, compile ~24 min (box concurrently serving) |
-| load | **25.36 GB**, `cpu_frac=0.0`, all 27 layers on one node |
-| KV reserve @ ctx 8192 | **1.17 GB** (7 full-attn layers × 20,480 B/token) + ~22 MB fixed KDA state — was mis-reserved as 27 × 9,216 |
-| generation | plumbing shipped; **end-to-end run still pending** (om3nbox was serving live traffic) |
+| load | **25.36 GB**, `cpu_frac=0.0`, all 27 layers on one node (`node=InferenceEngine`) |
+| KV reserve @ ctx 8192 | **1.09 GB measured** — only the 7 full-attn layers grow KV. Pre-fix this was 27 layers at the wrong geometry |
+| **generation** | ✅ coherent on `/api/generate` **and** `/v1/chat/completions`, clean `stop` |
+| decode, steady | **~6.5 tok/s** — 80 tok in 12.2 / 12.3 / 12.7 s, *while co-resident qwen3-30b-a3b served live traffic* |
+| decode, FIRST request after load | **~0.9 tok/s** — one-time Triton autotune of the KDA kernels. 6× faster from the 2nd request on. Do not benchmark the first call |
+| prefill | 25-token chat prompt, no measurable stall |
+
+### Why 6.5 tok/s and not ~28
+
+`qwen3-30b-a3b` reaches ~28 tok/s on the same box with comparable *active* parameters. Kimi reports
+`is_moe=False`: its 256 experts are **per-expert modules**, not the fused-3D layout, so it never
+enters the fused-MoE path — the same shape that made MiniMax-M2 unusably slow. That is an **open
+optimization, not a defect**, and it is unrelated to the linear-attention work.
