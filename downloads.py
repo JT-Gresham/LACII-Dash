@@ -96,6 +96,87 @@ def _pull_repo_interruptible(friendly: str, repo_id: str):
     return "done"
 
 
+# --- #dl-autoresolve: make a bare `org/Model` "just work" without the user choosing a quant or a
+# source format. Probe the repo and, for a GGUF-ONLY repo, PREFER its safetensors twin (native,
+# higher fidelity, and the ONLY option for arches transformers' GGUF loader can't dequantize — e.g.
+# qwen35moe / Qwen3.5-MoE, where the GGUF metadata arch name doesn't match transformers'); else
+# auto-pick a single-file quant to normalize to safetensors via the existing converter. -----------
+_GGUF_QUANT_PREF = (
+    "q4_k_m", "q5_k_m", "q4_k_l", "q5_k_l", "q6_k", "q4_k_s", "q5_k_s", "q8_0",
+    "q3_k_l", "q3_k_m", "q4_0", "q5_0", "iq4_xs", "iq4_nl", "q3_k_s", "q2_k",
+    "iq3_m", "iq3_xs", "iq2_m", "iq2_xs",
+)
+
+
+def _pick_gguf_quant(gguf_files):
+    """Choose the best SINGLE-FILE quant to normalize from a repo's .gguf filenames. Skips split
+    (NNNNN-of-NNNNN) parts (the converter rejects them) and prefers a medium K-quant — the best
+    size/quality for a source we re-quantize to int4 anyway. Raw float dumps (*f16/*f32/*bf16.gguf)
+    are a last resort. Returns the filename, or None if ONLY split parts exist."""
+    import re as _re
+    split = _re.compile(r"-\d{5}-of-\d{5}\.gguf$", _re.I)
+    base = lambda f: f.rsplit("/", 1)[-1].lower()
+    single = [f for f in gguf_files if f.lower().endswith(".gguf") and not split.search(f.lower())]
+    if not single:
+        return None
+    is_float = lambda f: any(t in base(f) for t in ("f16", "f32", "bf16"))
+
+    def _score(f):
+        b = base(f)
+        for i, q in enumerate(_GGUF_QUANT_PREF):
+            if q in b:
+                return i
+        return len(_GGUF_QUANT_PREF)                 # unknown quant -> after all known, before floats
+    ranked = sorted((f for f in single if not is_float(f)), key=_score)
+    return ranked[0] if ranked else single[0]        # only float dumps -> still translatable
+
+
+def _resolve_download_source(hf, gguf_file=""):
+    """#dl-autoresolve: decide the ACTUAL download source + friendly name for a raw HF id so a bare
+    `org/Model` just works. NETWORK (HfApi list) — call via asyncio.to_thread. An explicit gguf_file
+    is honored verbatim (power-user override, no probe). Never raises: a list failure (gated / typo /
+    offline) leaves the id untouched so the download path surfaces the real error. Returns
+    {"target", "gguf_file", "friendly_hint", "note", "error"}."""
+    import re as _re
+    from huggingface_hub import HfApi
+    tok = HF_TOKEN or None
+    api = HfApi()
+    gf = (gguf_file or "").strip()
+    if gf:
+        return {"target": hf, "gguf_file": gf, "friendly_hint": "",
+                "note": f"explicit GGUF file {gf}", "error": None}
+    try:
+        files = api.list_repo_files(hf, token=tok)
+    except Exception:
+        return {"target": hf, "gguf_file": "", "friendly_hint": "", "note": "", "error": None}
+    ggufs = [f for f in files if f.lower().endswith(".gguf")]
+    has_st = any(f.lower().endswith(".safetensors") for f in files)
+    if has_st or not ggufs:                          # ordinary safetensors (or .pth/.bin) repo -> as-is
+        return {"target": hf, "gguf_file": "", "friendly_hint": "", "note": "", "error": None}
+    # --- GGUF-ONLY repo ---
+    # 1) prefer a safetensors TWIN (the repo id minus its -GGUF tag): native + higher fidelity, and
+    #    the only path for arches the GGUF loader can't dequantize (e.g. Ornith's qwen35moe).
+    sib = _re.sub(r"[-_.]?gguf$", "", hf, flags=_re.I)
+    if sib and sib != hf:
+        try:
+            if any(f.lower().endswith(".safetensors") for f in api.list_repo_files(sib, token=tok)):
+                return {"target": sib, "gguf_file": "", "friendly_hint": _friendly_from_hf(sib),
+                        "note": f"{hf} is GGUF-only — using its safetensors source {sib}",
+                        "error": None}
+        except Exception:
+            pass                                     # no twin -> fall through to GGUF translate
+    # 2) no twin -> auto-translate a single-file quant to safetensors (the existing converter).
+    pick = _pick_gguf_quant(ggufs)
+    if not pick:
+        return {"target": hf, "gguf_file": "", "friendly_hint": "", "note": "",
+                "error": (f"{hf} ships only split (NNNNN-of-NNNNN) GGUF parts — name one single-file "
+                          "quant in the GGUF field; split GGUF isn't supported")}
+    clean = _re.sub(r"-gguf$", "", _friendly_from_hf(hf), flags=_re.I)
+    return {"target": hf, "gguf_file": pick, "friendly_hint": clean,
+            "note": f"{hf} is GGUF-only — auto-selected {pick} to normalize to safetensors",
+            "error": None}
+
+
 _START_DOWNLOAD = None   # #dl-resume: register() publishes _start_download here so the server's
                          # startup lifespan can re-kick a pull that a controller restart interrupted.
 
@@ -394,57 +475,68 @@ def register(app):
         return JSONResponse({"ok": True, "removed": removed, "freed_gb": round(freed / GB, 2)})
 
     @app.post("/add_model")          # dashboard: register + download ANY Hugging Face id
-    async def add_model(model: str, name: str = "", gguf_file: str = "") -> JSONResponse:
+    async def add_model(model: str, name: str = "", gguf_file: str = "",
+                        dry_run: bool = False) -> JSONResponse:
         # `name` (optional): override the client-facing model name instead of deriving it from
         # the HF id. Lets a precision-suffixed repo (e.g. ModelCloud/MiniMax-M2-BF16) be served
         # under a clean, quant-agnostic name (e.g. minimax-m2) — quant is a load-time choice, so
         # it shouldn't live in the name. Re-registering an already-cached HF id under a new name
         # is instant (no re-download — the cache is keyed by HF id, not the friendly name).
+        # `dry_run` (optional): resolve the source + name and RETURN the plan WITHOUT registering or
+        # downloading — the resolver preview (tests + a UI "what will this actually pull?" hint).
+        import asyncio
         hf = (model or "").strip()
-        # HF repo ids are colon-free (dash form, e.g. 'Qwen/Qwen3-4B'). A user may paste the
-        # Ollama 'family:size' form into the org/name field ('qwen/qwen3:4b'), which 404s on the
-        # Hub. Normalize ':' -> '-' in the TARGET id so both forms resolve to the real repo — the
-        # friendly registry KEY derived below already collapses ':' via _friendly_from_hf, but the
-        # download target came straight from this string. (No HF id legitimately contains ':'.)
+        # HF repo ids are colon-free (dash form, e.g. 'Qwen/Qwen3-4B'). A user may paste the Ollama
+        # 'family:size' form into the org/name field ('qwen/qwen3:4b'), which 404s on the Hub.
+        # Normalize ':' -> '-' in the TARGET id so both forms resolve to the real repo.
         hf = hf.replace(":", "-")
         if "/" not in hf or " " in hf or hf.count("/") > 1:
             return JSONResponse({"ok": False,
                                  "error": "enter a Hugging Face id like org/name"},
                                 status_code=400)
-        # A user-supplied override may be typed in the Ollama 'family:size' form ('qwen3:4b');
-        # collapse it to the canonical colon-free dash key ('qwen3-4b') so the registry key,
-        # the URL query param, and the on-disk filename stay simple — the colon display is
-        # rendered on demand by _ollama_name(). Validate AFTER normalizing (so ':' is allowed
-        # as input but never stored as a key).
-        friendly = _normalize_model_request(name) if (name or "").strip() else _friendly_from_hf(hf)
+        gf_in = (gguf_file or "").strip()
+        if gf_in and not gf_in.lower().endswith(".gguf"):
+            return JSONResponse({"ok": False,
+                                 "error": "gguf_file must be a single .gguf filename in the repo"},
+                                status_code=400)
+        # #dl-autoresolve: probe the repo so a bare `org/Model` just works. A GGUF-only repo
+        # redirects to its safetensors twin (or auto-picks a single-file quant to normalize), and the
+        # friendly name is derived from the RESOLVED target. An explicit gguf_file bypasses the probe.
+        res = await asyncio.to_thread(_resolve_download_source, hf, gf_in)
+        if res.get("error"):
+            return JSONResponse({"ok": False, "error": res["error"]}, status_code=400)
+        target, gf, note = res["target"], res["gguf_file"], (res.get("note") or "")
+        # friendly: explicit `name` override (collapsed to the canonical dash key) > resolver hint
+        # (clean, twin-derived) > derived from the resolved target.
+        if (name or "").strip():
+            friendly = _normalize_model_request(name)
+        else:
+            friendly = res.get("friendly_hint") or _friendly_from_hf(target)
         if not re.fullmatch(r"[a-z0-9._-]+", friendly):
             return JSONResponse({"ok": False,
                                  "error": "name must be lowercase [a-z0-9._-] (':' allowed as the size separator)"},
                                 status_code=400)
-        # GGUF source (optional): the repo ships weights only as a llama.cpp .gguf — record which
-        # single-file quant to use, so acquisition normalizes it to safetensors (subprocess) instead
-        # of pulling safetensors that don't exist. Keyed by the HF repo (== the target id).
-        gf = (gguf_file or "").strip()
-        if gf and not gf.lower().endswith(".gguf"):
-            return JSONResponse({"ok": False,
-                                 "error": "gguf_file must be a single .gguf filename in the repo"},
-                                status_code=400)
+        if dry_run:                              # resolve-only preview: no registration, no download
+            return JSONResponse({"ok": True, "dry_run": True, "input": hf, "friendly": friendly,
+                                 "target": target, "gguf_file": gf or None, "note": note or None})
         if friendly not in MODELS:
-            MODELS[friendly] = (hf, hf)          # draft = target (no speculative)
-            CUSTOM_MODELS[friendly] = hf
+            MODELS[friendly] = (target, target)  # draft = target (no speculative)
+            CUSTOM_MODELS[friendly] = target
             if gf:
-                GGUF_FILES[hf] = gf              # mark this target as GGUF-sourced
+                GGUF_FILES[target] = gf          # mark this target as GGUF-sourced
             save_custom_models()
-            log_activity(f"added model {friendly} ({hf})" + (f" [GGUF {gf}]" if gf else ""))
-        elif gf and GGUF_FILES.get(hf) != gf:
-            GGUF_FILES[hf] = gf                  # update the chosen quant for an already-registered repo
+            log_activity(f"added model {friendly} ({target})"
+                         + (f" [GGUF {gf}]" if gf else "") + (f" — {note}" if note else ""))
+        elif gf and GGUF_FILES.get(target) != gf:
+            GGUF_FILES[target] = gf              # update the chosen quant for an already-registered repo
             save_custom_models()
         if friendly in DELETED_MODELS:           # re-adding a previously deleted model un-hides it
             DELETED_MODELS.discard(friendly)
             save_deleted_models()
         r = await _start_download(friendly)
-        return JSONResponse({"ok": True, "friendly": friendly, "target": hf,
-                             "gguf_file": gf or None, "status": r.get("status")})
+        return JSONResponse({"ok": True, "friendly": friendly, "target": target,
+                             "gguf_file": gf or None, "note": note or None,
+                             "status": r.get("status")})
 
     @app.post("/delete")             # dashboard: delete a model from controller
     async def delete_model(model: str) -> JSONResponse:

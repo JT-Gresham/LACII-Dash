@@ -722,10 +722,11 @@ function closeOv(){ $('#ov').classList.remove('show'); DETAIL_OPEN=null; }
 $('#ov').addEventListener('wheel',e=>{ if(e.target===e.currentTarget){ $('#modal').scrollTop+=e.deltaY*(e.deltaMode===1?16:1); e.preventDefault(); } },{passive:false});
 function openAdd(){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Add a model</h3>'
-   +'<div style="font-size:12px;color:var(--muted);margin-top:4px">Register any Hugging Face id. It downloads in the background.</div>'
-   +'<label>Hugging Face id</label><input id="a-hf" placeholder="org/Name-Instruct">'
-   +'<div class="grid2"><div><label>Name (optional)</label><input id="a-nm" placeholder="auto from id"></div>'
-   +'<div><label>GGUF file (optional)</label><input id="a-gg" placeholder="*.gguf"></div></div>'
+   +'<div style="font-size:12px;color:var(--muted);margin-top:4px">Just enter the Hugging Face id — <b>org/Model</b>. A GGUF-only repo automatically uses its safetensors source (or auto-picks a quant to convert), and the name is derived for you. Downloads in the background.</div>'
+   +'<label>Hugging Face id</label><input id="a-hf" placeholder="org/Model — e.g. ornith-ai/Ornith-1.0-35B">'
+   +'<div style="font-size:11px;color:var(--dim);margin:12px 0 2px">Optional overrides — leave blank unless you need them:</div>'
+   +'<div class="grid2"><div><label>Name</label><input id="a-nm" placeholder="auto from id"></div>'
+   +'<div><label>GGUF file</label><input id="a-gg" placeholder="auto — set only to force one quant"></div></div>'
    +'<div style="margin-top:16px;text-align:right"><button class="btn pri" onclick="doAdd()">Add + download</button></div>'
    +'<div id="a-err" class="err" style="margin-top:8px"></div>';
   $('#ov').classList.add('show'); setTimeout(()=>$('#a-hf').focus(),50);
@@ -734,7 +735,7 @@ async function doAdd(){
   const hf=$('#a-hf').value.trim(), nm=$('#a-nm').value.trim(), gg=$('#a-gg').value.trim();
   if(!hf.includes('/')){ $('#a-err').textContent='enter an org/name Hugging Face id'; return; }
   const q=new URLSearchParams({model:hf}); if(nm)q.set('name',nm); if(gg)q.set('gguf_file',gg);
-  try{ await api('/add_model?'+q.toString(),{method:'POST'}); closeOv(); toast('added '+hf); tick(); }
+  try{ const r=await api('/add_model?'+q.toString(),{method:'POST'}); closeOv(); toast((r&&r.note)||('added '+((r&&r.friendly)||hf))); tick(); }
   catch(e){ $('#a-err').textContent=String(e.message||e); }
 }
 function _devOpts(){
