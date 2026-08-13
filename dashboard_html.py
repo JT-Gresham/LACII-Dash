@@ -769,13 +769,48 @@ function openLoad(name){
    +'<div><label title="Min-p sampling floor: drops any token whose probability is below this fraction of the top token\'s. Confidence-adaptive — strict when the model is sure, looser when it isn\'t — so it pairs well with HIGH temperature (temp flattens the distribution and lets weird tokens in; min-p cuts them first). At temperature >= 1.0 use 0.05-0.1: lower barely filters, higher eats the variety you raised temperature for. Used when a request sends no min_p of its own.">Default min-p</label>'
    +'<input id="l-minp" type="number" min="0" max="1" step="0.01" placeholder="0 (off)"></div></div>'
    +(dc>=131072?'<div class="note">⚠ native ctx is '+(Math.round(dc/1024))+'k — a huge KV cache. Keep ctx modest (8–16k) unless you need more.</div>':'')
-   +'<div style="margin-top:16px;text-align:right"><button class="btn ghost" onclick="preview(\''+esc(name)+'\')">Preview fit</button> '
+   +'<div class="grid2" style="margin-top:8px">'
+   +'<div><label title="KV slots (C): independent per-request KV streams on this replica. Each slot also keeps its OWN prompt-prefix record, and a request is routed to the free slot whose prefix best matches it — so with C&gt;1 two interleaved conversations stop evicting each other\'s cached prompt. Measured: with a 2594-token prompt, one unrelated request between turns cost +4691 ms at C=1 (full re-prefill) versus +109 ms at C=3. Costs C x the full-context KV reservation, so raising it too far pushes layers onto CPU — which is far worse than a prefix miss.">KV slots (concurrent streams)</label>'
+   +'<input id="l-slots" type="number" min="1" max="8" value="1" oninput="previewSoon(\''+esc(name)+'\')"></div><div></div></div>'
+   +'<div style="margin-top:16px;text-align:right"><button class="btn ghost" title="Fill every field above with the fastest settings for THIS model on THIS hardware, and explain each choice. Nothing is loaded — review and adjust before pressing Load." onclick="optimizeLoad(\''+esc(name)+'\')">⚡ Optimized settings</button> '
+   +'<button class="btn ghost" onclick="preview(\''+esc(name)+'\')">Preview fit</button> '
    +'<button class="btn pri" onclick="doLoad(\''+esc(name)+'\')">Load</button></div>'
    +'<div id="l-out" style="font-size:12px;color:var(--muted);margin-top:10px"></div>';
   $('#ov').classList.add('show');
   previewSoon(name);   // #mem-preview: show the est VRAM/RAM + KV-at-ctx footprint immediately
 }
 function _placeChg(){ $('#l-tpwrap').style.display=$('#l-place').value.indexOf('tp:')===0?'block':'none'; }
+// #perf-auto: "⚡ Optimized settings" — ask the controller which knobs give this model the fastest
+// tokens on THIS fleet (GET /optimize_knobs, a pure dry-run) and fill the form in. Deliberately does
+// NOT load: the operator sees every value change and the reason for it, and can still override.
+// The reasons matter — several settings are counter-intuitive and each one is there because it was
+// measured (e.g. int4 is a memory tier and NOT a speed tier on pre-sm80 cards, where no fused
+// kernel exists and the whole bf16 weight is rematerialized every forward).
+async function optimizeLoad(name){
+  const out=$('#l-out'); if(out)out.innerHTML='<span class="muted">resolving fastest settings…</span>';
+  try{
+    const ctx=parseInt(($('#l-ctx')||{}).value||'0',10)||0;
+    const r=await fetch('/optimize_knobs?model='+encodeURIComponent(name)+'&ctx='+ctx);
+    const d=await r.json();
+    if(!d.ok){ if(out)out.innerHTML='<span class="bad">'+esc(d.error||'could not resolve')+'</span>'; return; }
+    const k=d.knobs||{}, changed=[];
+    const set=(sel,val,label)=>{ const el=$(sel); if(!el)return;
+      const before=el.value; el.value=String(val);
+      if(String(before)!==String(val))changed.push(label+': '+(before===''?'(default)':before)+' → '+val); };
+    if(k.quant!==undefined)     set('#l-q',   k.quant, 'quant');
+    if(k.kv_slots!==undefined)  set('#l-slots',k.kv_slots,'KV slots');
+    if(k.kv_offload!==undefined)set('#l-kvo', k.kv_offload?'1':'', 'KV location');
+    if(k.kv_quant!==undefined)  set('#l-kvq', k.kv_quant==='none'?'':k.kv_quant, 'KV quant');
+    const why=(d.why||[]).map(w=>'<div style="margin:2px 0 2px 10px">• '+esc(w)+'</div>').join('');
+    if(out)out.innerHTML='<div><b>⚡ optimized for '+esc(d.device_name||'?')+'</b> ('
+      +esc(d.device_class||'?')+', '+(d.free_vram_gb||0).toFixed(1)+' GB free on '+esc(d.node||'?')+')</div>'
+      +(changed.length?'<div style="margin-top:6px"><b>changed:</b> '+esc(changed.join('  ·  '))+'</div>'
+                      :'<div style="margin-top:6px">already at the fastest settings — nothing changed.</div>')
+      +'<div style="margin-top:8px"><b>why:</b></div>'+why
+      +'<div style="margin-top:8px" class="muted">Nothing is loaded yet — adjust anything above, then press Load.</div>';
+    previewSoon(name);
+  }catch(e){ if(out)out.innerHTML='<span class="bad">optimize failed: '+esc(String(e))+'</span>'; }
+}
 function placeParams(name){
   const v=$('#l-place').value, p={model:name, quant:$('#l-q').value, ctx:$('#l-ctx').value};
   if(v.indexOf('m:')===0) p.mode=v.slice(2);
@@ -783,6 +818,7 @@ function placeParams(name){
   else if(v.indexOf('c:')===0){ p.node=v.slice(2); p.cpu_only='true'; }
   else if(v==='tp:gpu'){ p.tp=$('#l-tpn').value||2; }
   else if(v==='tp:cpu'){ p.tp=$('#l-tpn').value||2; p.cpu_only='true'; }
+  const sl=$('#l-slots'); if(sl&&sl.value&&+sl.value>1)p.kv_slots=sl.value;  // #kv-slots: C streams
   const kvo=$('#l-kvo'); if(kvo&&kvo.value)p.kv_offload='true';      // #kv-offload: KV in system RAM
   const kvq=$('#l-kvq'); if(kvq&&kvq.value)p.kv_quant=kvq.value;     // #172 TurboQuant KV preset (turbo2/3/4)
   const tmp=$('#l-temp'); if(tmp&&tmp.value!=='')p.temperature=tmp.value;  // #load-temp: default temp

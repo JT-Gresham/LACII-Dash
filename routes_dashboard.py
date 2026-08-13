@@ -184,6 +184,70 @@ def register(app):
         return JSONResponse({"sample_s": NET_HIST_SAMPLE_S, "cap": NET_HIST_MAX,
                              "now": int(time.time() * 1000), "hosts": hosts})
 
+    @app.get("/optimize_knobs")
+    async def optimize_knobs(model: str, ctx: int = 0, node: str = "") -> JSONResponse:
+        """#perf-auto: what settings would give this model the FASTEST tokens on THIS fleet?
+
+        A pure dry-run — resolves nothing on the engine and loads nothing. The Load screen's
+        "⚡ Optimize" button calls this and fills the form in, so the operator SEES what changed and
+        can still override anything before pressing Load.
+
+        The answer is genuinely setup-dependent, which is the whole point of perf_profile: device
+        class picks the int4 kernel (CUDA sm80+ -> torch tinygemm, ROCm -> the project's Triton
+        w4a16, CUDA sm<80 -> NEITHER, where int4 silently rematerializes the full bf16 weight every
+        forward and is a memory tier rather than a speed tier), and free VRAM decides how many KV
+        slots can be funded without pushing a layer onto CPU. Every returned value carries the
+        reason it was chosen, which the button renders under the form.
+        """
+        import perf_profile as _pp
+        try:
+            friendly = resolve_model_name(model)
+        except ValueError:
+            return JSONResponse({"ok": False, "error": f"unknown model '{model}'"}, status_code=404)
+        target = MODELS[friendly][0] if friendly in MODELS else friendly
+        spec = resolve_spec(target)
+        if spec is None:
+            return JSONResponse({"ok": False, "error": f"'{model}' has no transformer spec "
+                                                       f"(media models have no tunable knobs)"},
+                                status_code=400)
+        _pd = await asyncio.to_thread(_local_model_dir, target)
+        if _pd:
+            spec = await asyncio.to_thread(spec_with_measurements, spec, _pd)
+        if ctx <= 0:
+            ctx = min(int(spec.max_ctx or DEFAULT_CTX), 32768)
+        cands = [n for n in registry.alive_sorted() if n.can_infer]
+        if node:
+            cands = [n for n in cands if n.hostname == node]
+        gpu_c = [n for n in cands if n.eff_vram_gb > 0]
+        if not (gpu_c or cands):
+            return JSONResponse({"ok": False, "error": "no capable node is alive"}, status_code=503)
+        best = (max(gpu_c, key=lambda n: engine._node_live_free_vram_gb(n)) if gpu_c
+                else max(cands, key=lambda n: n.eff_ram_gb))
+        on_gpu = bool(gpu_c)
+        free_v = engine._node_live_free_vram_gb(best) if on_gpu else 0.0
+        _dn = (getattr(best, "device_name", "") or "").lower()
+        dev = _pp.classify_device(has_gpu=on_gpu,
+                                  is_hip=("amd" in _dn or "radeon" in _dn),
+                                  capability=getattr(best, "compute_cap", None),
+                                  unified_memory=False)
+        _lt = getattr(spec, "layer_types", None)
+        knobs, why = _pp.resolve(
+            params_b=(float(getattr(spec, "meas_params", 0) or 0) / 1e9
+                      or float(spec.total_weight_bytes) / 2e9),
+            num_layers=int(spec.num_layers), num_kv_heads=int(spec.num_kv_heads),
+            head_dim=int(spec.head_dim), vocab_size=int(spec.vocab_size),
+            is_moe=bool(getattr(spec, "is_moe", False)),
+            is_hybrid=bool(_lt) and any(t != "full_attention" for t in (_lt or [])),
+            is_multimodal=bool(getattr(spec, "is_multimodal", False)),
+            arch=str(getattr(spec, "arch", "") or ""),
+            tie_word_embeddings=bool(getattr(spec, "tie_embeddings", False)),
+            device_class=dev, free_vram_gb=free_v, free_ram_gb=float(best.eff_ram_gb or 0.0),
+            ctx=int(ctx))
+        return JSONResponse({"ok": True, "friendly": friendly, "ctx": int(ctx),
+                             "node": best.hostname, "device_class": dev,
+                             "device_name": getattr(best, "device_name", "") or "cpu",
+                             "free_vram_gb": round(free_v, 2), "knobs": knobs, "why": why})
+
     @app.get("/plan")
     async def plan(model: str, ctx: int = 0, quant: str = "none", mode: str = "auto", node: str = "", cpu_only: bool = False) -> JSONResponse:
         # #60 Preview: same inputs as /load (model, ctx, quant, mode) -> the placement + #76
