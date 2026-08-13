@@ -754,9 +754,21 @@ class EngineLoadMixin:
             # often than not. Explicit caller values always win. Off switch: /config?perf_auto=0.
             _perf_adv: list = []
             if bool(ENGINE_CONFIG.get("perf_auto", True)) and spec is not None and not cpu_only:
-                with contextlib.suppress(Exception):
+                try:
                     kv_slots = self._perf_auto_kv_slots(spec, quant, ctx, kv_slots, tp, kv_quant,
                                                         kv_offload, friendly, _perf_adv)
+                except Exception as _pexc:
+                    # NEVER silent: a resolver that fails invisibly is indistinguishable from one
+                    # that decided to change nothing, which makes the whole feature unfalsifiable.
+                    # Loud + non-fatal — the load proceeds on the caller's original knobs.
+                    print(f"[perf-auto] {friendly}: resolver failed ({_pexc!r}) — "
+                          f"keeping caller knobs", flush=True)
+                    log_activity(f"{friendly}: #perf-auto skipped ({type(_pexc).__name__})")
+            else:
+                print(f"[perf-auto] {friendly}: skipped "
+                      f"(perf_auto={ENGINE_CONFIG.get('perf_auto', True)}, "
+                      f"spec={'yes' if spec is not None else 'none'}, cpu_only={cpu_only})",
+                      flush=True)
             _kvs_req = max(1, min(8, int(kv_slots or 1)))
             kv_slots, _kvs_why = self._kvslots_clamp(kv_slots, tp, kv_quant, kv_offload,
                                                      model_dir)
