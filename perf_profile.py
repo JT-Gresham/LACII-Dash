@@ -53,6 +53,31 @@ def classify_device(*, has_gpu: bool, is_hip: bool = False, capability: tuple | 
 
 # --- KV sizing -----------------------------------------------------------------------------
 
+def looks_moe(*, meas_layer_w, hidden_size: int, num_heads: int, num_kv_heads: int,
+              head_dim: int, intermediate_size: int, attn_bias: bool = True,
+              weight_dtype_bytes: int = 2, ratio: float = 1.6) -> bool:
+    """Is this a Mixture-of-Experts model? Inferred, because the controller cannot know directly.
+
+    MoE-ness is only established WORKER-side (from the checkpoint's 3D expert tensors), so
+    ModelSpec carries no is_moe flag — an earlier version of this module asked for one and got a
+    silent False, which made the resolver confidently report "dense model" for a 35B-A3B. The
+    signal that IS available on the controller: spec_with_measurements fills meas_layer_w from the
+    REAL safetensors headers, while the dense formula models a single MLP per layer. A MoE layer
+    holds N experts, so measured/dense runs far above 1; anything at/below ~1 is dense.
+
+    Returns False when the model has not been downloaded (meas_layer_w is None) — unknown, not
+    dense. The caller must treat that as "cannot tell" rather than a positive dense claim.
+    """
+    if not meas_layer_w or not hidden_size or not intermediate_size:
+        return False
+    h, qd = int(hidden_size), int(num_heads) * int(head_dim)
+    kvd = int(num_kv_heads) * int(head_dim)
+    attn = h * qd + 2 * h * kvd + qd * h
+    bias = (qd + 2 * kvd) if attn_bias else 0
+    dense = (attn + bias + 3 * h * int(intermediate_size) + 2 * h) * int(weight_dtype_bytes)
+    return dense > 0 and (float(meas_layer_w) / dense) >= ratio
+
+
 def kv_bytes_per_token(*, num_layers: int, num_kv_heads: int, head_dim: int,
                        full_attention_layers: int | None = None, bytes_per_elem: int = 2) -> int:
     """K+V bytes one token occupies across every full-attention layer.
