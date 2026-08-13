@@ -264,7 +264,8 @@ class EngineLoadMixin:
         return ram, vram
 
     def _perf_auto_kv_slots(self, spec, quant: str, ctx: int, kv_slots: int, tp: int,
-                            kv_quant: str, kv_offload: bool, friendly: str, advice: list) -> int:
+                            kv_quant: str, kv_offload: bool, friendly: str, advice: list,
+                            pin_host: str = "") -> int:
         """#perf-auto: pick C (kv_slots) from the detected setup when the caller left it at 1.
 
         WHY THIS IS THE ONE KNOB WORTH AUTO-RAISING. #prefix-kv keeps ONE prompt-prefix record per
@@ -287,6 +288,11 @@ class EngineLoadMixin:
         if int(kv_slots or 1) > 1 or tp > 1 or kv_quant != "none" or kv_offload:
             return kv_slots                     # explicit request, or a path that hard-gates C=1
         cands = [n for n in registry.alive_sorted() if n.can_infer and n.eff_vram_gb > 0]
+        if pin_host:
+            # Size against the node this load will ACTUALLY land on. Without this the resolver
+            # picked the roomiest node in the fleet and could fund C x KV that the pinned node
+            # cannot hold — the exact CPU-spill this sizing exists to prevent.
+            cands = [n for n in cands if n.hostname == pin_host]
         if not cands:
             return kv_slots
         best = max(cands, key=lambda n: self._node_live_free_vram_gb(n))
@@ -756,7 +762,7 @@ class EngineLoadMixin:
             if bool(ENGINE_CONFIG.get("perf_auto", True)) and spec is not None and not cpu_only:
                 try:
                     kv_slots = self._perf_auto_kv_slots(spec, quant, ctx, kv_slots, tp, kv_quant,
-                                                        kv_offload, friendly, _perf_adv)
+                                                        kv_offload, friendly, _perf_adv, pin_host)
                 except Exception as _pexc:
                     # NEVER silent: a resolver that fails invisibly is indistinguishable from one
                     # that decided to change nothing, which makes the whole feature unfalsifiable.
