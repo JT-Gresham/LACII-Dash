@@ -52,6 +52,38 @@ def _stream_fail(exc, rec):
     return False, f"{type(exc).__name__}: {exc}"
 
 
+def _split_durations(rec, dur: int) -> tuple[int, int]:
+    """#honest-durations: (prompt_eval_duration, eval_duration) in ns, split at the first token.
+
+    Historically every emit site shipped ``prompt_eval_duration: 0`` and ``eval_duration: dur``
+    where dur is the TOTAL wall clock — queue wait + prefill + decode. Ollama reports the two
+    SEPARATELY (its eval_duration is decode only), so a client comparing the two APIs was comparing
+    ``tokens/(queue+prefill+decode)`` against ``tokens/decode``. Measured distortion on one card,
+    one model, varying only prompt length: 1.10x at P=37, 1.47x at P=1959, **2.47x at P=4196** —
+    iM's decode rate was flat throughout; only the reported number collapsed. On the live om3nbox
+    replica the same artifact shows up as max_tok_s/ema_tok_s = 30.47/26.97 = 1.13.
+
+    engine_gen stamps rec['t_gen0'] (after the slot is held, so queue wait is excluded) and
+    rec['t_first_tok'] (the prefill/decode boundary). total_duration keeps its old meaning, so
+    ``total - prompt_eval - eval`` is the queue wait — the same shape Ollama has, where
+    total_duration also exceeds prefill+eval.
+
+    Degrades safely: if either stamp is missing (generation failed before the first token, an older
+    engine_gen during per-file self-update convergence, a cached/reclaimed record) the prefill term
+    is reported as 0 and eval_duration keeps the whole span — exactly today's behaviour.
+    """
+    try:
+        t0 = rec.get("t_gen0") if rec is not None else None
+        t1 = rec.get("t_first_tok") if rec is not None else None
+        if t0 is None or t1 is None:
+            return 0, int(dur)
+        pf = int(max(0.0, float(t1) - float(t0)) * 1e9)
+        pf = min(pf, int(dur))              # never let prefill exceed the measured total
+        return pf, max(0, int(dur) - pf)
+    except Exception:
+        return 0, int(dur)
+
+
 def _normalize_ollama_images(messages):
     """#vl-vision: Ollama's NATIVE chat API attaches images as a per-message `images: [<b64>|<url>]`
     array next to a plain-string `content` — a shape BOTH the HF chat template and `_collect_images`
@@ -842,10 +874,12 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             except Exception as exc:
                 retryable, err = _stream_fail(exc, rec); done_reason = "error"
             dur = time.perf_counter_ns() - t0
+            _pf_ns, _ev_ns = _split_durations(rec, dur)   # #honest-durations
             final = {"model": model, "created_at": _iso(), "done": True, "done_reason": done_reason,
                      "total_duration": dur, "load_duration": 0,
-                     "prompt_eval_count": len(P.get("ids", [])), "prompt_eval_duration": 0,
-                     "eval_count": state["tokens"], "eval_duration": dur,
+                     "prompt_eval_count": len(P.get("ids", [])),
+                     "prompt_eval_duration": _pf_ns, "eval_count": state["tokens"],
+                     "eval_duration": _ev_ns,
                      "message": {"role": "assistant", "content": ""}}
             if err:
                 final["error"] = err
@@ -889,10 +923,12 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             except Exception as exc:  # generation failed mid-stream (model WAS ready); run() frees rec
                 retryable, err = _stream_fail(exc, rec); done_reason = "error"
             dur = time.perf_counter_ns() - t0
+            _pf_ns, _ev_ns = _split_durations(rec, dur)   # #honest-durations
             final = {"model": model, "created_at": _iso(), "done": True,
                      "done_reason": done_reason, "total_duration": dur, "load_duration": 0,
-                     "prompt_eval_count": len(P.get("ids", [])), "prompt_eval_duration": 0,
-                     "eval_count": state["tokens"], "eval_duration": dur}
+                     "prompt_eval_count": len(P.get("ids", [])),
+                     "prompt_eval_duration": _pf_ns, "eval_count": state["tokens"],
+                     "eval_duration": _ev_ns}
             final[body_key] = empty_val
             if err:
                 final["error"] = err
@@ -1022,9 +1058,10 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                 "usage": usage}
         METRICS["api_out"] += len(json.dumps(payload))
         return JSONResponse(payload)
+    _pf_ns, _ev_ns = _split_durations(rec, dur)   # #honest-durations
     out = {"model": model, "created_at": _iso(), "done": True, "done_reason": done_reason,
            "total_duration": dur, "load_duration": 0, "prompt_eval_count": len(P["ids"]),
-           "prompt_eval_duration": 0, "eval_count": n, "eval_duration": dur}
+           "prompt_eval_duration": _pf_ns, "eval_count": n, "eval_duration": _ev_ns}
     if mode == "chat":
         msg = {"role": "assistant", "content": text}
         if tcalls:

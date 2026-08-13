@@ -139,6 +139,10 @@ EXTRA_UPDATE_FILES: list[str] = ["worker_t2i.py",   # #t2i-serve: worker diffusi
                                  "kv_quant.py",       # TurboQuant KV-cache quantizer (#172)
                                  # m4c152 code-split: shared-state registry + relocated Engine mixins
                                  "state.py", "engine_load.py", "engine_gen.py", "engine_lifecycle.py",
+                                 # #perf-auto: setup-aware knob resolution, imported by engine_load.
+                                 # MUST ship with it — a self-update that pulled the new engine_load
+                                 # without this module would import a file that isn't there.
+                                 "perf_profile.py",
                                  "control_plane.py",   # code-split Inc 2: worker-facing control plane
                                  # m4c153 code-split: relocated build_app routes
                                  "routes_dashboard.py", "routes_lifecycle.py", "routes_api.py", "routes_diag.py",
@@ -934,6 +938,13 @@ def _record_ctx_history(friendly: str, in_ids, out_ids, tok_in: int, tok_out: in
 ENGINE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "engine_config.json")
 ENGINE_CONFIG: dict = {"max_loaded": MAX_LOADED_MODELS, "auto_unload": False,
                        "queue_depth": DEFAULT_QUEUE_DEPTH,
+                       # #perf-auto: resolve performance knobs the caller left unset from the
+                       # DETECTED setup (device class, live-free VRAM, model shape, MoE/hybrid).
+                       # Only MEASURED knobs are applied — today that is kv_slots, which turns
+                       # #prefix-kv from a depth-1 record into an associative cache (measured 3.9x
+                       # on an interleaved conversational turn). The rest of the resolver's
+                       # decisions are logged as advice. Explicit per-load values always win.
+                       "perf_auto": True,
                        # #autoload-smallest: quant an AUTO-LOADED (requested-but-not-resident) model
                        # defaults to — the SMALLEST that fits the common case. int4 is ~1/4 the bf16
                        # memory, fits more nodes, and serves PRE-PACKED when a shard cache exists, so a

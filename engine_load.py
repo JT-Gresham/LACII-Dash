@@ -263,6 +263,61 @@ class EngineLoadMixin:
                 vram[nid] = vram.get(nid, 0) + int(b.get("vram", 0))
         return ram, vram
 
+    def _perf_auto_kv_slots(self, spec, quant: str, ctx: int, kv_slots: int, tp: int,
+                            kv_quant: str, kv_offload: bool, friendly: str, advice: list) -> int:
+        """#perf-auto: pick C (kv_slots) from the detected setup when the caller left it at 1.
+
+        WHY THIS IS THE ONE KNOB WORTH AUTO-RAISING. #prefix-kv keeps ONE prompt-prefix record per
+        slot. At C=1 a single interleaved request — a second client, an agent's side-query, a
+        keep-alive probe — overwrites it, so every later turn re-prefills the whole conversation.
+        Measured on an idle card with a 2594-token prompt: C=1 interleaved 6506 ms (prefix MISS)
+        vs C=3 1665 ms (HIT) = **3.9x**. _SlotLease.__aenter__ already routes each request to the
+        free slot whose per-slot record has the longest common prefix, so C>1 upgrades a depth-1
+        record into an associative prefix cache with no new machinery.
+
+        WHY IT IS SIZED SO CONSERVATIVELY. C multiplies the full-ctx KV RESERVATION, and
+        overshooting pushes decoder layers onto CPU — far more destructive than a prefix miss (two
+        CPU layers took a 7B from 27 to 9.7 tok/s). Worse, a plan whose C x KV cannot fit raises
+        CapacityError, turning a load that used to succeed into a failure. So C is only raised when
+        the QUANTIZED weights plus C x KV fit ONE node's live-free VRAM with 25% slack — i.e. the
+        single-node conversational case, which is exactly where prefix reuse pays. Everything else
+        keeps C=1 and behaves byte-identically to before.
+        """
+        import perf_profile as _pp
+        if int(kv_slots or 1) > 1 or tp > 1 or kv_quant != "none" or kv_offload:
+            return kv_slots                     # explicit request, or a path that hard-gates C=1
+        cands = [n for n in registry.alive_sorted() if n.can_infer and n.eff_vram_gb > 0]
+        if not cands:
+            return kv_slots
+        best = max(cands, key=lambda n: self._node_live_free_vram_gb(n))
+        free_gb = self._node_live_free_vram_gb(best)
+        dev = _pp.classify_device(
+            has_gpu=True,
+            is_hip="amd" in (getattr(best, "device_name", "") or "").lower()
+                   or "radeon" in (getattr(best, "device_name", "") or "").lower(),
+            unified_memory=False)
+        _lt = getattr(spec, "layer_types", None)
+        knobs, why = _pp.resolve(
+            params_b=float(getattr(spec, "meas_params", 0) or 0) / 1e9
+                     or float(spec.total_weight_bytes) / 2e9,
+            num_layers=int(spec.num_layers), num_kv_heads=int(spec.num_kv_heads),
+            head_dim=int(spec.head_dim), vocab_size=int(spec.vocab_size),
+            is_moe=bool(getattr(spec, "is_moe", False)),
+            is_hybrid=bool(_lt) and any(t != "full_attention" for t in (_lt or [])),
+            is_multimodal=bool(getattr(spec, "is_multimodal", False)),
+            arch=str(getattr(spec, "arch", "") or ""),
+            device_class=dev, free_vram_gb=free_gb, ctx=int(ctx or 4096),
+            requested={"quant": quant})
+        advice.extend(why)
+        c = int(knobs.get("kv_slots", 1) or 1)
+        if c > 1:
+            log_activity(f"{friendly}: #perf-auto kv_slots=1 -> {c} on {best.hostname} "
+                         f"({free_gb:.1f} GB free) — keeps interleaved conversations' prefixes "
+                         f"warm (measured 3.9x on the interleaved turn)")
+        for line in why:
+            print(f"[perf-auto] {friendly}: {line}", flush=True)
+        return c
+
     def _kvslots_clamp(self, kv_slots: int, tp: int, kv_quant: str, kv_offload: bool,
                        model_dir: str) -> tuple:
         """#kv-slots load-time hard gates: returns (effective_kv_slots, reason). Only the
@@ -692,6 +747,16 @@ class EngineLoadMixin:
             # the ctx guardrails, colo_need, /status kv_reserved) reserves C x per-stream KV —
             # a load whose C*KV doesn't fit FAILS here (CapacityError) or at the worker's own
             # xC kv_reserve_probe (KV_RESERVE_OOM -> replan), never OOMs mid-decode.
+            # #perf-auto: resolve performance knobs the caller left UNSET from the DETECTED setup
+            # (device class, free VRAM, model shape, MoE/hybrid, draft availability). Only knobs
+            # backed by a measurement are APPLIED; the rest are logged as advice, because this
+            # session established that plausible-sounding tuning reverses under measurement more
+            # often than not. Explicit caller values always win. Off switch: /config?perf_auto=0.
+            _perf_adv: list = []
+            if bool(ENGINE_CONFIG.get("perf_auto", True)) and spec is not None and not cpu_only:
+                with contextlib.suppress(Exception):
+                    kv_slots = self._perf_auto_kv_slots(spec, quant, ctx, kv_slots, tp, kv_quant,
+                                                        kv_offload, friendly, _perf_adv)
             _kvs_req = max(1, min(8, int(kv_slots or 1)))
             kv_slots, _kvs_why = self._kvslots_clamp(kv_slots, tp, kv_quant, kv_offload,
                                                      model_dir)

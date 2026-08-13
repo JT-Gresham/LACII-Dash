@@ -407,6 +407,7 @@ def register(app):
                          auto_unload: Optional[bool] = None,
                          queue_depth: Optional[int] = None,
                          auto_tp: Optional[bool] = None,
+                         perf_auto: Optional[bool] = None,
                          auto_tp_ratio: Optional[float] = None,
                          auto_load: Optional[bool] = None,
                          autoload_quant: Optional[str] = None,
@@ -479,6 +480,8 @@ def register(app):
             ENGINE_CONFIG["queue_depth"] = max(0, int(queue_depth))
         if auto_tp is not None:                          # #87 D: auto-route cpu-bound models to CPU TP
             ENGINE_CONFIG["auto_tp"] = bool(auto_tp)
+        if perf_auto is not None:                        # #perf-auto: setup-aware knob resolution
+            ENGINE_CONFIG["perf_auto"] = bool(perf_auto)
         if auto_tp_ratio is not None:                    # trigger when weights > ratio x GPU pool
             ENGINE_CONFIG["auto_tp_ratio"] = max(0.0, float(auto_tp_ratio))
         if auto_load is not None:                        # auto-load a requested model that isn't resident

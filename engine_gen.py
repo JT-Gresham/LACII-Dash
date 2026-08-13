@@ -89,16 +89,26 @@ def _prefix_kv_min() -> int:
     INFINITEMODEL_PREFIX_KV — '0'/'off'/'false'/'no' -> hard opt-out (default ON; the
     _prefix_kv_ok gates already require the modern 'pipefill' worker caps, so a mixed/stale
     fleet self-gates to the classic full prefill);
-    INFINITEMODEL_PREFIX_MIN — the reuse threshold, default 1024 tokens; clamped >=16 so a
-    typo can never make every tiny retry crop a live cache for a negligible win."""
+    INFINITEMODEL_PREFIX_MIN — the reuse threshold, default 128 tokens; clamped >=16 so a
+    typo can never make every tiny retry crop a live cache for a negligible win.
+
+    #prefix-min-128 (2026-08-13): the default was 1024 and that made the whole feature INERT for
+    real traffic. Measured on the live om3nbox replica: 1816 served requests, a 30.5-minute /logs
+    window with 198 first-token lines and ZERO 'prefix-kv' occurrences — a 0% hit rate — because
+    the mean prompt there is 353 tokens and a 353-token prompt can never clear a 1024-token gate.
+    Reproduced on an idle card: a 2594-token prompt HITS (1814 ms vs 6499 ms cold) while the
+    identical test at a realistic 385-token prompt MISSES. The 1024 value was only ever justified
+    as typo protection, and the >=16 clamp already provides that. A miss is bounded above by
+    today's behaviour (one crop frame + a prefill of q-L), so lowering it cannot regress: the
+    downside is one wasted crop round-trip, the upside is skipping the whole prompt's prefill."""
     import os
     v = os.environ.get("INFINITEMODEL_PREFIX_KV", "").strip().lower()
     if v in ("0", "off", "false", "no"):
         return 0
     try:
-        n = int(os.environ.get("INFINITEMODEL_PREFIX_MIN", "1024"))
+        n = int(os.environ.get("INFINITEMODEL_PREFIX_MIN", "128"))
     except ValueError:
-        return 1024
+        return 128
     return max(16, n)
 
 
@@ -1165,7 +1175,25 @@ class EngineGenMixin:
                     # (item[0] is not None); the trailing stop/length marker is skipped.
                     _t0 = time.monotonic()
                     _ntoks = 0
+                    # #honest-durations: publish the generation's own clock on the INFLIGHT record so
+                    # the API surfaces can report prompt_eval_duration/eval_duration SEPARATELY (the
+                    # Ollama contract) instead of folding prefill into eval_duration. _t0 is stamped
+                    # after the slot is held, so t_gen0 excludes queue wait; the first emitted token
+                    # marks the prefill/decode boundary. serving.py derives:
+                    #     prompt_eval_duration = t_first_tok - t_gen0        (prefill)
+                    #     eval_duration        = total_duration - queue - prefill   (decode)
+                    # Observability only — nothing here changes what is generated.
+                    if rec is not None:
+                        with contextlib.suppress(Exception):
+                            rec["t_gen0"] = _t0
+                            rec.pop("t_first_tok", None)   # stale value from a retried record
                     _out_ids: list = []   # #ctx-history: accumulate generated token ids (decoded lazily)
+
+                    def _stamp_first_tok():
+                        """#honest-durations: record the prefill/decode boundary exactly once."""
+                        if rec is not None and _ntoks == 1:
+                            with contextlib.suppress(Exception):
+                                rec.setdefault("t_first_tok", time.monotonic())
                     # Multimodal (mm) forces PLAIN decode: the controller-side draft model has
                     # no image embeds, so speculative would diverge — only the full pipeline
                     # gets the spliced vision tokens at prefill.
@@ -1188,6 +1216,7 @@ class EngineGenMixin:
                         async for item in self._decode_spec(model, prompt_ids, max_new, spec_k):
                             if item[0] is not None:
                                 _ntoks += 1
+                                _stamp_first_tok()   # #honest-durations: prefill/decode boundary
                                 _out_ids.append(item[0])   # #ctx-history
                                 model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
                                 _dt = time.monotonic() - _t0
@@ -1198,6 +1227,7 @@ class EngineGenMixin:
                         async for item in self._decode_spec_mtp(model, prompt_ids, max_new, mtp_head):
                             if item[0] is not None:
                                 _ntoks += 1
+                                _stamp_first_tok()   # #honest-durations: prefill/decode boundary
                                 _out_ids.append(item[0])   # #ctx-history
                                 model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
                                 _dt = time.monotonic() - _t0
@@ -1211,6 +1241,7 @@ class EngineGenMixin:
                                                              slot=_slot):
                             if item[0] is not None:
                                 _ntoks += 1
+                                _stamp_first_tok()   # #honest-durations: prefill/decode boundary
                                 _out_ids.append(item[0])   # #ctx-history
                                 model.last_token_ts = time.time()   # #gen-stall-watchdog progress marker
                                 if _sst is not None:   # #kv-slots: per-slot progress (slot watchdog)

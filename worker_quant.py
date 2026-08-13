@@ -841,6 +841,27 @@ def _bench_large_m_naive(mod, tag: str) -> int:
         t_f = _ms(lambda: op(xk, qw, mod.group_size, szt))
         t_n = _ms(lambda: F.linear(xt, mod._dequant(torch.bfloat16)))
         thr = M if t_n < t_f * 0.87 else 0        # same >=13%-win margin as the de-alias bench
+        # #large-m-descend: when naive wins at the chunk bucket, find the SMALLEST bucket where it
+        # STILL wins instead of hard-coding the chunk. The old threshold was always
+        # _m_bucket(PREFILL_CHUNK) = 2048, so every prompt of 1025..2048 tokens (bucket 1024 or
+        # 2048's lower half) kept the DECODE-tuned kernel at prefill — and on the live om3nbox
+        # replica the mean prompt is 353 tokens (bucket 512), i.e. essentially ALL production
+        # prefill was running the wrong kernel. The fused `_k` grid is (cdiv(M,16), cdiv(N,128)),
+        # so it re-reads the whole packed weight cdiv(M,16) times: its cost is LINEAR in M and can
+        # be extrapolated from the single measurement already taken — no new Triton shape is
+        # probed, which is the constraint that forced the one-point bench in the first place.
+        # The naive side is timed for real at each candidate (plain BLAS, no JIT, no new shapes).
+        if thr:
+            f_per_row = t_f / max(1, M)           # fused: linear in rows (cdiv(M,16) weight passes)
+            b = M
+            while b > 16:
+                nb = b >> 1
+                xt2 = torch.randn(nb, mod.in_features, device=dev, dtype=torch.bfloat16)
+                t_n2 = _ms(lambda: F.linear(xt2, mod._dequant(torch.bfloat16)))
+                if t_n2 >= f_per_row * nb * 0.87:  # naive stops winning here -> keep the last bucket
+                    break
+                b = nb
+                thr = nb
         _LARGE_M_CHOICE[key] = thr
         _builtins.print(f"[{tag}] large-M dispatch [N={qw.shape[0]},Kpad={in_pad}]: "
                         f"M={M} fused={t_f:.2f}ms naive={t_n:.2f}ms -> "

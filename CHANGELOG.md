@@ -4,6 +4,73 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## 2026-08-13 — #honest-durations, #prefix-min-128, #perf-auto, #large-m-descend
+
+A measurement-driven performance pass. Its most useful output was **negative**: three
+plausible-sounding optimizations (CUDA graphs, lm_head int8 on CUDA, `torch.compile`) were
+implemented, benchmarked, and **reverted** because each measured *slower*. The wins that survived
+are below, and none of them is in decode — a paired interleaved benchmark showed iM's decode is
+already within ~12% of raw HuggingFace running the identical modules on the identical GPU, so the
+time was never there to reclaim.
+
+### Fixed
+
+- **#honest-durations — `eval_duration` no longer includes prefill.** Every API emit site shipped
+  `prompt_eval_duration: 0` and `eval_duration = total_duration`, i.e. queue + prefill + decode.
+  Ollama reports the two *separately* (its `eval_duration` is decode only), so any client comparing
+  the two APIs was comparing `tokens/(queue+prefill+decode)` against `tokens/decode`. Measured on one
+  card and one model, varying only prompt length: iM under-reported its own decode rate by **1.10x at
+  P=37, 1.47x at P=1959 and 2.47x at P=4196** — the decode rate was flat throughout; only the
+  reported number collapsed. `engine_gen` now stamps `t_gen0` (after the slot is held, so queue wait
+  is excluded) and `t_first_tok` on the INFLIGHT record; `serving._split_durations` derives the two
+  fields from them. `total_duration` keeps its meaning, so `total - prompt_eval - eval` is the queue
+  wait — the same shape Ollama has. Degrades to today's behaviour when either stamp is missing.
+  *This also fixes a latent divide-by-zero in clients that compute `prompt_eval_count /
+  prompt_eval_duration`, and means the repo's own harnesses (`bench_tp_crossover.py`, `tp_bench.py`,
+  `load_verify.py`) stop reading a prefill-contaminated field as "decode tok/s".*
+- **#prefix-min-128 — prompt-prefix reuse was inert.** `INFINITEMODEL_PREFIX_MIN` defaulted to 1024
+  tokens while the mean real prompt on the live replica is 353, giving a **measured 0% hit rate over
+  1816 served requests** (a 30.5-minute log window with 198 first-token lines and zero `prefix-kv`
+  entries). Reproduced on an idle card: a 2594-token prompt HITS (1814 ms vs 6499 ms cold) while the
+  identical test at 385 tokens MISSES. Default lowered to 128; the `>=16` clamp already provided the
+  typo protection the 1024 value was justified by, and a miss costs at most one crop round-trip.
+
+### Added
+
+- **#perf-auto — setup-aware knob resolution at load time** (`perf_profile.py`, new). A pure,
+  torch-free decision table that takes the detected setup (device class, live-free VRAM, model shape,
+  MoE/hybrid/multimodal, draft availability, ctx) and returns resolved knobs *plus a rationale line
+  per decision*, which is printed into the load log. Device class is the axis that matters most
+  because it selects the int4 kernel: CUDA sm80+ reaches torch tinygemm, ROCm reaches the project's
+  Triton w4a16, and **CUDA sm<80 reaches neither** — there `QuantLinear4` silently falls back to
+  rematerializing the whole bf16 weight every forward, so int4 is a memory tier and never a speed
+  tier. Explicit per-load values always win; `/config?perf_auto=0` disables it. Only knobs backed by
+  a measurement are *applied* today (see below) — the rest are logged as advice, deliberately, since
+  this pass established that untested tuning reverses under measurement more often than not.
+- **`kv_slots` is now auto-raised when it provably fits** (`_perf_auto_kv_slots`). `#prefix-kv` keeps
+  one prefix record *per slot*, so at `kv_slots=1` a single interleaved request — a second client, an
+  agent side-query, a keep-alive probe — evicts it and every later turn re-prefills the whole
+  conversation. Measured with a 2594-token prompt: `C=1` interleaved **6506 ms (MISS)** vs `C=3`
+  **1665 ms (HIT)** = **3.9x**. `_SlotLease` already routed each request to the free slot with the
+  longest common prefix, so `C>1` upgrades a depth-1 record into an associative prefix cache with no
+  new machinery. Sized conservatively: raised only when quantized weights + `C x` full-ctx KV fit one
+  node's live-free VRAM with 25% slack, because overshooting pushes layers onto CPU (far worse than a
+  prefix miss) or fails the load outright. **First live validation of `kv_slots>1`**: three concurrent
+  conversations produced bit-identical greedy output to the sequential baseline.
+
+### Changed
+
+- **#large-m-descend — prefill stopped running the decode-tuned int4 kernel.** The fused-vs-naive
+  dispatch threshold was hard-coded to `_m_bucket(INFINITEMODEL_PREFILL_CHUNK)` = 2048, so every
+  prompt below ~2048 tokens kept the decode-tuned Triton kernel at prefill — and the live mean prompt
+  is 353 tokens, meaning essentially *all* production prefill used the wrong kernel. That kernel's
+  grid re-reads the whole packed weight `cdiv(M,16)` times, so its cost is linear in M and can be
+  extrapolated from the single measurement already taken; the naive side is then timed for real at
+  each descending bucket (plain BLAS, no JIT, so **no new Triton shapes are probed** — the constraint
+  that forced the one-point bench originally). Grounded against the live bench lines, the crossover
+  lands near M=256 rather than 2048. Off-switch `IM_LARGE_M_NAIVE=0` unchanged; numerics unchanged
+  (the fall-through *is* the self-check's own reference path).
+
 ## Recent — VRAM-accounting hygiene + KV-quant in the Load UI
 
 - **Media render errors are now legible** — a t2a / t2music / t2i / tts render that failed *after* the
