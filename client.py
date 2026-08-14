@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.17"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.18"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -814,7 +814,7 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
                         if _p.device.type == "cuda" and _p.dtype == _t.bfloat16:
                             _bf += _p.numel() * _p.element_size()
                 print(f"[int4-vram] {self.placement} | in-use={_al:.2f}GB reserved={_rv:.2f}GB | "
-                      f"QuantLinear4={_nq} qweight={_qb/_GB:.2f}GB bf16params={_bf/_GB:.2f}GB", flush=True)
+                      f"qlinears={_nq} qweight={_qb/_GB:.2f}GB bf16params={_bf/_GB:.2f}GB", flush=True)
         except Exception as _e:
             print(f"[int4-vram] probe failed: {_e!r}", flush=True)
 
