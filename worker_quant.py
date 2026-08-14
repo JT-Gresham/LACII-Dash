@@ -412,11 +412,20 @@ def _quant_linear_cls():
                 # fp32 or fp16 input would have to be down-converted to feed tl.dot, which is a
                 # silent precision change the naive path does not make.
                 _op = getattr(self, "_w8", None)
+                # _w8_m_max: 0 = every M, 1 = DECODE ONLY. prepare_fused benchmarks both M=1 and a
+                # prefill-shaped M, because winning at one says nothing about the other: at large M
+                # the GEMM is compute-bound and the naive path's one-off dequant amortizes over
+                # every row, so dequant-once + a vendor BLAS can beat reading int8 inside a Triton
+                # tl.dot — the same crossover the int4 tier already handles with _naive_m_min. On
+                # gfx1151 _k8 wins at both (int8 prefill measured 1180 tok/s vs int4's 827), but
+                # that is a measurement about one device, not a property of the kernel.
                 if _op is not None and x.dtype == torch.bfloat16:
-                    _shape = x.shape
-                    y = _op(x.reshape(-1, _shape[-1]), self.qweight, self.scale)
-                    y = y.reshape(*_shape[:-1], y.shape[-1])
-                    return y if self.bias is None else y + self.bias
+                    _mx = getattr(self, "_w8_m_max", 0)
+                    if not _mx or _rows(x) <= _mx:
+                        _shape = x.shape
+                        y = _op(x.reshape(-1, _shape[-1]), self.qweight, self.scale)
+                        y = y.reshape(*_shape[:-1], y.shape[-1])
+                        return y if self.bias is None else y + self.bias
                 w = self.qweight.to(x.dtype) * self.scale    # dequant one weight matrix
                 return F.linear(x, w, self.bias)
 
@@ -465,11 +474,22 @@ def _quant_linear_cls():
                     t_n = _time_cuda(
                         lambda: F.linear(x1, self.qweight.to(torch.bfloat16) * self.scale), dev)
                     del wref
-                    if t_f < t_n:
-                        self._w8 = op
-                        _w8a16_note(self.qweight.numel(), t_n / max(t_f, 1e-9), dev)
-                    else:
+                    if not (t_f < t_n):
                         _w8a16_note_lost(t_f, t_n, dev)
+                        return
+                    self._w8 = op
+                    # Now the OTHER regime. Fewer iters: this is a load-time cost paid once per
+                    # linear (a 7B has ~197 of them) and the decision only needs to see which side
+                    # of a crossover it is on, not a publication-grade number.
+                    xp = torch.randn(_W8_PROBE_M, K, device=dev, dtype=torch.bfloat16)
+                    p_f = _time_cuda(lambda: op(xp, self.qweight, self.scale), dev,
+                                     iters=6, warmup=2)
+                    p_n = _time_cuda(
+                        lambda: F.linear(xp, self.qweight.to(torch.bfloat16) * self.scale), dev,
+                        iters=6, warmup=2)
+                    self._w8_m_max = 0 if p_f < p_n else 1
+                    _w8a16_note(self.qweight.numel(), t_n / max(t_f, 1e-9), dev,
+                                self._w8_m_max, p_n / max(p_f, 1e-9))
                 except Exception as exc:
                     print(f"[int8] w8a16 prepare failed on {dev} ({exc!r}) -> naive path",
                           flush=True)
@@ -758,6 +778,9 @@ _W8A16_OP = None
 _W8A16_TRIED = False
 _W8A16_BUILD_LOCK = threading.RLock()   # #triton-race: see _W4A16_BUILD_LOCK below
 _W8A16_LOGGED = False
+_W8_PROBE_M = 256       # prefill-shaped probe: big enough that the GEMM is compute-bound and
+                        # the naive path's one-off dequant has amortized, small enough that
+                        # benchmarking it on ~197 linears at load does not dominate the load.
 
 
 def _time_cuda(fn, dev, iters: int = 30, warmup: int = 8) -> float:
@@ -774,16 +797,19 @@ def _time_cuda(fn, dev, iters: int = 30, warmup: int = 8) -> float:
     return (time.perf_counter() - t0) / iters * 1e3
 
 
-def _w8a16_note(nweights: int, speedup: float, dev) -> None:
+def _w8a16_note(nweights: int, speedup: float, dev, m_max: int = 0, pre: float = 0.0) -> None:
     """One line per SHARD, not per linear — a 7B has ~200 of these and the per-linear spam would
     bury the load log (and every line costs a flush on a box that is mid-load)."""
     global _W8A16_LOGGED
     if _W8A16_LOGGED:
         return
     _W8A16_LOGGED = True
+    _scope = ("decode+prefill" if not m_max else
+              f"DECODE ONLY (prefill kept naive: {pre:.2f}x)")
     print(f"[int8] w8a16 triton kernel ACTIVE on {dev} — {speedup:.2f}x vs dequant+F.linear at "
-          f"decode (first linear: {nweights / 2 ** 20:.0f} MB int8, bf16 copy no longer "
-          f"materialized per call)", flush=True)
+          f"decode, {pre:.2f}x at M={_W8_PROBE_M} -> {_scope} (first linear: "
+          f"{nweights / 2 ** 20:.0f} MB int8, bf16 copy no longer materialized per call)",
+          flush=True)
 
 
 def _w8a16_note_lost(t_f: float, t_n: float, dev) -> None:
