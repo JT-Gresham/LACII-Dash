@@ -193,7 +193,30 @@ def _unpack_tensor(meta, raw):
 # advertises this cap — the gate is LOAD-time and all-or-nothing (a /load?kv_slots>1
 # REFUSES a chain with any older node; engine_load._kvslots_cap_check). 'slot' absent ==
 # slot 0 == the legacy single-cache behavior, byte-identical frames end to end.
-WIRE_CAPS = ("ntensor", "ntdiet", "pipefill", "kvslots")
+# 'ntpen' (#ntpen): this build's worker_net/shard_forward understand the 'argmaxpen'/'topkpen'
+# nt_mode variants + the 'nt_pen' header directive, and apply the request's repetition
+# penalties (repeat_penalty / presence_penalty / frequency_penalty) to the logits row ON THE
+# HEAD before reducing it. Without this the controller had to fall back to the FULL-vocab row
+# for any penalised request — and an Ollama client sends repeat_penalty by DEFAULT, so the
+# common case never got the diet at all (~300 KB/token instead of ~8 bytes).
+# THREE independent staleness guards, because the failure mode here is silent WRONG OUTPUT (a
+# top-K of the UNPENALISED row is perfectly well-formed and impossible to spot downstream),
+# unlike 'ntdiet' whose only downgrade risk was a bigger frame:
+#   - the cap itself: the controller only sends penalties down the wire when EVERY chain node
+#     advertises 'ntpen';
+#   - NEW MODE NAMES ('argmaxpen'/'topkpen') rather than a new key beside 'argmax': a stale
+#     worker_net whose wire.py already advertises the cap (per-file self-update convergence)
+#     gates on _ntm in ('argmax','topk'), so an unknown mode makes it reply the full row —
+#     whereas an extra key beside a KNOWN mode would have been ignored and answered
+#     unpenalised. The pen directive is also refused when 'nt_pen' is missing, which is what
+#     an 'ntdiet'-vintage INTERMEDIATE does to it (it rebuilds the next-hop header from a
+#     hardcoded nt_mode/nt_clip/nt_k tuple and drops the new key);
+#   - shard._pen_capable, the same doctrine as _nt_capable, for a stale shard_forward.py under
+#     a fresh worker_net.
+# Every one of those degrades to the legacy full-vocab row, which the controller ALWAYS still
+# accepts and penalises itself (engine_gen._penalized) — so the diet can only lose bandwidth,
+# never correctness.
+WIRE_CAPS = ("ntensor", "ntdiet", "pipefill", "kvslots", "ntpen")
 
 # #ntensor-manifest tensor kinds (u8 on the wire). 0/1 = full tensors; 2-4 carry the #logits-diet
 # reduced head replies: 2 = greedy argmax token ids (int64, [q]); 3/4 = top-K candidate values

@@ -29,7 +29,52 @@ _PREALLOC_KV_CLS = None   # #kv-prealloc: classes built ONCE on first use (trans
 # nt_clip / nt_k header keys (worker_net), replied as NT_TOKEN_IDS / NT_TOPK_VALS+NT_TOPK_IDX
 # manifest tensors (wire.py #ntensor-manifest), cap-gated end to end ('ntdiet', #wire-caps).
 
-def _diet_argmax(logits, clip):
+def _diet_penalize(row, pen):
+    """#ntpen: apply the request's repetition penalties to ONE logits row ON THE HEAD'S DEVICE, so
+    a penalised request can still take the reduced #logits-diet wire instead of shipping the full
+    [1,1,V] row back for controller-side penalties.
+
+    EXACT twin of engine_gen._penalized: `repeat_penalty` is MULTIPLICATIVE over the unique ids of
+    the last `repeat_last_n` tokens of PROMPT+OUTPUT (positive logits divided, negative multiplied);
+    `presence_penalty`/`frequency_penalty` are ADDITIVE over the OUTPUT ids only (the latter x that
+    id's occurrence count). The controller pre-reduces both windows to plain id lists
+    (pen['rp_ids']; pen['fp_ids'] + pen['fp_cnt']) so the head never needs the token history — the
+    wire carries at most repeat_last_n ids (64 by default, ~400 bytes of JSON), not a ~300 KB row.
+
+    Ordering is load-bearing in TWO places. (1) The row arrives ALREADY CLIPPED to nt_clip, and ids
+    >= clip are dropped here — exactly equivalent to the controller penalising a row whose tail it
+    had set to -inf, since -inf/rp and -inf-pp are both still -inf and so still unwinnable. (2) The
+    caller penalises BEFORE topk, never after: penalties REORDER the distribution (a rank-500 token
+    can become rank 1 once its rivals are penalised), so a top-K taken from the unpenalised row
+    would be the wrong candidate SET, not merely mis-scored.
+
+    fp32 (the controller does row.float().clone()) so the arithmetic is bit-identical to the legacy
+    path. Returns the row untouched when every knob is off; never mutates the caller's tensor."""
+    import torch
+    rp = float(pen.get("rp") or 1.0)
+    pp = float(pen.get("pp") or 0.0)
+    fp = float(pen.get("fp") or 0.0)
+    if (rp <= 0 or rp == 1.0) and not pp and not fp:
+        return row
+    V = int(row.shape[-1])
+    out = row.float().clone()
+    if rp > 0 and rp != 1.0:
+        ids = [int(i) for i in (pen.get("rp_ids") or []) if 0 <= int(i) < V]
+        if ids:
+            t = torch.tensor(ids, dtype=torch.long, device=out.device)
+            vals = out[t]
+            out[t] = torch.where(vals > 0, vals / rp, vals * rp)
+    if pp or fp:
+        keep = [(int(i), float(c)) for i, c in
+                zip(pen.get("fp_ids") or [], pen.get("fp_cnt") or []) if 0 <= int(i) < V]
+        if keep:
+            t = torch.tensor([i for i, _ in keep], dtype=torch.long, device=out.device)
+            c = torch.tensor([v for _, v in keep], dtype=out.dtype, device=out.device)
+            out[t] = out[t] - pp - fp * c
+    return out
+
+
+def _diet_argmax(logits, clip, pen=None):
     """#logits-diet argmax mode: greedy token id(s) [q] (int64, CPU) from head logits [1,q,V]
     (any device/dtype). clip>0 restricts candidates to the first `clip` vocab entries — EXACTLY
     the controller's legacy `row[ntok:] = -inf` mask + argmax (#21): slicing preserves index
@@ -44,10 +89,18 @@ def _diet_argmax(logits, clip):
     rows = logits[0]                                     # [q, V]
     if clip and 0 < int(clip) < int(rows.shape[-1]):
         rows = rows[:, :int(clip)]
+    if pen:
+        # #ntpen: penalties are defined over ONE next-token distribution. A multi-position
+        # (all_logits) frame is the spec-decode VERIFY round, which the controller never
+        # penalises — refuse LOUDLY rather than silently answer an unpenalised argmax, the
+        # one failure mode this whole feature is built to make impossible.
+        if int(rows.shape[0]) != 1:
+            raise RuntimeError("#ntpen: penalties on a multi-position (all_logits) frame")
+        rows = _diet_penalize(rows[0], pen).unsqueeze(0)
     return rows.argmax(dim=-1).to("cpu")                 # int64 [q]
 
 
-def _diet_topk(logits, clip, k):
+def _diet_topk(logits, clip, k, pen=None):
     """#logits-diet topk mode: (values, token ids) of the top-k candidates of the LAST position's
     row — the only position sampled decode consumes (the controller never requests topk with
     all_logits). clip applied FIRST (ids at/past the tokenizer length must never be candidates —
@@ -59,6 +112,8 @@ def _diet_topk(logits, clip, k):
     row = logits[0, -1]                                  # [V]
     if clip and 0 < int(clip) < int(row.shape[-1]):
         row = row[:int(clip)]
+    if pen:              # #ntpen: BEFORE topk — penalties change which ids are candidates
+        row = _diet_penalize(row, pen)
     kk = min(int(k), int(row.shape[-1]))
     vals, idx = torch.topk(row, kk)
     return vals.to("cpu"), idx.to("cpu")
@@ -207,6 +262,11 @@ class ShardForwardMixin:
     # no `nt` parameter — is never handed one (the head then replies full logits, which the
     # controller always still accepts as the downgrade path).
     _nt_capable = True
+    # #ntpen: worker_net gates the nt['pen'] directive on THIS attribute, so a stale
+    # shard_forward.py under a fresh worker_net (per-file self-update convergence) is never
+    # handed penalties its _diet_argmax/_diet_topk would silently IGNORE — the head then
+    # replies the full row and the controller penalises it itself.
+    _pen_capable = True
     # #kv-slots: worker_net gates the 'slot' header field on THIS attribute (getattr, default
     # False) so a stale shard_forward.py during per-file self-update convergence — whose
     # forward() has no `slot` parameter and a SINGLE self.kv — is never handed a slot>0 frame
@@ -618,8 +678,8 @@ class ShardForwardMixin:
                     # legacy row exactly — #gemma4).
                     ld = self._softcap_logits(self.head(sel))
                     if nt.get("mode") == "topk":
-                        return _diet_topk(ld, nt.get("clip", 0), nt.get("k", 0))
-                    return _diet_argmax(ld, nt.get("clip", 0))
+                        return _diet_topk(ld, nt.get("clip", 0), nt.get("k", 0), nt.get("pen"))
+                    return _diet_argmax(ld, nt.get("clip", 0), nt.get("pen"))
                 logits = self._softcap_logits(self.head(sel)).to(self.cpu)   # #gemma4 final logit softcap
                 if capture_pre_norm:
                     # #91 MTP: return the PRE-final-norm trunk hidden (what the checkpoint's MTP
@@ -649,8 +709,8 @@ class ShardForwardMixin:
                     # the wire + controller CPU, not D2H. Values/ids identical to the eager
                     # reduction because the helpers are device/dtype-agnostic.
                     if nt.get("mode") == "topk":
-                        return _diet_topk(r, nt.get("clip", 0), nt.get("k", 0))
-                    return _diet_argmax(r, nt.get("clip", 0))
+                        return _diet_topk(r, nt.get("clip", 0), nt.get("k", 0), nt.get("pen"))
+                    return _diet_argmax(r, nt.get("clip", 0), nt.get("pen"))
                 return r
         return self._forward_uniform_eager(x, cache_start, all_logits, inject, position_ids,
                                            capture_hidden, capture_pre_norm, bidir_spans, nt)
@@ -785,8 +845,8 @@ class ShardForwardMixin:
                 # #logits-diet: reduce ON DEVICE (see the general path) — ids / top-K only.
                 ld = self._softcap_logits(self.head(sel))
                 if nt.get("mode") == "topk":
-                    return _diet_topk(ld, nt.get("clip", 0), nt.get("k", 0))
-                return _diet_argmax(ld, nt.get("clip", 0))
+                    return _diet_topk(ld, nt.get("clip", 0), nt.get("k", 0), nt.get("pen"))
+                return _diet_argmax(ld, nt.get("clip", 0), nt.get("pen"))
             logits = self._softcap_logits(self.head(sel)).to(self.cpu)   # #gemma4 final logit softcap
             if capture_pre_norm:   # #91 MTP: PRE-final-norm trunk hidden (see general path)
                 hsel = h if all_logits else h[:, -1:, :]

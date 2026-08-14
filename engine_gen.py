@@ -449,6 +449,56 @@ class EngineGenMixin:
         ids = getattr(model, "stage_node_ids", None) or []
         return bool(ids) and all("ntdiet" in registry.node_caps(nid) for nid in ids)
 
+    def _wire_pen_ok(self, model) -> bool:
+        """#ntpen: may _send push this request's repetition penalties to `model`'s HEAD (so a
+        penalised request keeps the reduced wire) instead of pulling the full row back and
+        penalising here? Requires the whole #logits-diet gate PLUS every chain node advertising
+        'ntpen'. Stricter than the other wire gates on purpose: every OTHER cap's worst case is
+        a fatter frame, but a node that takes the directive and ignores it answers a perfectly
+        well-formed top-K of the UNPENALISED row — wrong output that nothing downstream can
+        detect. The wire carries two further guards behind this one (wire.py 'ntpen')."""
+        if not self._wire_diet_ok(model):
+            return False
+        ids = getattr(model, "stage_node_ids", None) or []
+        return bool(ids) and all("ntpen" in registry.node_caps(nid) for nid in ids)
+
+    def _pen_directive(self, prompt_ids, out_ids, sp):
+        """#ntpen: reduce the penalty knobs + the token history to the compact per-frame
+        directive the head applies (shard_forward._diet_penalize). Returns None when every knob
+        is a no-op — INCLUDING the rp<=0 case that _pen admits but _penalized ignores, so the
+        two paths agree on "no penalty" and a null directive simply means the plain diet.
+
+        The rp window is the last `repeat_last_n` of PROMPT+OUTPUT. It is assembled from the
+        tail of each list rather than `(prompt_ids + out_ids)[-n:]` because this runs on EVERY
+        decoded token and the naive form copies the whole prompt each time (a 4k-token list
+        rebuilt per token, to read 64 entries off the end). Guard the k==0 case: prompt_ids[-0:]
+        is the WHOLE list, not the empty tail."""
+        rp = float(sp.get("repeat_penalty") or 1.0)
+        pp = float(sp.get("presence_penalty") or 0.0)
+        fp = float(sp.get("frequency_penalty") or 0.0)
+        if (rp <= 0 or rp == 1.0) and not pp and not fp:
+            return None
+        d = {"rp": rp, "pp": pp, "fp": fp}
+        if rp > 0 and rp != 1.0:
+            n = sp.get("repeat_last_n")
+            n = 64 if n is None else int(n)
+            if n < 0:
+                window = list(prompt_ids) + list(out_ids)
+            elif n == 0:
+                window = []
+            else:
+                window = list(out_ids[-n:])
+                k = n - len(window)
+                if k > 0:
+                    window = list(prompt_ids[-k:]) + window
+            d["rp_ids"] = sorted({int(i) for i in window})   # unique, like _penalized
+        if (pp or fp) and out_ids:
+            from collections import Counter
+            cnt = Counter(int(i) for i in out_ids)
+            d["fp_ids"] = list(cnt.keys())
+            d["fp_cnt"] = [float(v) for v in cnt.values()]
+        return d
+
     def _pipefill_arch_ok(self, model) -> bool:
         """#pipefill: is this model's ARCHITECTURE safe for cross-stage chunked prefill? Must
         mirror shard_forward's own intra-stage do_chunk exclusion list (the audit-binding set):
@@ -573,7 +623,7 @@ class EngineGenMixin:
 
     async def _prefill_reuse(self, model: LoadedModel, prompt_ids: list, mm=None,
                              position_ids=None, nt_mode=None, nt_clip: int = 0, nt_k: int = 0,
-                             slot: int = 0):
+                             slot: int = 0, nt_pen=None):
         """#prefix-kv: prefill dispatcher with CROSS-REQUEST prefix reuse (audit finding 29).
 
         THE DEFECT this fixes: every request re-prefilled its ENTIRE prompt from position 0,
@@ -631,13 +681,13 @@ class EngineGenMixin:
             return await self._send_prefill(model, torch.tensor([prompt_ids], dtype=torch.long),
                                             mm=mm, position_ids=position_ids,
                                             nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k,
-                                            slot=slot)
+                                            slot=slot, nt_pen=nt_pen)
         # -- resume: crop every stage to the shared prefix, prefill only the suffix -------------
         await self._crop(model, L, slot=slot)   # nulls the slot's record; in-order ahead of the suffix
         res = await self._send_prefill(model,
                                        torch.tensor([prompt_ids[L:]], dtype=torch.long),
                                        base=L, nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k,
-                                       slot=slot)
+                                       slot=slot, nt_pen=nt_pen)
         # #prefix-kv observability: without this line a reuse is invisible in telemetry (the
         # render-oom-guard lesson) — one activity line per HIT, with the tokens saved.
         with contextlib.suppress(Exception):
@@ -650,7 +700,7 @@ class EngineGenMixin:
                     all_logits: bool = False, mm=None, position_ids=None,
                     capture_hidden: bool = False, capture_pre_norm: bool = False,
                     ntensor: bool = False, nt_mode=None, nt_clip: int = 0, nt_k: int = 0,
-                    prefill_wait: bool = False, slot: int = 0):
+                    prefill_wait: bool = False, slot: int = 0, nt_pen=None):
         """Push one frame (token ids) through `model`'s pipeline and return last-stage
         logits — last position only, or every position when all_logits=True (verify).
         mm = (positions, embeds_tensor) (#22 inc 3): on a prefill (reset), a companion
@@ -682,12 +732,19 @@ class EngineGenMixin:
             nt_mode = None
         if nt_mode == "topk" and int(nt_k or 0) <= 0:
             nt_mode = None   # INFINITEMODEL_TOPK_WIRE=0 -> full row for sampled decode
+        # #ntpen: penalties are NOT optional — if they can't ride the wire the reply must be the
+        # full row so _decode_plain's legacy branch applies them here. Dropping just the
+        # directive and keeping the diet would return an unpenalised token.
+        if nt_pen is not None and (nt_mode is None or not self._wire_pen_ok(model)):
+            nt_mode = None
+            nt_pen = None
         if nt_mode is not None:
             ntensor = True   # the reduced reply rides the #ntensor-manifest frame
         # #wire-caps: never request the manifest from a chain that hasn't advertised it.
         if ntensor and not self._wire_ntensor_ok(model):
             ntensor = False
             nt_mode = None
+            nt_pen = None
         # #prefix-kv: a reset frame rebuilds every stage's KV from position 0 — whatever ids the
         # cross-request record claimed are gone the moment this dispatches. Null FIRST (before
         # any await can fail) so EVERY reset path (decode prefills, capture_thinker, MTP,
@@ -747,7 +804,15 @@ class EngineGenMixin:
                 # on #wire-caps above; old workers whitelist-read the header via hdr.get and
                 # ignore this key harmlessly — their legacy reply is always still accepted)
                 hdr["ntensor"] = True
-                if nt_mode is not None:   # #logits-diet: the reduction directive (gated above;
+                if nt_mode is not None and nt_pen is not None:
+                    # #ntpen: the penalised twin of the mode below (see wire.py 'ntpen' for why
+                    # this is a new mode NAME and not an extra key beside 'argmax').
+                    hdr["nt_mode"] = nt_mode + "pen"
+                    hdr["nt_clip"] = int(nt_clip or 0)
+                    hdr["nt_pen"] = nt_pen
+                    if nt_mode == "topk":
+                        hdr["nt_k"] = int(nt_k)
+                elif nt_mode is not None:   # #logits-diet: the reduction directive (gated above;
                     # intermediate stages re-propagate these keys hop-by-hop like capture_hidden)
                     hdr["nt_mode"] = nt_mode
                     hdr["nt_clip"] = int(nt_clip or 0)
@@ -799,7 +864,7 @@ class EngineGenMixin:
 
     async def _send_prefill(self, model: LoadedModel, x, mm=None, position_ids=None,
                             nt_mode=None, nt_clip: int = 0, nt_k: int = 0, base: int = 0,
-                            slot: int = 0):
+                            slot: int = 0, nt_pen=None):
         """#pipefill: prefill dispatcher. Eligible prompts (see _pipefill_chunk) are streamed
         through the pipeline as a BURST of chunk frames so the stages overlap; everything else
         falls through to the classic one-shot _send prefill, byte-identical to before.
@@ -859,7 +924,7 @@ class EngineGenMixin:
         if not cstep:
             return await self._send(model, x, base, base == 0, mm=mm, position_ids=position_ids,
                                     nt_mode=nt_mode, nt_clip=nt_clip, nt_k=nt_k,
-                                    prefill_wait=base > 0, slot=slot)
+                                    prefill_wait=base > 0, slot=slot, nt_pen=nt_pen)
         # -- chunked pipelined path ------------------------------------------------------------
         # #logits-diet gating for the LAST chunk mirrors _send's own downgrade ladder, so the
         # final reply keeps the exact same wire mode the one-shot prefill would have used.
@@ -867,6 +932,9 @@ class EngineGenMixin:
             nt_mode = None
         if nt_mode == "topk" and int(nt_k or 0) <= 0:
             nt_mode = None
+        if nt_pen is not None and (nt_mode is None or not self._wire_pen_ok(model)):
+            nt_mode = None      # #ntpen: same all-or-nothing ladder as _send's
+            nt_pen = None
         _diet_mid = self._wire_diet_ok(model)   # shrink DISCARDED intermediate replies to ~8 B
         if model.stage0_writer is None:
             await self._freshen_stage0(model, force=True)
@@ -888,8 +956,12 @@ class EngineGenMixin:
             if last:
                 if nt_mode is not None:   # the caller's reply directive rides the FINAL chunk
                     hdr["ntensor"] = True
-                    hdr["nt_mode"] = nt_mode
+                    # #ntpen: only the LAST chunk is sampled, so only it carries penalties —
+                    # the intermediate chunks' replies are discarded exhaust (argmax, 8 bytes).
+                    hdr["nt_mode"] = nt_mode + "pen" if nt_pen is not None else nt_mode
                     hdr["nt_clip"] = int(nt_clip or 0)
+                    if nt_pen is not None:
+                        hdr["nt_pen"] = nt_pen
                     if nt_mode == "topk":
                         hdr["nt_k"] = int(nt_k)
             elif _diet_mid:
@@ -1306,6 +1378,10 @@ class EngineGenMixin:
         _pen = (float(_sp.get("repeat_penalty") or 1.0) not in (0.0, 1.0)
                 or bool(_sp.get("presence_penalty")) or bool(_sp.get("frequency_penalty")))
         _hist: list[int] = []   # tokens emitted so far (the penalties' output window)
+        # #ntpen: rebuilt per frame (the output window grows with every token). Bound late —
+        # _pen_wire is decided below, after the tokenizer length is known.
+        def _pen_dir(out_ids):
+            return self._pen_directive(prompt_ids, out_ids, _sp) if _pen_wire else None
         # Empty prompt (a keep-warm/health probe whose text tokenizes to []) has nothing to
         # prefill: torch.tensor([[]]) is shape [1,0] and an empty forward crashes the worker's
         # tensor unpack. Short-circuit with zero generated tokens BEFORE any wire send.
@@ -1325,9 +1401,8 @@ class EngineGenMixin:
             ntok = len(model.tokenizer)
         except Exception:
             ntok = 0
-        # #logits-diet: pick the per-request reduced-reply mode ONCE. Penalties need
-        # arbitrary-id access to the full row (_penalized indexes any history id), so they keep
-        # the legacy full-row wire. Greedy is exactly argmax(row[:ntok]) -> ship ids only
+        # #logits-diet: pick the per-request reduced-reply mode ONCE. Greedy is exactly
+        # argmax(row[:ntok]) -> ship ids only
         # (bit-exact). Sampled -> top-K candidates (K=INFINITEMODEL_TOPK_WIRE, 0=off); the
         # controller then runs the SAME _sample over the K candidates and maps the draw through
         # the candidate ids (min_p keeps identical survivor sets — probability RATIOS are
@@ -1335,8 +1410,16 @@ class EngineGenMixin:
         # beyond-K tail mass — the documented, negligible-at-4096 truncation). _send downgrades
         # to the legacy row unless the whole chain advertises 'ntdiet' (and on TP), so every
         # consumer below also handles a plain-tensor reply.
+        # #ntpen: penalties USED to disable the diet outright — they need arbitrary-id access to
+        # the row, which only the head has. That made the diet dead code for the common case:
+        # every Ollama client sends repeat_penalty by DEFAULT, so nearly every real request paid
+        # a full ~300 KB vocab row per token (~2.6 ms on 1 GbE) to save a ~400-byte id window.
+        # Now the window goes to the head instead and the diet survives — but ONLY on a chain
+        # that advertises 'ntpen'; anywhere else _pen stays true and the legacy branch below
+        # penalises the full row exactly as before.
         _nt_mode, _nt_k = None, 0
-        if not _pen:
+        _pen_wire = self._wire_pen_ok(model) if _pen else False
+        if (not _pen) or _pen_wire:
             if not temperature or temperature <= 0:
                 _nt_mode = "argmax"
             else:
@@ -1360,10 +1443,12 @@ class EngineGenMixin:
             async with _pfl:
                 res = await self._prefill_reuse(model, prompt_ids, mm=mm,
                                                 position_ids=prefill_pos, nt_mode=_nt_mode,
-                                                nt_clip=ntok, nt_k=_nt_k, slot=slot)
+                                                nt_clip=ntok, nt_k=_nt_k, slot=slot,
+                                                nt_pen=_pen_dir([]))
         else:
             res = await self._prefill_reuse(model, prompt_ids, mm=mm, position_ids=prefill_pos,
-                                            nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k, slot=slot)
+                                            nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k, slot=slot,
+                                            nt_pen=_pen_dir([]))
         cur = len(prompt_ids)
         model.kv_pos = cur          # KV depth so far (prompt); climbs per decode token
         # #prefix-kv: publish the cross-request record — exactly the ids now in every stage's
@@ -1430,7 +1515,8 @@ class EngineGenMixin:
             try:
                 res = await self._send(model, torch.tensor([[tok_id]], dtype=torch.long), cur,
                                        False, position_ids=dpos,
-                                       nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k, slot=slot)
+                                       nt_mode=_nt_mode, nt_clip=ntok, nt_k=_nt_k, slot=slot,
+                                       nt_pen=_pen_dir(_hist))
             except BaseException:
                 # #prefix-kv: append state unknown mid-send (incl. CancelledError from a client
                 # drop / gen-stall reclaim / _ForwardSuperseded landing in this await) -> the

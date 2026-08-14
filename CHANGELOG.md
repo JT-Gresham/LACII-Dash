@@ -4,6 +4,52 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## 2026-08-13 (latest) — #ntpen: penalised requests keep the reduced wire
+
+### Changed
+
+- **#ntpen — `repeat_penalty` no longer disables `#logits-diet`.** The diet ships the head's
+  ANSWER (a greedy token id, or the top-K candidates) instead of the full ~304 KB vocab row, every
+  decoded token. But repetition penalties need arbitrary-id access to that row, and only the
+  controller had the token history — so `_decode_plain` simply turned the diet OFF whenever
+  `repeat_penalty` / `presence_penalty` / `frequency_penalty` was set. **Every Ollama client sends
+  `repeat_penalty` by default**, which made the diet dead code for the common case: the wire paid
+  ~304 KB/token to save an id window that is ~400 bytes.
+
+  The fix inverts it — the history window goes to the head, not the row to the controller. The
+  controller reduces the two windows to plain id lists (`rp_ids`; `fp_ids`+`fp_cnt`) and rides them
+  on the frame header; `shard_forward._diet_penalize` applies the exact same arithmetic as
+  `engine_gen._penalized` on the head's device, **before** the argmax/top-K. Penalising before the
+  top-K is load-bearing, not stylistic: penalties reorder the distribution, so a top-K taken from
+  the unpenalised row would be the wrong candidate *set*, not merely mis-scored.
+
+  Measured on `qwen2.5-1.5b-instruct` int4, one RTX 3060 (single-stage, so the head reply is the
+  only wire cost), 400-token greedy generations, conditions ALTERNATED within one run so fleet
+  drift cannot masquerade as the effect — **before: penalised 52.59 tok/s vs unpenalised 56.94, a
+  7.6% penalty for having penalties on** (ranges 52.09-53.30 and 56.02-57.82 — non-overlapping).
+  Directive size at the default `repeat_last_n=64` is **319 bytes of header vs 303,872 bytes of
+  bf16 row**; at `repeat_last_n=-1` (whole history) it is still only 23 KB on a 4096-token prompt.
+
+- **Mixed-version safety, three independent guards** — because unlike every other wire cap, this
+  one's failure mode is silent WRONG OUTPUT. A node that accepts the directive and ignores it
+  returns a perfectly well-formed top-K of the *unpenalised* row; nothing downstream can tell.
+  So: (1) the new `ntpen` cap, all-or-nothing across the chain, same doctrine as `ntdiet`;
+  (2) **new mode names** `argmaxpen`/`topkpen` rather than an extra key beside `argmax` — a
+  worker of `ntdiet` vintage gates on the mode string, so an unknown mode makes it reply the full
+  row, whereas an ignored extra key beside a *known* mode would have answered unpenalised. The
+  directive is also refused when `nt_pen` is missing, which is exactly what such a node's
+  intermediate stage does to it (it rebuilds the next-hop header from a hardcoded `nt_*` tuple);
+  (3) `shard._pen_capable`, for a stale `shard_forward.py` under a fresh `worker_net.py`. Every
+  one of those degrades to the full row, which the controller still accepts and penalises itself —
+  so the diet can only ever lose bandwidth, never correctness.
+
+- **Equivalence validated before deploy, not after.** `scratch_ntpen_test.py` compares the head-side
+  reduction against the controller's legacy `-inf`-mask + `_penalized` path over 720 adversarial
+  trials — fp32/bf16/fp16 x {512, 2048, 32000} vocab x {argmax, topk} — with planted ties, logits
+  straddling zero (where `repeat_penalty`'s divide/multiply branch flips) and a beyond-clip token
+  planted as the global max (the `#21` case the clip mask exists for). argmax must be bit-exact;
+  top-K must match the controller's penalised row elementwise. 720/720.
+
 ## 2026-08-13 (later) — #cuda-large-m, the ⚡ Optimized-settings button, perf-auto fixes
 
 ### Changed

@@ -332,14 +332,31 @@ class WorkerNetMixin:
                     # convergence doesn't — the head then replies full NT_LOGITS, which the
                     # controller ALWAYS still accepts as the downgrade path). capture frames
                     # keep full logits (speech/MTP consume the row + hidden).
+                    # #ntpen: 'argmaxpen'/'topkpen' are the SAME two reductions with the
+                    # request's repetition penalties (nt_pen) applied to the row first. They
+                    # are deliberately new MODE NAMES rather than an extra key beside
+                    # 'argmax'/'topk': a worker of ntdiet vintage gates on the mode string, so
+                    # an unknown one makes it reply the full row (correct, just fat), whereas an
+                    # ignored extra key would have answered a well-formed but UNPENALISED
+                    # top-K — silent wrong output. Refused unless the directive actually
+                    # arrived (an old INTERMEDIATE rebuilds the next-hop header from the
+                    # hardcoded nt_* tuple below and drops it) and this shard can apply it.
                     nt = None
                     _ntm = hdr.get("nt_mode")
+                    _ntp = hdr.get("nt_pen")
+                    _pen_mode = _ntm in ("argmaxpen", "topkpen")
+                    if _pen_mode and not (_ntp and getattr(shard, "_pen_capable", False)):
+                        _ntm = None       # -> full row; the controller penalises it itself
+                    elif _pen_mode:
+                        _ntm = _ntm[:-3]  # 'argmaxpen' -> 'argmax', 'topkpen' -> 'topk'
                     if (ntensor_req and _ntm in ("argmax", "topk") and shard.has_head
                             and _pack_ntensor is not None
                             and not capture_hidden and not capture_pre_norm
                             and getattr(shard, "_nt_capable", False)):
                         nt = {"mode": _ntm, "clip": int(hdr.get("nt_clip") or 0),
                               "k": int(hdr.get("nt_k") or 0)}
+                        if _pen_mode:
+                            nt["pen"] = _ntp
                         if _ntm == "topk" and nt["k"] <= 0:
                             nt = None   # k<=0 = diet off for sampled decode -> full row
                     # #prefill-progress: hand the frame's req_id to the shard so its per-layer
@@ -422,7 +439,7 @@ class WorkerNetMixin:
                             # this parser rebuilds the next-hop header, so an unforwarded key
                             # would die at the first intermediate stage and the head would fall
                             # back to a full-logits reply (safe, but no diet).
-                            for _dk in ("nt_mode", "nt_clip", "nt_k"):
+                            for _dk in ("nt_mode", "nt_clip", "nt_k", "nt_pen"):
                                 if hdr.get(_dk) is not None:
                                     ohdr[_dk] = hdr[_dk]
                         _tx = await self._send_next(model_id, ohdr, oraw)
