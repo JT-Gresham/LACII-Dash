@@ -4,6 +4,80 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## 2026-08-14 — w8a16: the int8 tier stops being an anti-speed tier
+
+### Added
+
+- **Triton w8a16 int8 GEMM + split-K GEMV (`worker_quant`).** int8 weight-only quant shipped as a
+  pure *memory* tier and was actively **anti-speed**: `QuantLinear.forward` did
+  `qweight.to(x.dtype) * scale` then `F.linear`, so one decode step read the int8 weight, **wrote a
+  full bf16 copy of it, and read that copy back** — roughly 2.5x the traffic of simply keeping the
+  weight in bf16. That is why the #8 investigation found int8 to be the quality-safe head quant and
+  still unusable: the kernel did not exist.
+
+  Measured end to end on om3nbox (gfx1151), Qwen2.5-7B, ctx 4096, distinct prompts per run so
+  `#prefix-kv` cannot fake a prefill number, first run discarded as Triton autotune:
+
+  | tier | decode | prefill |
+  |---|---|---|
+  | int8, no kernel *(before)* | 2.83 tok/s | — |
+  | **int8 + w8a16** | **25.00 tok/s** | **1180 tok/s** |
+  | int4 *(existing tier)* | 32.06 tok/s | 827 tok/s |
+
+  **8.8x on decode.** int8 went from unusable — ~11x slower than int4 on the same box — to
+  competitive with int4, while being far more accurate than it (#8 measured int8 at +0.0050 nats /
+  98.4% top-1 agreement, against int4's +0.0421 / 88.1%). The int8 tier is now a real choice
+  rather than a memory-only fallback. int8 prefill also came out **43% faster than int4's**, which
+  is a dequant-once+BLAS path already tuned for this box.
+
+  The int8 format makes the kernel both simpler and *more accurate* than its int4 twin: because
+  the scale is **per output row** it factors straight out of the K loop, so the inner loop is a
+  plain dot product and the scale is applied once after an fp32 accumulation. `w4a16` must
+  dequantize to bf16 *inside* its loop; this one never does. int8 values (|q| ≤ 127) are exactly
+  representable in bf16's 8 mantissa bits, so converting `q` to feed `tl.dot` loses nothing.
+
+  Split-K is what makes decode fast: at M=1 a `tl.dot` kernel launches only ~`cdiv(N,BN)` programs,
+  far too few to hide memory latency on an iGPU. Splitting K and atomic-adding fp32 partials grows
+  the grid ~SPLITKx. Scaling a *partial* is exact **only** because the scale is per-row —
+  `sum_i(acc_i·s) == s·sum_i(acc_i)`; a group-wise scale could not be hoisted this way.
+
+### Changed
+
+- **The kernel is gated per M-REGIME, not bound globally.** The first cut benchmarked M=1 and then
+  used the kernel at every M, quietly assuming the decode result carries to prefill. It does not:
+  at large M the GEMM is compute-bound and the naive path's one-off dequant amortizes over every
+  row, so dequant-once + a vendor BLAS can beat reading int8 inside a `tl.dot` — the same crossover
+  the int4 tier already handles with `_naive_m_min`. `prepare_fused` now benchmarks **both**
+  regimes (M=1 and M=256) and records `_w8_m_max`; the chosen scope is logged. On gfx1151 the
+  kernel wins both (`26.86x at decode, 1.71x at M=256 -> decode+prefill`), so nothing changes
+  there — but that is a measurement about one device, which is precisely why the gate exists.
+
+- **`prepare_fused` decides by BENCHMARK, not by self-check alone.** "Reads fewer bytes" does not
+  imply "faster": on a discrete NVIDIA card cuBLAS bf16 is fast enough that dequant-once can win,
+  which is how torch's own `_weight_int8pack_mm` measured 2-5x *slower* than bf16 `F.linear` on
+  CUDA. A device where the kernel loses keeps the naive path and says so in the log.
+
+- **`[int4-vram]` census label `QuantLinear4=` → `qlinears=`.** The counter is "any module with a
+  `qweight` buffer", so an int8 7B logged `QuantLinear4=197` on a shard holding exactly zero int4
+  linears. (197 = 28 layers x 7 + the `lm_head`, confirming int8 quantizes the head;
+  `qweight=6.58GB` is the int8 bytes, `bf16params=1.02GB` is the embedding, bf16 by design.)
+
+### Verification
+
+- `scratch_w8a16_test.py` on an RTX 3060: every shape passing at M ∈ {1,2,4,16,129,512} with rel
+  err ~0.0017 (bf16 output rounding — the reference is bf16 too) against
+  `F.linear(x, q.bf16 * scale)`. Shapes include Qwen2.5-7B's `lm_head` (152064x3584) and two
+  **deliberately unaligned** cases (1000x999, 17x130) whose dims are not multiples of any BN/BK in
+  the autotune space, so masking bugs cannot hide behind tidy dimensions. The GEMV is called four
+  times against a fixed reference — what a missing `reset_to_zero` would fail.
+- On the actual gfx1151 device at load: **zero self-check failures and zero fallbacks across all
+  197 quantized linears** of the 7B, kernel bound to all of them including the `lm_head`.
+- ⚠ `reset_to_zero` on the GEMV is load-bearing — it atomic-adds, so autotune's timing reruns
+  would otherwise accumulate into the same buffer and corrupt the first call per (N,K). The int4
+  twin shipped without it and the bug hid behind its load-time self-check absorbing the corrupted
+  launch. That is why this one self-checks at **M=1 and M=4**: the two kernels are different code
+  paths and an M=4-only check cannot see a broken decode path at all.
+
 ## 2026-08-13 (latest) — #8 int4 `lm_head` MEASURED AND REJECTED
 
 ### Not changed (deliberately)
