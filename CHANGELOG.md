@@ -4,6 +4,70 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## 2026-08-13 (latest) — #8 int4 `lm_head` MEASURED AND REJECTED
+
+### Not changed (deliberately)
+
+- **The `lm_head` stays bf16 on every quant tier.** #8 proposed packing it int4 on ROCm, where
+  decode is bandwidth-saturated (~140 GB/s measured) and the head is **1.02 GB of the ~4.6 GB read
+  per decoded token — 22%**. The speed case was sound and the implementation was small (the
+  `prepare_fused` sweep already covers `self.head`, so a `QuantLinear4` head picks up the shipped
+  Triton `_ksk` GEMV with no new kernel). It was built, measured, and **thrown away**, because the
+  quality cost is not affordable.
+
+  Measured on Qwen2.5-7B-Instruct (a real, untied head), 750 next-token predictions of held-out
+  prose, using the project's OWN `pack_linear_int4` round-tripped through `worker_quant`'s exact
+  `_dequant` convention:
+
+  | variant | ppl | ΔNLL | top-1 vs ref | KL |
+  |---|---|---|---|---|
+  | bf16 body + bf16 head (reference) | 10.72 | — | 100% | 0 |
+  | bf16 body + **int4 head** | 11.23 | +0.046 | 84.3% | 0.060 |
+  | int4 body + bf16 head (**today**) | 11.18 | +0.042 | 88.1% | 0.070 |
+  | int4 body + int4 head (proposal) | 11.63 | +0.081 | 80.5% | 0.124 |
+
+  **One head tensor costs as much as all 196 decoder tensors combined** — the head's marginal
+  ΔNLL (+0.0389) is **92.5% of the damage already shipped and accepted** (+0.0421), and it changes
+  **15.3% of greedy tokens**. The trade on offer was: double the total quantization damage to buy
+  16.2% decode. Declined.
+
+- **A narrower group does not rescue it.** Group size is nearly free in bandwidth terms (g128 →
+  g16 costs only 2.4 points of the win, 16.2% → 13.8%), so it was the obvious lever. Swept on the
+  same trunk: KL falls cleanly and monotonically (0.0599 → 0.0495 → 0.0424 → **0.0241** at g16) and
+  top-1 agreement rises (84.7% → 90.9%), but even g16 still flips ~9% of greedy tokens at ~+0.042
+  nats — still comparable to the entire body. ⚠ **ΔNLL is NOT monotonic across the sweep** (g64
+  worse than g128, g16 worse than g32): at 750 predictions the per-variant NLL is too noisy to rank
+  group sizes against each other. KL and top-1 agreement are per-token paired and far less noisy —
+  read those columns, not ΔNLL, for the trend.
+
+- **int8 is the quality-safe head quant and is a SPEED PESSIMIZATION here.** Per-row int8 costs
+  only **+0.0050 nats** with **98.4%** top-1 agreement (KL 0.0023 — ~25x less damage than
+  int4-g128). But `QuantLinear.forward` materializes the full bf16 weight every call, so an int8
+  head reads 0.55 GB and then writes+reads 1.09 GB: strictly worse than leaving it bf16. There is
+  no w8a16 kernel in the tree, only w4a16.
+
+  **This is the real opportunity, and it needs a kernel, not a config change:** a w8a16 Triton
+  GEMV would make the head 0.51 GB (an ~11% decode win on gfx1151) at a quality cost of +0.005
+  nats — essentially free. That is the shape #8 should take if it is ever revisited.
+
+### Added
+
+- **`scratch_head_int4_quality.py`** — the gate this needed, kept because the question recurs.
+  Compares bf16/int4 body × bf16/int4 head over real text and reports NLL, perplexity, greedy
+  agreement and KL, framed against the body's already-accepted damage so the number is judgeable
+  rather than arbitrary. `--sweep` walks group sizes, `--sweep-only` does it on one trunk pass,
+  and `--werr` is a seconds-long weights-only screen (per-tensor round-trip error, kurtosis,
+  max/p99.9) needing no model execution. Runs on CPU on any worker venv.
+
+  ⚠ **The `--werr` screen predicted the OPPOSITE of the truth, and that is the durable lesson.**
+  The 7B head round-trips at 0.1189 mean relative error — squarely inside the body's 0.1097-0.1303
+  band, with *lower* kurtosis (13.9) than `L0.gate_proj` (131). By weight statistics it is an
+  ordinary tensor. Yet it alone does as much damage as the whole body. The reason is structural:
+  body errors pass through later layers, residual adds and RMS norms that partially cancel and
+  re-normalise them, while the head's error lands directly in the logits with nothing downstream.
+  **Position in the network dominates weight statistics** — "this tensor quantizes like the others"
+  is not evidence that quantizing it is safe. (The router-gate exclusion is the same lesson.)
+
 ## 2026-08-13 (latest) — #ntpen: penalised requests keep the reduced wire
 
 ### Changed
