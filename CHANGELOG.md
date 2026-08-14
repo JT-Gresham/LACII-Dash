@@ -4,6 +4,69 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## 2026-08-14 (later) — `#head-quant`: an int4 body with an int8 head
+
+### Added
+
+- **`POST /load?head_quant=int8`** — sets the `lm_head`'s precision independently of the body.
+  This is the trade #8 identified but could not take. On Qwen2.5-7B the head is **22% of
+  everything read per decoded token** — the largest single tensor per token — and #8 measured
+  int4 on it at +0.0389 nats / 84.7% top-1 (**92.5% of the damage the whole int4 body does**,
+  rejected) against int8 at **+0.0050 nats / 98.4% top-1**, roughly 8x cheaper than the body's own
+  cost. int8 was the right answer and was unusable until the w8a16 kernel existed.
+
+  Measured on om3nbox (gfx1151), Qwen2.5-7B, ctx 4096, first run discarded as Triton autotune:
+
+  | load | decode | prefill | VRAM |
+  |---|---|---|---|
+  | `quant=int4` | 32.06 tok/s | 827 tok/s | 5.37 GB |
+  | `quant=int4&head_quant=int8` | **35.22 tok/s** | 833 tok/s | **4.87 GB** |
+
+  **+9.9% decode** — matching the byte arithmetic (4.60 → 4.09 GB/token) almost exactly — with
+  **prefill unchanged** and **0.5 GB less VRAM**. The census moves exactly as it should:
+  `qlinears` 196 → 197, `qweight` 3.04 → 3.55 GB (+0.51 int8 head), `bf16params` 2.03 → 1.02 GB
+  (only the embedding left in bf16).
+
+  Plumbed like `#moe-offload` (`/load` → `engine.load` → `_load_impl` → install directive →
+  `worker_load` → `Shard._head_quant`), including through `replicate()` so two copies of one model
+  cannot answer with different head precision depending on routing, and through the `#load-faster`
+  re-place snapshot so a rebuild does not silently drop it.
+
+  Applied in `client._finalize_placement` rather than at build time: that is after final device
+  placement and before both the CPU-linear wrapper and the `prepare_fused` sweep, so the new
+  `QuantLinear` is never wrapped as a native Linear, the sweep binds w8a16 automatically, and
+  **cold loads and serve-from-cache loads take the identical path** — no cache format change, no
+  manifest change, no new packed tier on disk. The head is quantized **on CPU** whatever its final
+  device (the intermediates are a couple of GB for a 152k-row head — enough to OOM a tight GPU at
+  the end of a load, for a result half the size of its input), which also frees the bf16 copy's
+  VRAM as a side effect. The planner budgeted a bf16 head, so a packed head uses *less* than
+  reserved — the safe direction, no placement change needed.
+
+- **Four refusals instead of silent no-ops**, each a case where the flag would otherwise look like
+  it worked: head on **CPU** (the kernel is GPU-only, and on CPU an int8 head is *slower* than
+  bf16 — quantizing there is a pessimization); **tied embeddings** (`#tied-dedup` already points
+  `head.weight` at `embed_tokens.weight`, so packing adds a copy rather than replacing one); head
+  **already packed** by the int8 tier; and `head_quant=int4`, which raises citing the measurement.
+  Any failure leaves the head exactly as built — a head pack must never cost a load.
+
+- **`perf_profile` advises it, and deliberately never applies it.** This is the one knob in the
+  resolver that changes *output*, so it stays an explicit operator choice; the rationale line
+  carries the measured numbers and says why it was not taken automatically. The not-applicable
+  branches name the specific reason (tied / not int4 body / no GPU).
+
+### Fixed
+
+- **`#load-faster` silently dropped `moe_offload` on re-place.** Found while copying the snapshot
+  pattern: the snapshot READ `getattr(m, "moe_offload", False)`, but `moe_offload` is not a
+  `LoadedModel` field and nothing ever assigned it — so the read always returned `False` and a
+  re-placed MoE model lost its expert-offload split. Both `moe_offload` and `head_quant` are now
+  recorded on the instance at construction.
+
+- **`[head-quant] FAILED (NameError: name 'torch' is not defined')`** — caught live on the first
+  deploy. `client.py` has no module-level `torch` in that scope; `Shard` carries `self.torch`. The
+  load completed correctly with a bf16 head, which is the guard doing its job, but the feature was
+  a silent no-op until fixed.
+
 ## 2026-08-14 — w8a16: the int8 tier stops being an anti-speed tier
 
 ### Added

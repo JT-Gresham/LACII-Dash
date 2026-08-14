@@ -226,6 +226,28 @@ def resolve(*,
     else:
         take("moe_offload", False, "dense model — no expert tier to offload")
 
+    # ---- 4b. lm_head precision (#head-quant) ----------------------------------------------
+    # ADVICE ONLY, never applied: this is the one knob here that changes OUTPUT, so it stays an
+    # explicit operator choice. The case for it is measured, not theoretical — on Qwen2.5-7B the
+    # head is 22% of everything read per decoded token, and:
+    #     int4 head  +0.0389 nats, 84.7% top-1  -> 92.5% of the damage the whole int4 body does.
+    #                                              REJECTED; head_quant refuses this value.
+    #     int8 head  +0.0050 nats, 98.4% top-1  -> ~8x cheaper than the body's own cost.
+    # With the w8a16 kernel an int8 head measured +9.9% decode on gfx1151 (32.06 -> 35.22 tok/s)
+    # with prefill unchanged and 0.5 GB LESS VRAM. Only worth suggesting where it can actually
+    # pay: the head must be GPU-resident (the kernel is GPU-only; on CPU an int8 head is SLOWER
+    # than bf16), the body must not already be int8, and a tied head is not a separate matrix.
+    if quant in ("int4", "int2") and gpu and not tie_word_embeddings:
+        take("head_quant", "",
+             "int8 lm_head is available and measured +9.9% decode for +0.0050 nats (98.4% top-1) "
+             "— NOT applied automatically because it changes output; pass head_quant=int8 to take it")
+    else:
+        take("head_quant", "",
+             "int8 lm_head not applicable here (" + (
+                 "tied embeddings — the head aliases embed_tokens" if tie_word_embeddings else
+                 "body is not int4/int2" if quant not in ("int4", "int2") else
+                 "no GPU — an int8 head is slower than bf16 on CPU") + ")")
+
     # ---- 5. speculative decoding ----------------------------------------------------------
     # Only a win when BOTH the verifier and the draft are GPU-resident; a CPU-resident draft makes
     # every verify round wait on the slow path and loses to plain decode. MoE decode is already
