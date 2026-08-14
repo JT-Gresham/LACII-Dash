@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.11"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.12"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -76,7 +76,10 @@ GB = 1024 ** 3
 # [load]/[+]/[!]/[load] FAILED lines pick this up automatically.
 import builtins as _builtins
 def print(*args, **kwargs):  # noqa: A001 — intentional builtin shadow for timestamping
-    _builtins.print(time.strftime("[%Y-%m-%d %H:%M:%S]"), *args, **kwargs)
+    # #utc-logs: UTC, not local. Every node stamped its own timezone, so GET /logs across the
+    # fleet returned streams hours apart (the .45 LXCs run local, om3nbox runs UTC) and a
+    # cross-node correlation read as stale logging. The trailing Z marks the change.
+    _builtins.print(time.strftime("[%Y-%m-%d %H:%M:%SZ]", time.gmtime()), *args, **kwargs)
 
 
 # --- Self-update: poll GitHub for a newer server.py; when idle (no model loaded),

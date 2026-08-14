@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.21"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.22"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -78,7 +78,10 @@ NET = {"in": 0, "out": 0}
 # it up automatically.
 import builtins as _builtins
 def print(*args, **kwargs):  # noqa: A001 — intentional builtin shadow for timestamping
-    _builtins.print(time.strftime("[%Y-%m-%d %H:%M:%S]"), *args, **kwargs)
+    # #utc-logs: UTC, not local. Every node stamped its own timezone, so GET /logs across the
+    # fleet returned streams hours apart (the .45 LXCs run local, om3nbox runs UTC) and a
+    # cross-node correlation read as stale logging. The trailing Z marks the change.
+    _builtins.print(time.strftime("[%Y-%m-%d %H:%M:%SZ]", time.gmtime()), *args, **kwargs)
 
 
 # code-split Inc 7: memory/GC helpers (_release_vram/_release_ram/_flush_os_cache/

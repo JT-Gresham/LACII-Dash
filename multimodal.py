@@ -416,7 +416,7 @@ def _vlog(msg: str) -> None:
     the controller (uncatchable native fault), so console prints are lost on restart. Append
     each phase to a file FIRST (flush+fsync) so /vision_log can report the last step reached
     AFTER the relaunch — pinpointing exactly which op killed the process."""
-    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    line = f"[{time.strftime('%H:%M:%SZ', time.gmtime())}] {msg}"   # #utc-logs
     print(line, flush=True)
     with contextlib.suppress(Exception):
         with open(_VISION_LOG, "a", encoding="utf-8") as fh:

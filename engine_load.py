@@ -658,8 +658,13 @@ class EngineLoadMixin:
             # planning, no lm_head). Branch BEFORE plan_pipeline; the slim loader keys self.models
             # the same way this path does (reg_key).
             if getattr(spec, "is_embedding", False):
+                # #embed-pin: the placement constraints must ride along. This branch happens BEFORE
+                # the node-filtering loop the pipeline path uses, so anything not passed here is
+                # silently dropped — which is exactly what happened to pin_host.
                 return await self._load_embedding_locked(friendly, target_id, spec, reg_key,
-                                                         replica_idx=replica_idx)
+                                                         replica_idx=replica_idx,
+                                                         pin_host=pin_host,
+                                                         exclude_nodes=exclude_nodes)
             # (previous pipeline connections are torn down by _unload_locked below,
             # which closes every loaded model's stage0_writer before we re-plan.)
             # controller is the model source: download the full model once so the
@@ -1641,7 +1646,8 @@ class EngineLoadMixin:
 
     async def _load_embedding_locked(self, friendly: str, target_id: str, spec: ModelSpec,
                                      reg_key: Optional[str] = None,
-                                     replica_idx: int = 0) -> LoadedModel:
+                                     replica_idx: int = 0, pin_host: str = "",
+                                     exclude_nodes: Optional[set] = None) -> LoadedModel:
         """Slim sibling of load(): an ENCODER (sentence-embedding) model loads WHOLE onto ONE
         capable node (no pipeline/TP/KV planning, no lm_head). Mirrors load()'s control-send +
         pending_load future + stage0_writer mechanism, and stores a minimal single-stage
@@ -1657,10 +1663,34 @@ class EngineLoadMixin:
             await self._unload_model_locked(reg_key, "reload (embedding)")
             await self._await_free_refresh()
         # Pick ONE capable node: prefer a GPU+can_infer node, else any can_infer node.
+        # #embed-pin: this used to be a bare `alive_sorted()[0] with a GPU`, which silently ignored
+        # every placement constraint the pipeline path honours. Being a simpler loader does not make
+        # those constraints optional — each omission was a real defect:
+        #   * pin_host  — a /load?node=X went wherever sorted first (seen live: node=work -> amdcomp).
+        #   * exclude_nodes — two replicas of one embedder would land on the SAME node, so the
+        #     "disjoint copies" contract that makes replicas add a concurrent slot silently failed.
+        #   * peer claims — double-booking a node another controller already owns is the exact
+        #     double-reservation that OOMs it (#federation Phase 5).
+        # A pin that CANNOT be honoured now raises instead of quietly placing elsewhere: silently
+        # ignoring an explicit instruction is worse than failing it, because nothing downstream
+        # reveals that the pin did not take.
         alive = [n for n in registry.alive_sorted() if n.can_infer]
         if not alive:
             raise RuntimeError("no capable worker nodes connected for the embedding model")
-        node = next((n for n in alive if n.eff_vram_gb > 0), None) or alive[0]
+        cands = [n for n in alive if not _peer_claimed_host(n.hostname)]
+        if exclude_nodes:
+            cands = [n for n in cands if n.node_id not in exclude_nodes]
+        if pin_host:
+            _pinned = [n for n in cands if n.hostname == pin_host]
+            if not _pinned:
+                raise RuntimeError(
+                    f"embedding model pinned to '{pin_host}', which is not an available "
+                    f"inference node (candidates: {', '.join(n.hostname for n in cands) or 'none'})")
+            cands = _pinned
+        if not cands:
+            raise RuntimeError("no capable worker node available for the embedding model after "
+                               "peer-claim/replica filtering")
+        node = next((n for n in cands if n.eff_vram_gb > 0), None) or cands[0]
         log_activity(f"load {friendly}: embedding (single node {node.hostname})")
         self.loadings[reg_key] = {"model": friendly, "display_model": _ollama_name(friendly),
                         "target": target_id, "total": 1, "ready": 0,
