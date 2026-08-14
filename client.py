@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.20"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.21"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -796,6 +796,7 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
         _hq = (getattr(self, "_head_quant", "") or "").strip().lower()
         if _hq and self.has_head and self.head is not None:
             try:
+                torch = self.torch     # client.py has no module-level `torch` in this scope
                 _tied = bool(getattr(self.cfg, "tie_word_embeddings", False))
                 if _hq not in ("int8", "bf16"):
                     # int4 is DELIBERATELY not offered here — see the measurement above. Refusing
