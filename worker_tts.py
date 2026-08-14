@@ -137,6 +137,16 @@ class KokoroPipeline:
         want = str(device or "")
         if not want or "gpu" in want:
             want = "cuda" if torch.cuda.is_available() else "cpu"
+        # INFINITEMODEL_TTS_CPU=1 forces CPU, matching INFINITEMODEL_STT_CPU and
+        # INFINITEMODEL_T2MUSIC_CPU. This leaf was the only one of the three without the
+        # lever, and it is the one that most needs it: on gfx1151 the GPU path hits the
+        # MIOpen LSTM-dropout compile bug, so it builds, fails, and falls back to CPU
+        # anyway — the env var just skips a doomed attempt. Where the fallback does NOT
+        # fire, GPU Kokoro can still be the slower placement on an APU, and without this
+        # there was no way to say so without editing the unit.
+        if want.startswith("cuda") and os.environ.get("INFINITEMODEL_TTS_CPU") == "1":
+            print("[tts] INFINITEMODEL_TTS_CPU=1 — forcing Kokoro onto CPU", flush=True)
+            want = "cpu"
         # Build on the requested device, then a tiny warmup synth. If the GPU path
         # raises a HIP/MIOpen kernel-COMPILE error (gfx1151 LSTM-dropout bug), fall
         # back to CPU transparently — the model is tiny, correctness > speed.

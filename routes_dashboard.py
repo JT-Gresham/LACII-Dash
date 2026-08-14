@@ -591,9 +591,47 @@ def register(app):
 
     @app.get("/gpudiag")             # per-process GPU usage on the CONTROLLER host (this box)
     async def gpudiag() -> JSONResponse:
-        """Run nvidia-smi locally and return which PROCESSES hold this GPU. The controller
-        runs on a GPU node (beast), so this distinguishes InfiniteModel's own worker python
-        from other tenants (Ollama, other inference) when the GPU looks unexpectedly full."""
+        """Return which PROCESSES hold this box's GPU, so an unexpectedly-full GPU can be
+        attributed to InfiniteModel's own worker python vs another tenant (Ollama, a render).
+
+        nvidia-smi first, then rocm-smi. AMD is not a nicety here: om3nbox is a controller on
+        a Strix Halo APU where GPU and system RAM are ONE pool, so "who is holding the GPU" is
+        the question that box raises most often — and it was the one box where this endpoint
+        returned nothing but a FileNotFoundError."""
+        def _rocm_diag(out):
+            """rocm-smi fallback. Located the same way worker_hw._rocm_gpu_util does — the
+            TheRock wheels install the CLI INSIDE the venv, so it is on sys.prefix/bin and NOT
+            on a non-login shell's PATH; `shutil.which` alone finds nothing."""
+            import os, re, shutil, subprocess, sys
+            exe = shutil.which("rocm-smi") or os.path.join(sys.prefix, "bin", "rocm-smi")
+            if not exe or not os.path.exists(exe):
+                return False
+            # --csv keeps this parse honest: header + one row per card, bytes not MiB.
+            g = subprocess.run([exe, "--showmeminfo", "vram", "--showuse", "--csv"],
+                               capture_output=True, text=True, timeout=15).stdout
+            rows = [r for r in (l.strip() for l in g.splitlines()) if r and not r.startswith("device,")]
+            if rows:
+                f = rows[0].split(",")
+                if len(f) >= 4:
+                    try:      # report MiB so the shape matches the nvidia-smi branch exactly
+                        out["gpu"] = (f"{int(f[3]) // (1024 * 1024)}, "
+                                      f"{int(f[2]) // (1024 * 1024)}, {f[1].strip()}")
+                    except (ValueError, IndexError):
+                        out["gpu"] = rows[0]
+            p = subprocess.run([exe, "--showpids"], capture_output=True, text=True, timeout=15).stdout
+            procs = []
+            for line in p.splitlines():
+                # "819532  python  0  0  0  UNKNOWN" — a data row starts with a bare PID.
+                m = re.match(r"^\s*(\d+)\s+(\S+)\s+\S+\s+(\S+)", line)
+                if m:
+                    procs.append({"pid": m.group(1), "name": m.group(2), "used_mib": m.group(3)})
+            out["processes"] = procs
+            out["backend"] = "rocm-smi"
+            if procs and all(x["used_mib"] in ("0", "UNKNOWN", "N/A") for x in procs):
+                out["note"] = ("per-process VRAM reads 0/UNKNOWN via rocm-smi on an APU — GPU and "
+                               "system RAM are one pool, so only the GPU total is meaningful here")
+            return True
+
         def _run():
             import subprocess
             out = {"host": platform.node()}
@@ -620,7 +658,16 @@ def register(app):
                 if procs and all(_mib(x) < 0 for x in procs):
                     out["note"] = ("per-process VRAM is [N/A] on Windows/WDDM — "
                                    "PIDs/names listed, but only the GPU total is exact")
+                out["backend"] = "nvidia-smi"
             except Exception as exc:
+                # No nvidia-smi (the usual case on an AMD box: FileNotFoundError) — try ROCm
+                # before reporting failure. Only surface the nvidia error if BOTH are absent,
+                # and keep it as `error` so an all-AMD host still reads as a clean answer.
+                try:
+                    if _rocm_diag(out):
+                        return out
+                except Exception as rexc:
+                    out["rocm_error"] = f"{type(rexc).__name__}: {rexc}"
                 out["error"] = f"{type(exc).__name__}: {exc}"
             return out
         return JSONResponse(await asyncio.to_thread(_run))
