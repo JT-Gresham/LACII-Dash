@@ -36,13 +36,33 @@ Not a code change — controller-host configuration, recorded here because it ch
   verbatim — and each file carries a header saying why. When retiring a source, grep the backups,
   not just the live file.
 
-### Noted, not fixed
+### Fixed — `switch()` destroyed before it validated
 
-- `switch()` **destroys before it validates**: it stops `im-controller`, unmounts, and rewrites
-  `/etc/fstab` *before* it knows the new mount works, so a failure leaves fstab pointing at a dead
-  source — and that survives a reboot. The same destroy-before-validate shape as the `#embed-pin`
-  bug fixed earlier today. Much less dangerous now that beast is the only reachable target, but it
-  should be fixed if that function is touched again.
+Recorded first as "noted, not fixed", then fixed in the same session once the failure was
+demonstrated rather than merely suspected.
+
+`switch()` stopped `im-controller`, unmounted, and rewrote `/etc/fstab` **before** it knew the new
+mount worked. A failure therefore left fstab pointing at a source that does not work — and that
+**survives a reboot**, so the box comes back with no models. Same destroy-before-validate shape as
+the `#embed-pin` bug fixed earlier today: *a path that previously could not fail acquires a new
+failure mode, and nobody re-checks what it already tore down.*
+
+Now: a **read-only probe-mount at a scratch path** confirms the source both mounts *and* is
+non-empty before anything is touched, and `/etc/fstab` is snapshotted so a late `mount` failure
+**rolls back and restarts the controller** instead of leaving the box wedged. Probe options are
+deliberately not the fstab options — `soft` with a 5 s `timeo` so a dead server fails the probe in
+seconds rather than hanging forever on `hard`, and `_netdev`/`nofail` are fstab-only.
+
+Verified in a sandbox that stubs `mount`/`umount`/`mountpoint`/`systemctl` and redirects fstab and
+the mountpoint into a temp dir, so the destructive paths run without touching a real box —
+**16/16 assertions across four scenarios**: happy path, source unreachable, source mounts but is
+empty, and mount fails late. The two failure cases assert the property the old code violated:
+fstab byte-identical and the controller never stopped.
+
+A differential run of the *same* harness against the previous version is what justified the
+change — on a late mount failure it leaves `fstab: MODIFIED` and `service: LEFT STOPPED`, where
+the new one reports `fstab: INTACT (rolled back)` and `service: restarted`. The live switch was
+**not** executed on the controller; only the read-only `status` path was run there.
 
 ### Verification
 
