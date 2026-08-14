@@ -52,10 +52,33 @@ first request, with several GB already resident on the wrong node.
   an old worker → refused*, and *unknown node → legacy path* (the conservative answer).
 - Full `py_compile` sweep plus `node --check` on all six embedded dashboard script blocks.
 
-Not yet exercised end-to-end against live hardware: beast is the one node carrying the whole
-Kokoro stack (`kokoro`/`misaki`/`espeakng_loader`/`soundfile` all present; amdcomp has `diffusers`
-for t2i but not Kokoro), and workers only re-advertise capabilities on restart, which is why
-`client.py` is bumped.
+### Verified live on the fleet
+
+Deployed and exercised end-to-end on the `.45` pool (controller 0.3.15, 11 workers 0.3.23):
+
+- capabilities converged — `mediab64` on **11/11** workers, `can_t2i` on amdcomp + beast,
+  `can_tts` on beast (the only node carrying the whole Kokoro stack; amdcomp has `diffusers`
+  for t2i but not Kokoro).
+- `POST /load?model=kokoro` → `kokoro READY (tts/kokoro, beast, cuda)`, placed on a **remote**
+  node. That exact request previously failed outright with *"no controller-co-located worker"*.
+- `POST /v1/audio/speech` → HTTP 200, **558 044 bytes**, a valid 24 kHz mono 16-bit PCM WAV of
+  **11.62 s**, returned as base64 over the control link with no shared filesystem anywhere in
+  the path.
+
+⚠️ **t2i's remote path is implemented but not yet exercised on hardware.** It shares the placement
+gate and the result transport with tts (both verified above), but its *weights* bridge — the
+`transformer/`-subdir probe that decides whether to `snapshot_download` — is specific to t2i and
+untested. The only registered t2i model is `qwen-image` at ~54 GB, so testing it is a real load,
+not a quick check.
+
+### Deploy note
+
+Plain `POST /update` restarted the controller **on old code**: at that moment `raw.githubusercontent`
+had propagated `wire.py` and `client.py` but not yet `server.py`, and the CDN lag is **per file**.
+The symptom is quiet — the controller comes back healthy at the old version, with
+`/code_manifest?grep=` showing `grep_hit: false` and an unchanged mtime. Poll the marker on
+**every** file being deployed, not a representative one, and use `?hitless=1` for controller-side
+changes (plain `/update` is the worker path).
 
 ## 2026-08-14 — infrastructure: mini05 retired as a models source (beast only)
 
