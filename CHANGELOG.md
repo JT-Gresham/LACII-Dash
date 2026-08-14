@@ -4,6 +4,65 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## 2026-08-13 (later) — #cuda-large-m, the ⚡ Optimized-settings button, perf-auto fixes
+
+### Changed
+
+- **#cuda-large-m — CUDA int4 stopped running a batch-1 kernel at prefill.** `prepare_fused` set
+  `_naive_m_min` only on the ROCm branch and freed `qweight` on CUDA the moment the fused pack was
+  built, so `_dequant` — and with it the whole dequant-once+cuBLAS fall-through — was
+  **structurally unreachable at any M**. ROCm measured that the fused kernel loses at prefill row
+  counts and shipped a fallback; CUDA never made the comparison possible. Measured on an RTX 3060
+  (sm86, 2 MB L2 chosen so a 32 MB weight cannot sit in cache and report bandwidth it never paid
+  for), M=2048, real Qwen2.5-7B shapes, **with the int4 packing verified against the naive dequant
+  to rel=0.0025 before any timing was taken**: q/o 8.51→3.16 ms (2.69x), k/v 1.18→0.47 (2.54x),
+  gate/up 44.42→16.21 (2.74x), down 45.96→15.92 (2.89x) — ≈154 ms/layer fused vs ≈56 ms naive,
+  **~2.8 s per 2048-token prefill chunk** across 28 layers. Keeping `qweight` costs the packed bytes
+  a second time (mat2 is the same size and its interleaved layout has no `_dequant`), so the
+  **worker decides per-linear from its own `mem_get_info`**: retain while the device has room for 2x
+  the tensor plus 1 GB slack, stop when it does not. A partially-armed shard is fine and strictly
+  better than all-or-nothing. `IM_KEEP_QWEIGHT=1/0` forces it. Decode untouched (`_m_bucket(1)==1`
+  can never reach the threshold); numerics unchanged (the fall-through *is* the self-check's own
+  reference path). Verified live: `fallback ARMED (naive at row-bucket>=512)`, `qweight=0.61GB`.
+
+### Added
+
+- **"⚡ Optimized settings" in the Load screen** + a visible **KV slots** control (the dialog had
+  none, so the knob measured to matter most for conversational traffic could only be set by editing
+  a URL). New `GET /optimize_knobs` is a pure dry-run — it resolves nothing on the engine and loads
+  nothing — returning the recommended knobs **plus the reason for each**; the button fills the form,
+  prints a `changed: X → Y` summary and the full rationale, and stops there so the operator can
+  override anything before pressing Load. Showing the reasons is the design point: several right
+  answers are counter-intuitive and only defensible by measurement.
+
+### Fixed
+
+- **perf-auto no longer fails silently.** The resolver was wrapped in `contextlib.suppress`, which
+  made "it threw" indistinguishable from "it decided nothing" — and cost two deploy cycles to
+  notice. Now a loud `try/except` with an activity line, plus an else-branch explaining a skip.
+  This is what surfaced the `ModuleNotFoundError` below.
+- **perf-auto sized `kv_slots` against the wrong node.** It picked the roomiest node in the fleet
+  even for a pinned load (observed: a `work`-pinned load sized against `amdcomp`). It fit by luck,
+  but could fund `C x` full-ctx KV the target cannot hold — exactly the CPU spill the conservative
+  sizing exists to prevent. Now filters candidates by `pin_host`.
+- **perf-auto called MoE models dense.** It read `spec.is_moe`; `ModelSpec` has no such field, so
+  `getattr(..., False)` turned "cannot tell" into a confident wrong claim (`qwen3.6-35b-a3b` was
+  reported as "dense model — no expert tier to offload"). MoE-ness is only established worker-side,
+  so it is now **inferred** via `perf_profile.looks_moe()` from measured-vs-dense per-layer bytes,
+  and "not downloaded" is documented as *unknown*, not dense.
+
+### Operational notes learned the hard way
+
+- **Adding a file to `EXTRA_UPDATE_FILES` needs TWO `/update`s.** The update runs the *old*
+  `server.py`, whose manifest predates the new module — om3nbox failed with
+  `ModuleNotFoundError: No module named 'perf_profile'` until a second update.
+- **Worker-side changes need an explicit `POST /restart_node`.** `/update` reports
+  `worker_restart: false` (VERSION-gated): workers fetch the file but keep running old code.
+- **`POST /update` unloads every resident model and `/api/embed` does NOT autoload** — reload
+  embedding models by hand afterwards or dependent services take 503s.
+- **Never benchmark the first generation after a ROCm int4 load** — Triton autotune measured
+  5.68 tok/s against a 33 tok/s steady state.
+
 ## 2026-08-13 — #honest-durations, #prefix-min-128, #perf-auto, #large-m-descend
 
 A measurement-driven performance pass. Its most useful output was **negative**: three
