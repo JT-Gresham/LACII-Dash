@@ -97,6 +97,44 @@ _FUSED_INT2 = (os.environ.get("IM_FUSED_INT2", "1") != "0")
 _LARGE_M_NAIVE = (os.environ.get("IM_LARGE_M_NAIVE", "1") != "0")
 
 
+def _keep_qweight_for_prefill(mod=None, dev=None) -> bool:
+    """#cuda-large-m: retain the int4 source weight on CUDA so the prefill fallback exists at all.
+
+    torch tinygemm is a batch-1 kernel and loses ~2.7x to dequant-once+cuBLAS at prefill row counts
+    (measured, see prepare_fused), but the CUDA path frees qweight the moment the fused pack is
+    built, which makes _dequant — and therefore the whole naive fall-through — unreachable at any M.
+
+    Retaining it costs the packed bytes a SECOND time (mat2 is the same size, and its interleaved
+    layout has no _dequant, so there is no cheaper source). Rather than force that on every card or
+    require the controller to plumb an env var into an already-running worker, the WORKER decides
+    per-linear from what it can actually see: keep the source while this device still has room for
+    it plus a healthy reserve, stop when it does not. A partially-armed shard is fine and strictly
+    better than all-or-nothing — every layer that kept its qweight takes the fast prefill path, and
+    the rest behave exactly as before.
+
+    IM_KEEP_QWEIGHT forces the answer either way (1/on = always keep, 0/off = never), for operators
+    who would rather spend the VRAM deliberately or not at all.
+    """
+    env = os.environ.get("IM_KEEP_QWEIGHT", "").strip().lower()
+    if env in ("1", "on", "true", "yes"):
+        return True
+    if env in ("0", "off", "false", "no"):
+        return False
+    if mod is None or dev is None or getattr(dev, "type", "") != "cuda":
+        return False
+    try:
+        import torch
+        need = mod.qweight.numel() * mod.qweight.element_size()
+        free, _total = torch.cuda.mem_get_info(dev)
+        # + the allocator's vacant pool: a new alloc reuses it even though the driver counts it used
+        free += max(0, int(torch.cuda.memory_reserved(dev)) - int(torch.cuda.memory_allocated(dev)))
+        # 2x the tensor plus 1 GB of slack — the shard is still streaming in, so later layers (and
+        # their own KV reservation) must not be squeezed out by a prefill optimisation.
+        return free > need * 2 + (1 << 30)
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # CPU matmul acceleration (fp32 GEMM + thread tuning).
 #
@@ -532,6 +570,33 @@ def _quant4_linear_cls():
                     rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
                     if rel < 0.05:
                         self._fused = (mat2, sz, op, in_pad)
+                        # #cuda-large-m (2026-08-13): torch tinygemm is a BATCH-1 kernel. At prefill
+                        # row counts it loses badly to "dequant the weight ONCE + one cuBLAS bf16
+                        # GEMM" — measured on an RTX 3060 (sm86, 2 MB L2 so nothing hides in cache),
+                        # M=2048, Qwen2.5-7B shapes, packing verified against the naive dequant to
+                        # rel=0.0025 first:
+                        #     q/o    8.51ms fused vs 3.16ms naive   (2.69x)
+                        #     k/v    1.18ms         vs 0.47ms       (2.54x)
+                        #     gate/up 44.42ms       vs 16.21ms      (2.74x)
+                        #     down   45.96ms        vs 15.92ms      (2.89x)
+                        # = ~154ms/layer fused vs ~56ms naive, ~2.8 s per 2048-token prefill chunk
+                        # across 28 layers. ROCm shipped exactly this fallback (_naive_m_min); CUDA
+                        # never could, because freeing qweight makes _dequant — and therefore the
+                        # whole naive path — structurally unreachable at any M.
+                        #
+                        # Keeping qweight costs its own bytes AGAIN (qweight and mat2 are the same
+                        # size; mat2's interleaved layout has no _dequant, so there is no cheaper
+                        # source). That is a real trade, so it is OPT-IN and the caller decides:
+                        # perf_profile only asks for it when the node has provable VRAM headroom.
+                        # Off by default -> byte-identical to the previous behaviour.
+                        if _keep_qweight_for_prefill(self, dev):
+                            self._naive_m_min = _bench_large_m_naive(self, "int4")
+                            if self._naive_m_min:
+                                print(f"[int4] CUDA large-M fallback ARMED "
+                                      f"(naive at row-bucket>={self._naive_m_min}) — retaining "
+                                      f"qweight ({self.qweight.numel()/2**20:.0f} MB) for prefill",
+                                      flush=True)
+                                return          # keep qweight/scale/zero: _dequant must stay live
                         self.qweight = None        # packed mat2 is now authoritative; free the source
                         # #sz-free: scale/zero live on ONLY inside the fused sz tensor now (the
                         # [ng,out,2] bf16 repack above) — the originals are dead weight, ~6% of
