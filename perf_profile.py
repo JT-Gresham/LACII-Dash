@@ -283,14 +283,17 @@ def resolve(*,
          "miss costs at most one crop round-trip, so a low gate cannot regress")
 
     # ---- 8. things measured as pessimizations — pinned OFF --------------------------------
+    # NOTE: head_quant is NOT taken here. It used to be, and because take() is last-wins
+    # (`out[name] = value`), that call silently overwrote section 4b above — which is the whole
+    # point of 4b. The overwrite predated the #8 measurement: it proposed int4 on ROCm back when
+    # an int4 head still looked like the bandwidth win. #8 then measured that head at +0.0389 nats
+    # (92.5% of the damage the entire int4 body does, 15.3% of greedy tokens flipped) and it is now
+    # REFUSED by client.py's head_quant validator — so the stale line made ⚡ propose a value the
+    # loader rejects on ROCm, and erased the useful int8 suggestion everywhere else.
+    # Anything added to this section must not re-take a knob an earlier section already owns.
     take("cuda_graph", False,
          "graphed decode measured 0.11x-0.95x: its StaticCache mirror attends over the full "
          "maxlen every token, which swamps the dispatch saving")
-    take("head_quant", "none" if device_class != ROCM else "int4",
-         ("lm_head stays bf16: every torch int8 GEMV measured 2-5x SLOWER than cuBLAS bf16 at "
-          "head shapes" if device_class != ROCM else
-          "ROCm has a shipped Triton w4a16 kernel at 119-134 GB/s — the same band decode achieves — "
-          "so an int4 head cuts ~24% of decode bytes on a bandwidth-saturated box"))
 
     return out, why
 
