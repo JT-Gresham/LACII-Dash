@@ -4,7 +4,88 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-14 (latest) — `#media-anywhere` for `t2i` and `tts` (server 0.3.15 / client 0.3.23)
+## 2026-08-14 (latest) — Qwen3.8-27B, a reasoning leak, and four quantization gaps (server 0.3.16 / client 0.3.24)
+
+### Added
+
+- **`Qwen/Qwen3.8-27B` serves on om3nbox**, the day it was published. It needed **no architecture
+  work**: despite the version jump it is `Qwen3_5ForConditionalGeneration` / `qwen3_5` with exactly
+  the same shape as `qwen3.6-27b` — 64 layers, hidden 5120, `head_dim` 256, vocab 248320,
+  `attn_output_gate`, interleaved mRoPE `[11,11,10]`, a vision tower, and the same hybrid
+  `layer_types` (48 `linear_attention` + 16 `full_attention`). A retrained checkpoint, not a new
+  architecture. Confirming that BEFORE writing any code was the whole job.
+
+  55.59 GB / 18 shards in ~15 min; loaded first try, single stage, 64/64 layers GPU, 16.79 GB VRAM
+  — byte-for-byte the same footprint as its 3.6 sibling. **Decode 8.91 tok/s** (112.2 ms/tok),
+  measured by differencing n=32 against n=128 so prefill cancels; the naive
+  `eval_count/eval_duration` reads 8.86 because `eval_duration` includes prefill. Text, reasoning
+  (bat-and-ball → **$0.05**), tools and vision all validated.
+
+### Fixed
+
+- **Reasoning leaked into `content` unless the request happened to send tools.** Found on Qwen3.8
+  but never model-specific — it hit EVERY model whose chat template opens `<think>`, on both the
+  OpenAI and Ollama endpoints. `starts_in_think` was computed inside `if tools_req:`, yet whether
+  the template opened a thought is a property of the PROMPT. Callers who defined no tool received
+  the entire chain-of-thought terminated by a bare, unpaired `</think>` — malformed, not merely
+  untidy. `/v1/messages` was always correct because `serving_anthropic.py` computed it
+  unconditionally, which is why the qwen3.6 reasoning work never surfaced it.
+
+  Confirmed by experiment, not by reading: the identical prompt plus one unused dummy tool returned
+  a clean answer. Reasoning now goes to `reasoning_content` (OpenAI) / `thinking` (Ollama), with a
+  streaming gate that needed **three** states — releasing on `</think>` and stripping the blank
+  lines after it in one step only works when both land in the same chunk, and at one token per
+  piece the closer arrives alone. Verified identical output at chunk sizes 1..59, 200 and 1000.
+
+- **The int4, int2 and routed-expert fused self-checks only ever probed M=8.** `_op` dispatches on
+  M: `M==1` is a split-K GEMV that atomic-adds into a zeroed accumulator, everything else is a
+  `tl.dot` GEMM. They share no code — so the check validated the PREFILL kernel and said nothing
+  about the kernel that runs on every decoded token, which is also the one carrying the
+  `reset_to_zero` hazard (a stale accumulator shows up as wrong logits, not as an error). The
+  routed-expert case was the worst: at decode a MoE routes ONE token per active expert, so its
+  per-expert GEMM is M=1 on every token. All three now probe M in (1, 8). Live on gfx1151 after
+  deploy: `[int4] triton w4a16 kernel active` — which now means both regimes passed.
+
+- **`/compile_shards` would have written a silently TRANSPOSED cache for gpt-oss.** Its fused
+  experts are IN-major — `_dequant_mxfp4_to_bf16` returns `[E, in, out]` — while
+  `pack_linear_int4_3d` packs `[out, in]`. The compile path already refuses int8 MoE, fp8/nvfp4
+  fused MoE and skeleton-less per-expert MoE under a stated "never a silent wrong cache" rule, but
+  MXFP4 is neither fp8 nor nvfp4 and passed all three. The worker transposes correctly, so cold
+  loads were right and only the cache would have been wrong — it would load, pass its own sha
+  verification, and generate garbage. Now refused with a message pointing at the working path.
+
+- **`kv_offload` enabled offloaded KV when ANY layer was on cuda.** `DynamicCache(offloading=True)`
+  prefetches every layer's K/V to "the" compute device — it assumes one. On a mixed shard (the
+  ordinary shape whenever a model doesn't fit) CPU layers were offloaded too. Now requires ALL, with
+  the empty case excluded explicitly since `all([])` is vacuously true.
+
+- **`perf_profile`'s section 8 silently overwrote the `head_quant` advice** added in `3d0be71`.
+  `take()` is last-wins, so a second call for the same knob erases the first. The stale line
+  predated the #8 measurement and proposed **int4** on ROCm — the value measured at 92.5% of the
+  damage the entire int4 body does, and refused outright by `client.py`. So ⚡ Optimized settings
+  offered ROCm a load the loader rejects, and erased the int8 suggestion everywhere else, leaving
+  the feature 100% inert. A gate now walks `resolve()`'s AST and fails on any knob taken twice.
+
+### Added — operations
+
+- **`INFINITEMODEL_TTS_CPU=1`** forces Kokoro to CPU, matching the existing STT and T2MUSIC levers.
+  tts was the only one of the three without it and the one that most needs it on gfx1151.
+- **`/gpudiag` falls back to `rocm-smi`** when nvidia-smi is absent — it returned nothing but a
+  FileNotFoundError on om3nbox, the Strix Halo box where "who is holding the GPU" is asked most.
+  The CLI lives INSIDE the venv on `sys.prefix/bin`, so `shutil.which` alone never finds it.
+
+### Security
+
+- **13 of the 14 `INFINITEMODEL_SESSION_HANDOFF_*.md` files contained cleartext SSH passwords** for
+  the fleet, and were untracked but NOT gitignored — one `git add -A` away from a permanent public
+  push. Verified nothing had leaked (`git log --all -S<secret>` → 0 commits; absent from HEAD), then
+  ignored as a class. The guard that should have caught this was inert twice over: `.git/hooks/` is
+  not cloned, and that one copy was mode 0644 so git never ran it. The hook now lives at
+  `hooks/pre-push` tracked as 100755, enabled with `git config core.hooksPath hooks`, and catches
+  cleartext passwords by SHAPE as well as forge tokens — without hardcoding the literals, since the
+  hook itself is public. Tested: blocks to github.com, allows to LAN, no false positive on `$PW`.
+
+## 2026-08-14 — `#media-anywhere` for `t2i` and `tts` (server 0.3.15 / client 0.3.23)
 
 ### Fixed
 

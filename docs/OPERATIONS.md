@@ -165,7 +165,7 @@ All runtime knobs persist across restarts and are settable from the dashboard se
 | `max_loaded` | 8 | Max resident models before LRU eviction (pins win). |
 | `auto_load` | true | First request for a non-resident model loads it. |
 | `auto_unload` | false | Let a load that doesn't fit LRU-evict **idle** residents to make room (pins win). Off = the load fails instead (and cold requests at capacity get the terminal `at_capacity` 503). |
-| `auto_tp` / `auto_tp_ratio` | false / — | Auto-route a CPU-bound model to CPU tensor-parallel when its weights exceed `ratio ×` the GPU pool. Off by default — measured: CPU-TP never beats pipelining onto a GPU on this fleet. |
+| `auto_tp` / `auto_tp_ratio` | **true** / — | Auto-route a CPU-bound model to CPU tensor-parallel when its weights exceed `ratio ×` the GPU pool. ⚠ This table said "false" until 2026-08-14; the key is **not** in the `ENGINE_CONFIG` defaults, so `engine_load.py`'s `ENGINE_CONFIG.get("auto_tp", True)` makes the effective default **true** unless an operator has set it via `POST /config`. Note the measurement that motivated the "off" advice still stands — CPU-TP never beat pipelining onto a GPU on this fleet — so if you want it off, set it explicitly rather than relying on the default. |
 | `autoload_quant` | `int4` | Quant tier for auto-loads (one-shot bf16 fallback on failure). |
 | `autoload_ctx` | 8192 | Default ctx for auto/click loads. |
 | `autoload_mode` | `auto` | Placement mode for auto-loads. **`auto` = GPU-first**; `single` is RAM-first — if models "randomly" land in RAM, check this. |

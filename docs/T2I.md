@@ -9,9 +9,12 @@ and the operational behavior around renders.
 
 ## Architecture (what actually runs where)
 
-Unlike LLM serving, a t2i pipeline is **not** layer-split across the fleet. The whole pipeline
-runs on **one controller-co-located GPU worker** (co-location is by hostname match — the worker
-process on the controller's own box):
+Unlike LLM serving, a t2i pipeline is **not** layer-split across the fleet — the whole pipeline
+runs on **one** GPU worker. Since `#media-anywhere` (2026-08-14) that worker no longer has to be
+co-located with the controller: any node advertising the `can_t2i` runtime **and** the `mediab64`
+wire cap is eligible, fetching the weights itself and returning the PNG as base64 over the control
+link. A controller in its own VM with no worker on its box can therefore serve t2i.
+The co-located path is unchanged and still used when the chosen node is local:
 
 - **DiT (the diffusion transformer)** — on the GPU, in one of the two modes below.
 - **Text encoder** (Qwen-Image's is Qwen2.5-VL-7B, ~16 GB) — on the worker's **CPU**,

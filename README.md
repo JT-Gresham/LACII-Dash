@@ -92,11 +92,14 @@ dashboard.
   HF-cache snapshot; `/v1/audio/music` dispatches to whichever engine the loaded model is; the
   model-detail page gets a **Generate music** panel (prompt + controls, player, WAV download).
   Guide → [docs/T2MUSIC.md](docs/T2MUSIC.md).
-- **Linear-attention hybrids (Kimi-Linear) — ingests and loads, does NOT serve yet.**
-  `moonshotai/Kimi-Linear-48B-A3B-Instruct` downloads, int4-compiles (25.4 GB) and loads fully
-  GPU-resident, but **cannot generate**: 20 of its 27 layers are KDA linear attention, which keeps a
-  **recurrent + short-convolution state** instead of a KV cache, and `_PreallocKVCache` implements
-  attention KV only. It also needs **`fla-core`** installed on every box that builds the arch
+- **Linear-attention hybrids (Kimi-Linear) — SERVES.** `moonshotai/Kimi-Linear-48B-A3B-Instruct`
+  downloads, int4-compiles (25.4 GB), loads fully GPU-resident and **generates** at ~6.5 tok/s
+  (validated end-to-end on om3nbox; the first call pays a Triton autotune and is slow). 20 of its 27
+  layers are KDA linear attention, keeping a **recurrent + short-convolution state** instead of a KV
+  cache — the hybrid cache that makes this work is documented in
+  [docs/KIMI-LINEAR.md](docs/KIMI-LINEAR.md). ⚠ `#prefix-kv`, `#pipefill`, spec-decode and
+  `kv_slots>1` stay gated OFF for linear-attention archs: recurrent state cannot be rewound.
+  It also needs **`fla-core` pinned to 0.4.0`** installed on every box that builds the arch
   (controller *and* workers) plus two in-repo compat fixes. Several of its failure modes report the
   wrong cause — a missing import surfaces as *"no room for the new model"* — so read
   **[docs/KIMI-LINEAR.md](docs/KIMI-LINEAR.md)** before attempting it.

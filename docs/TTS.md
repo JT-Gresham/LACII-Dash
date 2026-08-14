@@ -16,10 +16,14 @@ the API contract, and the operational behavior around synthesis.
 
 ## Architecture (what actually runs where)
 
-Like text-to-image, TTS is **not** layer-split across the fleet. The whole model runs on **one
-controller-co-located worker** (co-location is by hostname match — the worker process on the
-controller's own box, so the finished WAV is written to a shared filesystem and handed back as a
-local path, no transfer):
+Like text-to-image, TTS is **not** layer-split across the fleet — the whole model runs on **one**
+worker. Since `#media-anywhere` (2026-08-14) that worker no longer has to be co-located with the
+controller: any node advertising the `can_tts` runtime (the full Kokoro stack: `kokoro` + `misaki`
++ `espeakng_loader` + `soundfile`) **and** the `mediab64` wire cap is eligible, and returns the WAV
+as base64 over the control link rather than as a shared-filesystem path.
+Verified live on the `.45` pool: `kokoro` placed on **remote** beast, `POST /v1/audio/speech` →
+558 044 bytes of valid 24 kHz mono PCM, with no shared filesystem in the path.
+When the chosen node IS local the original path-return is used, unchanged:
 
 - **Kokoro `KModel`** — on the GPU when it compiles there, else CPU (see the fallback below).
   It is driven **directly**, not through Kokoro's `KPipeline`.

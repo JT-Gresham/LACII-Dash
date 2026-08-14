@@ -1984,9 +1984,11 @@ class EngineLoadMixin:
                     continue
                 _need = _est_gb(1 if quant != "none" else 0) + _MARGIN_GB
                 raise RuntimeError(
-                    f"no controller-co-located GPU has ~{_need:.1f} GB free VRAM for the image "
-                    f"model ({'no co-located GPU workers connected' if not cand else 'and nothing evictable'})"
-                    " — v1 serves t2i only on a GPU sharing the controller's box")
+                    f"no eligible GPU has ~{_need:.1f} GB free VRAM for the image "
+                    f"model ({'no eligible GPU workers connected' if not cand else 'and nothing evictable'})"
+                    " — t2i needs one node holding the whole pipeline; since #media-anywhere that "
+                    "can be any node advertising can_t2i + the mediab64 wire cap, not only a worker "
+                    "on the controller's own box")
             await self._unload_model_locked(victim, "evict idle LRU: image model needs VRAM")
             await self._await_free_refresh()
         if edge != want_edge and quant != "none":

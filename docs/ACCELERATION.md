@@ -278,7 +278,9 @@ These kernels are good but not the ceiling. Ranked by likely payoff:
    only decode attention (mask=None) switches to flash. Verify per-arch before enabling on other RDNA (e.g. gfx1033).
 3. **Single-node in-process transport.** Adjacent pipeline stages on the *same* box still hand off over
    loopback TCP; an in-process path removes that per-token round-trip.
-4. **Dense-kernel autotune on RDNA.** The RDNA dense Triton kernel still uses fixed tiles; the AMD iGPU is
+4. **Dense-kernel autotune on RDNA (M>1 PREFILL only).** The M=1 decode GEMV *is* autotuned (since
+   `#dram-dealias`); only the `M>1` prefill kernel `_k` still uses fixed tiles (BM=16/BN=128), and even
+   that is partly mitigated by `#large-m-naive`. The AMD iGPU is
    ~5× behind llama.cpp/Vulkan on the same silicon — the dense kernel plus (1)+(2) is where that gap lives.
 5. **MoE weight re-pack for coalescing (hard, uncertain).** The fused MoE GEMV reaches ~35–48% of peak;
    the gap is the strided per-expert weight tile (laid out `[E, N, K/2]`, read strided across `N`), not
