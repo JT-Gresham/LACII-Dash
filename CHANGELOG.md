@@ -4,6 +4,47 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## 2026-08-14 (latest) — `#media-pin`: the same defect in all five media leaves
+
+### Fixed
+
+- **`node=` was ignored by `t2i`, `t2a`, `tts`, `stt` and `t2music` too.** The audit flagged after
+  `#embed-pin`, and it found the identical defect five more times. Each leaf branches out of
+  `_load_impl` before the node-filtering loop and picks from a bare capability comprehension; none
+  ever *received* `pin_host` or `exclude_nodes`, and none consulted `_peer_claimed_host`. So
+  `/load?model=kokoro&node=X` went wherever the heuristic pointed, two replicas could share a node,
+  and a host another controller already claimed could be double-booked (`#federation` Phase 5).
+
+  Same root cause each time: written as "find a capable node" and never revisited as placement grew
+  pin / replica / federation semantics. One shared `_place_filter()` now applies all three
+  constraints to an already-built candidate list **without touching each leaf's own preference
+  ordering** — `can_X` first, then co-location, then VRAM stays each leaf's business. An
+  unsatisfiable pin raises naming the survivors.
+
+- **…and none of them could safely refuse, because all five unload before choosing.** Exactly the
+  trap the `#embed-pin` fix hit. Every candidate predicate here is *static* (capability + tier
+  toggles + co-location); only the *ranking* wants the VRAM the unload frees. So `tts`/`stt`/
+  `t2music` have their candidate build hoisted above the unload and filtered there (selection uses
+  static attributes only and stays put), while `t2i`/`t2a` run a validating `_place_filter` on the
+  same static predicate before the unload and let their retry loop re-derive and re-filter for the
+  VRAM-aware ranking — the loop must keep its own build, since it re-evaluates after eviction.
+
+### Verification
+
+Checked statically rather than hoped at, after two NameError-class slips earlier in the day:
+
+- an AST check that no precheck references a local bound **later** in its own function. It caught a
+  real one — `t2a`'s precheck called `_is_colo` 13 lines before its `def`, an `UnboundLocalError`
+  at runtime and completely invisible to `py_compile`. Inlined the test.
+- an AST check that across **all six** single-node load paths the first `_place_filter` /
+  `_embed_candidates` call precedes the first `_unload_model_locked`, so validated-before-destroyed
+  is machine-checked rather than asserted in a comment.
+
+Then end to end on a real media leaf (kokoro on om3nbox): pin honoured → `InferenceEngine`; bogus
+pin → refused with `candidates: InferenceEngine`; **the resident model survived the refusal** and
+still served a 102 KB WAV. The refusal case deliberately used a nonexistent node name rather than
+pinning at `furnace`, so a wrong filter could not have placed anything on an off-limits card.
+
 ## 2026-08-14 (latest) — `#embed-pin` and `#utc-logs`
 
 ### Fixed
