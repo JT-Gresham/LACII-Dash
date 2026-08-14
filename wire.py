@@ -216,7 +216,7 @@ def _unpack_tensor(meta, raw):
 # Every one of those degrades to the legacy full-vocab row, which the controller ALWAYS still
 # accepts and penalises itself (engine_gen._penalized) — so the diet can only lose bandwidth,
 # never correctness.
-WIRE_CAPS = ("ntensor", "ntdiet", "pipefill", "kvslots", "ntpen")
+WIRE_CAPS = ("ntensor", "ntdiet", "pipefill", "kvslots", "ntpen", "mediab64")
 
 # #ntensor-manifest tensor kinds (u8 on the wire). 0/1 = full tensors; 2-4 carry the #logits-diet
 # reduced head replies: 2 = greedy argmax token ids (int64, [q]); 3/4 = top-K candidate values

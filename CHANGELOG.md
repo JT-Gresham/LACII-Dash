@@ -4,7 +4,60 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-14 (latest) — infrastructure: mini05 retired as a models source (beast only)
+## 2026-08-14 (latest) — `#media-anywhere` for `t2i` and `tts` (server 0.3.15 / client 0.3.23)
+
+### Fixed
+
+- **`t2i` and `tts` could not load at all on a controller with no worker on its own box.** That is
+  the normal shape for a controller running in its own VM — `iM` at `.45` — so `/load?model=kokoro`
+  there failed with *"no controller-co-located worker … v1 serves speech models only on a worker
+  sharing the controller's box"*, however much idle GPU the fleet had. `t2a`, `stt` and `t2music`
+  had already been freed of this; `t2i` and `tts` were the last two.
+
+  Being co-located-only was never one property — it was **three**, and these two leaves were
+  missing all three while the other leaves had all three:
+
+  | | `t2i` / `tts` before | how the fix works |
+  |---|---|---|
+  | **weights** | worker reads the controller's `model_dir` off a shared FS | remote worker `snapshot_download`s the repo itself, exactly as `t2a`/`stt`/`t2music` do |
+  | **result** | worker writes a PNG/WAV and returns a **path** the controller `open()`s | returns the **bytes** as base64 over the control link |
+  | **placement** | candidate predicate accepted only co-located nodes | accepts a remote node advertising the runtime **and** the new `mediab64` wire cap |
+
+  The `can_t2i` flag needed for step 3 had existed all along — `worker_hw`'s own comment says it is
+  advertised *"so the controller can place a t2a/t2i model on ANY capable GPU, not only the
+  co-located box"* — the loader simply never consulted it. `can_tts` is new (probes
+  `kokoro`+`misaki`+`espeakng_loader`+`soundfile`; missing any one `ImportError`s at load rather
+  than at registration, so all four are probed).
+
+### The co-located path is deliberately untouched
+
+om3nbox serves `qwen-image` through the path-returning branch today, and a worker can update
+before its controller does. So the worker switches to base64 **only when the controller asks**
+(`inline` in the request), and the controller only asks when it placed the model on a node that is
+genuinely remote *and* advertises `mediab64`. Every version pairing therefore works: an old worker
+ignores `inline` and is never chosen for a remote placement; an old controller never sets it and
+keeps the path. The legacy reply dict is byte-identical to before.
+
+Gating on the wire cap **as well as** the runtime is the load-bearing part. An older worker
+advertises `can_t2i` quite happily but would still reply with a path the controller cannot open —
+and since a media model loads first and renders later, that failure would surface only on the
+first request, with several GB already resident on the wrong node.
+
+### Verification
+
+- Two AST checks over `engine_load.py`: validated-before-destroyed still holds across **all six**
+  single-node load paths, and neither `t2i` nor `tts` retains a raw `_LOCAL_IPS` co-location test.
+- The placement gate was extracted from the shipped source by AST and exercised against stub
+  nodes — **12/12**, including the case that matters: *remote node advertising the runtime but on
+  an old worker → refused*, and *unknown node → legacy path* (the conservative answer).
+- Full `py_compile` sweep plus `node --check` on all six embedded dashboard script blocks.
+
+Not yet exercised end-to-end against live hardware: beast is the one node carrying the whole
+Kokoro stack (`kokoro`/`misaki`/`espeakng_loader`/`soundfile` all present; amdcomp has `diffusers`
+for t2i but not Kokoro), and workers only re-advertise capabilities on restart, which is why
+`client.py` is bumped.
+
+## 2026-08-14 — infrastructure: mini05 retired as a models source (beast only)
 
 Not a code change — controller-host configuration, recorded here because it changes boot config
 (`/etc/fstab`) and removes an operational lever that older runbooks still describe.

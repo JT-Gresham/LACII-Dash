@@ -223,10 +223,27 @@ class WorkerLoadMixin:
             # a fetch-if-missing bridge so pre-#t2i workers converge without a restart loop.
             if a.get("kind") == "t2i":
                 mdir = a.get("model_dir") or ""
-                if not os.path.isdir(mdir):
-                    raise RuntimeError(
-                        f"t2i model dir not visible on this worker: {mdir!r} — v1 serves "
-                        "image models only on a GPU worker co-located with the controller")
+                # #media-anywhere: a REMOTE worker doesn't share the controller's filesystem, so
+                # the controller's model_dir won't exist here. Fetch the diffusers repo from HF
+                # into this worker's own cache — the same bridge t2a/stt/t2music already use.
+                # Co-located workers keep the fast path: the dir is visible, nothing downloads.
+                if not (mdir and os.path.isdir(os.path.join(mdir, "transformer"))):
+                    def _fetch_t2i() -> str:
+                        from huggingface_hub import snapshot_download
+                        try:
+                            _loc = snapshot_download(model_id)
+                        except Exception as _e:
+                            raise RuntimeError(
+                                f"remote t2i worker can't fetch {model_id!r} from HuggingFace "
+                                f"({_e!r}) — an image model served on a REMOTE GPU must be a "
+                                "public HF repo id (co-located serving works from local disk)"
+                            ) from _e
+                        if not os.path.isdir(os.path.join(_loc, "transformer")):
+                            raise RuntimeError(
+                                f"fetched {model_id!r} but it has no transformer/ — not a "
+                                "valid diffusers image checkpoint")
+                        return _loc
+                    mdir = await asyncio.to_thread(_fetch_t2i)
                 try:
                     import worker_t2i
                 except Exception:
@@ -261,10 +278,28 @@ class WorkerLoadMixin:
             # back to CPU on its own if the GPU's MIOpen kernels fail to JIT-compile (gfx1151).
             if a.get("kind") == "tts":
                 mdir = a.get("model_dir") or ""
-                if not os.path.isdir(mdir):
-                    raise RuntimeError(
-                        f"tts model dir not visible on this worker: {mdir!r} — v1 serves "
-                        "speech models only on a worker co-located with the controller")
+                # #media-anywhere: as for t2i — a REMOTE worker fetches the Kokoro checkpoint
+                # itself. Probe the two files worker_tts actually opens (config.json and
+                # kokoro-v1_0.pth), not just the dir, so a partial cache re-downloads instead of
+                # failing deep inside the pipeline with a less obvious error.
+                if not (mdir and os.path.exists(os.path.join(mdir, "config.json"))
+                        and os.path.exists(os.path.join(mdir, "kokoro-v1_0.pth"))):
+                    def _fetch_tts() -> str:
+                        from huggingface_hub import snapshot_download
+                        try:
+                            _loc = snapshot_download(model_id)
+                        except Exception as _e:
+                            raise RuntimeError(
+                                f"remote tts worker can't fetch {model_id!r} from HuggingFace "
+                                f"({_e!r}) — a speech model served on a REMOTE worker must be a "
+                                "public HF repo id (co-located serving works from local disk)"
+                            ) from _e
+                        if not os.path.exists(os.path.join(_loc, "kokoro-v1_0.pth")):
+                            raise RuntimeError(
+                                f"fetched {model_id!r} but it has no kokoro-v1_0.pth — not a "
+                                "valid Kokoro checkpoint")
+                        return _loc
+                    mdir = await asyncio.to_thread(_fetch_tts)
                 try:
                     import worker_tts
                 except Exception:
@@ -729,8 +764,25 @@ class WorkerLoadMixin:
                     msg.get("seed"), _on_step)
             finally:
                 self._building -= 1
-            await reply({"type": "t2i_done", "req_id": rid, "model_id": mid,
-                         "path": path, "seconds": round(secs, 1)})
+            # #media-anywhere: when the controller asked for an inline result (it placed us
+            # on a node that does NOT share its filesystem), return the PNG as base64 over the
+            # control link and delete our own temp — the bytes are the deliverable, and nobody
+            # else can clean up a file on this box. Otherwise keep the legacy local-path reply
+            # EXACTLY as before, so a co-located worker still works with an older controller.
+            if msg.get("inline"):
+                def _read_del(_p: str) -> str:
+                    import base64
+                    with open(_p, "rb") as _fh:
+                        _b = _fh.read()
+                    with contextlib.suppress(Exception):
+                        os.remove(_p)
+                    return base64.b64encode(_b).decode("ascii")
+                _ib64 = await asyncio.to_thread(_read_del, path)
+                await reply({"type": "t2i_done", "req_id": rid, "model_id": mid,
+                             "image_b64": _ib64, "seconds": round(secs, 1)})
+            else:
+                await reply({"type": "t2i_done", "req_id": rid, "model_id": mid,
+                             "path": path, "seconds": round(secs, 1)})
         except Exception as exc:
             with contextlib.suppress(Exception):
                 await reply({"type": "t2i_err", "req_id": rid, "model_id": mid,
@@ -800,9 +852,24 @@ class WorkerLoadMixin:
                     str(msg.get("fmt") or "wav"), _on_step)
             finally:
                 self._building -= 1
-            await reply({"type": "tts_done", "req_id": rid, "model_id": mid,
-                         "path": path, "seconds": round(secs, 1),
-                         "audio_s": round(audio_s, 1)})   # #media-detail: for RTF in the modal
+            # #media-anywhere: see handle_t2i_gen — inline base64 for a remote controller,
+            # unchanged local-path reply for a co-located one.
+            if msg.get("inline"):
+                def _read_del(_p: str) -> str:
+                    import base64
+                    with open(_p, "rb") as _fh:
+                        _b = _fh.read()
+                    with contextlib.suppress(Exception):
+                        os.remove(_p)
+                    return base64.b64encode(_b).decode("ascii")
+                _ab64 = await asyncio.to_thread(_read_del, path)
+                await reply({"type": "tts_done", "req_id": rid, "model_id": mid,
+                             "audio_b64": _ab64, "seconds": round(secs, 1),
+                             "audio_s": round(audio_s, 1)})   # #media-detail: for RTF in the modal
+            else:
+                await reply({"type": "tts_done", "req_id": rid, "model_id": mid,
+                             "path": path, "seconds": round(secs, 1),
+                             "audio_s": round(audio_s, 1)})   # #media-detail: for RTF in the modal
         except Exception as exc:
             with contextlib.suppress(Exception):
                 await reply({"type": "tts_err", "req_id": rid, "model_id": mid,

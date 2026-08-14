@@ -1650,6 +1650,40 @@ class EngineLoadMixin:
             if _held:
                 self.lock.release()
 
+    def _is_colo_node(self, n) -> bool:
+        """Does node `n` share this controller's filesystem? hostname match is the robust signal
+        (a standalone worker may register its LAN IP, e.g. om3nbox's 192.168.x); a loopback or
+        this-box data endpoint covers the rest."""
+        return (n.hostname == socket.gethostname()
+                or str(n.data_host).startswith(("127.", "::1"))
+                or str(n.data_host) in _LOCAL_IPS)
+
+    def _media_node_ok(self, n, cap: str) -> bool:
+        """#media-anywhere: may a single-node media leaf run on node `n`?
+
+        Co-located: always — that is the legacy path (worker reads the controller's model_dir and
+        hands back a local file path). REMOTE: the node must advertise BOTH the runtime (`cap`,
+        e.g. can_t2i, from worker_hw's find_spec probe) AND the `mediab64` wire cap.
+
+        Requiring the wire cap as well as the runtime is the whole point. An older worker
+        advertises can_t2i quite happily but still replies with a filesystem path this controller
+        cannot open — and because a media model loads first and renders later, that failure would
+        surface only on the first request, with several GB already resident on the wrong node."""
+        if self._is_colo_node(n):
+            return True
+        return bool(getattr(n, cap, False)) and "mediab64" in registry.node_caps(n.node_id)
+
+    def _media_inline(self, lm) -> bool:
+        """#media-anywhere: True when this model's worker does NOT share our filesystem, so the
+        result must ride the control link as base64 rather than a path. Derived per request from
+        the live registry instead of being frozen at load time, so it stays correct if the node
+        re-registers. Unknown node -> False, i.e. the legacy path: the conservative answer, since
+        that is what every pre-#media-anywhere worker does."""
+        node = None
+        with contextlib.suppress(Exception):
+            node = registry._nodes.get(lm.stage_node_ids[0])
+        return False if node is None else (not self._is_colo_node(node))
+
     def _place_filter(self, cand: list, pin_host: str = "", exclude_nodes: Optional[set] = None,
                       what: str = "model") -> list:
         """#media-pin: apply the placement constraints to an already-built candidate list, WITHOUT
@@ -1879,8 +1913,7 @@ class EngineLoadMixin:
         self._place_filter(
             [n for n in registry.alive_sorted()
              if n.can_infer and n.vram_total_gb > 0 and (n.ram_enabled or n.vram_enabled)
-             and (n.hostname == _ctrl_host or str(n.data_host).startswith(("127.", "::1"))
-                  or str(n.data_host) in _LOCAL_IPS)],
+             and self._media_node_ok(n, "can_t2i")],
             pin_host, exclude_nodes, "t2i (image) model")
         if reg_key in self.models:
             await self._unload_model_locked(reg_key, "reload (t2i)")
@@ -1893,14 +1926,13 @@ class EngineLoadMixin:
             # loopback/this-box data endpoint.
             # #media-node-optout (audit #28): skip a node whose NODE_CONFIG has BOTH tiers
             # disabled (fully opted out) — same rule as the t2a filter (see _load_t2a_locked
-            # for the furnace incident that motivated it). t2i is co-located-only today, so
-            # this is precautionary here; it becomes load-bearing the day t2i goes remote.
+            # for the furnace incident that motivated it). That note said this was
+            # "precautionary here; it becomes load-bearing the day t2i goes remote" — that day
+            # is now, since a remote can_t2i node is a real candidate below.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and n.vram_total_gb > 0
                     and (n.ram_enabled or n.vram_enabled)
-                    and (n.hostname == _ctrl_host
-                         or str(n.data_host).startswith(("127.", "::1"))
-                         or str(n.data_host) in _LOCAL_IPS)]
+                    and self._media_node_ok(n, "can_t2i")]
             cand = self._place_filter(cand, pin_host, exclude_nodes, "t2i (image) model")
             # In-flight loads' reservations count as USED (they're streaming toward that size —
             # observed: a cache-served 14b auto-load planned seconds before this one filled the
@@ -2070,7 +2102,10 @@ class EngineLoadMixin:
                 await link.send({"type": "t2i_gen", "model_id": lm.target_id, "req_id": rid,
                                  "prompt": str(prompt), "negative_prompt": str(negative_prompt or " "),
                                  "width": int(width), "height": int(height),
-                                 "steps": int(steps), "cfg": float(cfg), "seed": seed})
+                                 "steps": int(steps), "cfg": float(cfg), "seed": seed,
+                                 # #media-anywhere: ask for bytes only when the worker can't
+                                 # hand us a path we could actually open.
+                                 "inline": self._media_inline(lm)})
                 # slowest observed ~42 s/step (gfx1151 sharing the GPU) — generous flat margin
                 r = await asyncio.wait_for(fut, timeout=300 + int(steps) * 120)
             finally:
@@ -2081,16 +2116,28 @@ class EngineLoadMixin:
             if not isinstance(r, dict) or r.get("type") == "t2i_err":
                 raise RuntimeError(f"image generation failed: "
                                    f"{(r or {}).get('error', 'no result')}")
-            path = r.get("path") or ""
+            _ib64 = r.get("image_b64")
+            if _ib64:
+                # #media-anywhere: a REMOTE worker returns the PNG as base64 over the control
+                # link and has already deleted its own temp. Decode off the event loop — a
+                # 1024x1024 PNG is a few MB and b64decode is not free.
+                import base64
+                data = await asyncio.to_thread(base64.b64decode, _ib64)
+            else:
+                path = r.get("path") or ""
+                if not path:
+                    raise RuntimeError(
+                        "image worker returned neither image_b64 nor path — it is probably too "
+                        "old for remote serving (needs the mediab64 wire capability)")
 
-            def _read() -> bytes:
-                with open(path, "rb") as fh:
-                    data = fh.read()
-                with contextlib.suppress(OSError):
-                    os.remove(path)
-                return data
+                def _read() -> bytes:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    with contextlib.suppress(OSError):
+                        os.remove(path)
+                    return data
 
-            data = await asyncio.to_thread(_read)
+                data = await asyncio.to_thread(_read)
             lm.last_used = time.time()
             log_activity(f"{_ollama_name(friendly)}: image {width}x{height} steps={steps} "
                          f"in {r.get('seconds', '?')}s ({len(data) / 1e6:.1f} MB)")
@@ -2342,14 +2389,17 @@ class EngineLoadMixin:
         # it in this order means an unsatisfiable pin fails with the resident copy still serving,
         # instead of unloading it and then raising.
         _ctrl_host = socket.gethostname()
+        # #media-anywhere: co-located OR any node advertising the Kokoro runtime (can_tts) and
+        # the mediab64 wire cap. Before this, a controller with no worker on its own box — the
+        # normal shape for a controller running in its own VM, e.g. iM at .45 — could NEVER load
+        # a speech model at all, however much idle GPU the fleet had.
         cand = [n for n in registry.alive_sorted()
-                if n.can_infer and (n.hostname == _ctrl_host
-                     or str(n.data_host).startswith(("127.", "::1"))
-                     or str(n.data_host) in _LOCAL_IPS)]
+                if n.can_infer and self._media_node_ok(n, "can_tts")]
         if not cand:
-            raise RuntimeError("no controller-co-located worker for the tts (Kokoro) model "
-                               "— v1 serves speech models only on a worker sharing the "
-                               "controller's box")
+            raise RuntimeError(
+                "no worker can serve the tts (Kokoro) model — need a co-located worker, or a "
+                "remote one advertising the Kokoro runtime (can_tts: kokoro+misaki+"
+                "espeakng_loader+soundfile) and the mediab64 wire capability")
         cand = self._place_filter(cand, pin_host, exclude_nodes, "tts (Kokoro) model")
         if reg_key in self.models:
             await self._unload_model_locked(reg_key, "reload (tts)")
@@ -2698,7 +2748,8 @@ class EngineLoadMixin:
             try:
                 await link.send({"type": "tts_gen", "model_id": lm.target_id, "req_id": rid,
                                  "text": str(text), "voice": str(voice or ""),
-                                 "speed": float(speed or 1.0), "fmt": str(fmt or "wav")})
+                                 "speed": float(speed or 1.0), "fmt": str(fmt or "wav"),
+                                 "inline": self._media_inline(lm)})   # #media-anywhere
                 # CPU synthesis runs ~4x realtime; scale the ceiling to the text length.
                 r = await asyncio.wait_for(
                     fut, timeout=max(GEN_TIMEOUT_S, 60.0 + len(str(text)) * 0.5))
@@ -2712,16 +2763,26 @@ class EngineLoadMixin:
                                    f"{(r or {}).get('error', 'no result')}")
             lm.last_render_s = r.get("seconds")      # wall time of this synth (#media-detail)
             lm.last_audio_s = r.get("audio_s")       # audio duration -> RTF in the modal
-            path = r.get("path") or ""
+            _ab64 = r.get("audio_b64")
+            if _ab64:
+                # #media-anywhere: remote worker -> WAV as base64, temp already deleted there.
+                import base64
+                data = await asyncio.to_thread(base64.b64decode, _ab64)
+            else:
+                path = r.get("path") or ""
+                if not path:
+                    raise RuntimeError(
+                        "speech worker returned neither audio_b64 nor path — it is probably too "
+                        "old for remote serving (needs the mediab64 wire capability)")
 
-            def _read() -> bytes:
-                with open(path, "rb") as fh:
-                    data = fh.read()
-                with contextlib.suppress(OSError):
-                    os.remove(path)
-                return data
+                def _read() -> bytes:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    with contextlib.suppress(OSError):
+                        os.remove(path)
+                    return data
 
-            data = await asyncio.to_thread(_read)
+                data = await asyncio.to_thread(_read)
             lm.last_used = time.time()
             log_activity(f"{_ollama_name(friendly)}: speech {r.get('seconds', '?')}s "
                          f"({len(data) / 1e6:.2f} MB)")

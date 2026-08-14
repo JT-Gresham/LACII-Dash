@@ -281,7 +281,7 @@ def register(app):
                 ("t2music (MusicGen)", "can_t2music") if "musicgen" in _s else
                 ("t2a (ACE-Step)", "can_t2a") if ("ace-step" in _s or "acestep" in _s
                                                   or "ace_step" in _s) else
-                ("tts (Kokoro)", "co-located") if "kokoro" in _s else
+                ("tts (Kokoro)", "can_tts") if "kokoro" in _s else
                 ("", ""))
             if _mk:
                 return JSONResponse({"ok": True, "media": True, "friendly": friendly, "stages": [],

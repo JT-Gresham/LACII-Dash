@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.14"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.15"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -534,6 +534,7 @@ class Node:
     # GPU, not just the co-located one. False for workers that never reported it (pre-feature).
     can_t2a: bool = False
     can_t2i: bool = False
+    can_tts: bool = False   # #media-anywhere: Kokoro runtime present (kokoro+misaki+espeakng_loader+soundfile)
     can_stt: bool = False
     # #einops-probe: einops is pulled in by several models' trust_remote_code. Missing it fails
     # the load with ImportError, which marks the node can_infer=False fleet-wide until its worker
@@ -659,6 +660,7 @@ class Node:
             "age_s": round(self.age, 1), "alive": self.alive,
             "can_infer": self.can_infer, "incapable_reason": self.incapable_reason,
             "can_t2a": self.can_t2a, "can_t2i": self.can_t2i, "can_stt": self.can_stt,
+            "can_tts": self.can_tts,
             "can_t2music": self.can_t2music, "has_einops": self.has_einops,
             "caps": sorted(self.caps),   # #wire-caps: advertised wire capabilities (/status)
             "vram_total_gb": round(self.vram_total_gb, 2),
@@ -705,6 +707,7 @@ class Registry:
                 cores=int(reg.get("cores", 0)),
                 can_t2a=bool(reg.get("can_t2a", False)),
                 can_t2i=bool(reg.get("can_t2i", False)),
+                can_tts=bool(reg.get("can_tts", False)),
                 can_stt=bool(reg.get("can_stt", False)),
                 can_t2music=bool(reg.get("can_t2music", False)),
                 has_einops=bool(reg.get("has_einops", True)),   # #einops-probe (absent -> assume OK)

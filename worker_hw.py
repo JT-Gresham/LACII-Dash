@@ -493,6 +493,12 @@ def build_registration(args: argparse.Namespace) -> dict:
             return False
     reg["can_t2a"] = _has("acestep")
     reg["can_t2i"] = _has("diffusers")
+    # #media-anywhere: Kokoro needs the kokoro+misaki pair (installed --no-deps, phonemizing via
+    # misaki.espeak — see worker_tts's header) plus espeakng_loader for the bundled voice data and
+    # soundfile to write the WAV. Missing ANY of the four ImportErrors at load, not at register,
+    # so probe all four rather than just the top-level package.
+    reg["can_tts"] = (_has("kokoro") and _has("misaki")
+                      and _has("espeakng_loader") and _has("soundfile"))
     # #einops-probe: einops is imported by several models' trust_remote_code (nomic-embed's
     # encoder, Kimi-Linear, …). A node missing it fails the load with ImportError, and the
     # controller's handler then marks the WHOLE node can_infer=False and replans without it
