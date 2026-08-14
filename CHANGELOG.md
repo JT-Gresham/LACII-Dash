@@ -4,6 +4,54 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
+## 2026-08-14 (latest) — `#embed-pin` and `#utc-logs`
+
+### Fixed
+
+- **`#embed-pin` — `/load?model=<embedder>&node=X` silently ignored the pin.** The embedding branch
+  leaves `_load_impl` *before* the node-filtering loop the pipeline path runs, and `pin_host` was
+  never passed to `_load_embedding_locked` at all; the node choice was a bare
+  `alive_sorted()[0] that has a GPU`. So an explicit pin went to whichever node sorted first — seen
+  live as `node=work` landing on `amdcomp`, with the response reporting `mode="pin:work/gpu"` while
+  `stages[0].hostname` said otherwise. `work` sorts second-to-last among candidates, so the pin
+  could never have been honoured by accident.
+
+  Two more constraints were dropped on the same line: **`exclude_nodes`** (two replicas of one
+  embedder would land on the *same* node, silently breaking the disjoint-copies contract that makes
+  replicas add a concurrent decode slot) and **peer claims** (double-booking a node another
+  controller owns is the exact double-reservation that OOMs it, `#federation` Phase 5). All three
+  are now applied, and **a pin that cannot be honoured raises**, naming the candidates, rather than
+  quietly placing elsewhere — a wrong-but-working placement is invisible downstream.
+
+  Root cause worth naming: the slim loader was written as "pick a capable node" and never revisited
+  as placement grew pin / replica / federation semantics. Being the simpler path did not make those
+  constraints optional.
+
+- **…and the regression that fix caused, caught by its own test.** `_load_embedding_locked` drops
+  the resident copy *before* choosing a node, so making an unsatisfiable pin raise turned a typo'd
+  node name into "unload the working embedder, then error" — `/api/embed` returned 0 dims with
+  nothing resident. Previously this path could not fail, so the ordering never mattered. The filter
+  is now one helper, `_embed_candidates()`, called twice: once **before** the unload purely to
+  validate (fail with the copy still serving), once after to select (so the choice sees freed
+  VRAM). Sharing the helper is the point — two hand-written copies could drift, and a load that
+  passed validation then found no node would hit exactly the failure being fixed.
+
+  ⚠ **General shape: when adding a refusal to a path that previously could not fail, check what
+  that path has already destroyed by the time it refuses.**
+
+- **`#utc-logs` — every node stamped its log lines in LOCAL time.** `time.strftime` with no `tm`
+  argument uses the node's own timezone, so `GET /logs` across the fleet returned streams hours
+  apart: the `.45` LXC workers run local, om3nbox runs UTC. Correlating one load across two nodes
+  read as ~8 hours of stale logging when both streams were current. Now UTC everywhere with a
+  trailing `Z`, so the format is self-describing rather than a silent clock jump for anyone reading
+  old and new lines together.
+
+  Four stamp sites kept in sync — `server.py`, `client.py`, `worker_quant.py` (code-split copy of
+  the same shim) and `multimodal._vlog`, which writes the crash-survival vision log and would
+  otherwise have been the one local-time stream left in an otherwise-UTC file. Safe to change:
+  nothing parses the prefix (the `/logs` ring buffer is display-only). Verified live — controller,
+  a `.45` worker and an om3nbox worker all stamping within seconds of `date -u`.
+
 ## 2026-08-14 (later) — `#head-quant`: an int4 body with an int8 head
 
 ### Added
