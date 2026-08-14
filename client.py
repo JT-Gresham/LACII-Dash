@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.19"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.20"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -763,6 +763,77 @@ class Shard(ShardBuildMixin, ShardForwardMixin):
         # reduced-dim modules (wraps whatever is on CPU). QuantLinear/QuantLinear4 handle fp32
         # in their own dequant, so they're skipped here. Per-call upcast only -> resident RAM
         # unchanged. Idempotent (safe if placement is ever re-run).
+        # #head-quant: pack the lm_head int8 beside an int4 body (or force it back to bf16).
+        #
+        # WHY THIS PARTICULAR COMBINATION. #8 (302d72b) measured, on Qwen2.5-7B, that the head is
+        # 22% of everything read per decoded token — the single largest tensor per token — but that
+        # int4 on it costs +0.0389 nats, which is 92.5% of the damage the ENTIRE int4 body already
+        # does, and changes 15.3% of greedy tokens. int4 on the head was rejected for that reason.
+        # int8 on the same head costs +0.0050 nats at 98.4% top-1 agreement — about 8x cheaper than
+        # what the body already costs — and halves the head's bytes. It was unusable only because
+        # nothing read int8 directly; the w8a16 kernel (3a94c84) fixed that, so the good trade is
+        # finally available: ~11% fewer bytes per decoded token for a quality cost far below the
+        # noise floor of the quantization already in use.
+        #
+        # Applied HERE, after final device placement and before both the CPU-linear wrapper and the
+        # prepare_fused sweep below, so: the new QuantLinear is never wrapped as a native Linear,
+        # the sweep binds w8a16 to it automatically (it dispatches on hasattr), and — the reason
+        # this is not done at build time — cold loads and serve-from-cache loads take the SAME path.
+        # No cache format change, no manifest change, no new packed tier on disk.
+        #
+        # Quantized on CPU whatever the head's final device: _quantize_linear builds full-size
+        # intermediates (W/scale, then the rounded copy) which for a 152k-row head is a couple of GB
+        # of transient, enough to OOM a tightly budgeted GPU at the very end of a load, for a result
+        # that is only half the size of the input. One D2H of a tensor we already hold plus a
+        # smaller H2D is the cheaper trade.
+        #
+        # TIED-embedding models are refused: #tied-dedup has already pointed head.weight AT
+        # embed_tokens.weight, so there is no separate head to shrink — packing it would ADD an int8
+        # copy beside the bf16 embedding rather than replace anything.
+        #
+        # The planner budgeted this stage for a bf16 head, so a packed head simply uses LESS than
+        # was reserved. That is the safe direction and needs no placement change.
+        _hq = (getattr(self, "_head_quant", "") or "").strip().lower()
+        if _hq and self.has_head and self.head is not None:
+            try:
+                _tied = bool(getattr(self.cfg, "tie_word_embeddings", False))
+                if _hq not in ("int8", "bf16"):
+                    # int4 is DELIBERATELY not offered here — see the measurement above. Refusing
+                    # loudly beats silently ignoring a value someone believed took effect.
+                    raise ValueError(f"head_quant={_hq!r} unsupported (int8 | bf16); int4 on the "
+                                     f"lm_head was measured and rejected — see CHANGELOG #8")
+                if _hq == "int8" and self.head_device.type != "cuda":
+                    # A CPU-resident head must stay bf16. The w8a16 kernel is GPU-only, so on CPU
+                    # QuantLinear falls back to dequant-then-GEMM — which reads the int8 weight,
+                    # materializes the bf16 copy and reads that: strictly SLOWER than the bf16 head
+                    # it replaced. Quantizing here would be a pessimization, not a saving.
+                    print(f"[head-quant] int8 head SKIPPED: lm_head is on {self.head_device} and "
+                          f"the w8a16 kernel is GPU-only — bf16 is faster there", flush=True)
+                elif _hq == "int8" and not isinstance(self.head, torch.nn.Linear):
+                    # The int8 load tier already packed it; nothing to do, but say so rather than
+                    # let a caller believe a flag took effect that was a no-op.
+                    print(f"[head-quant] int8 head already packed by the load tier "
+                          f"({type(self.head).__name__}) — nothing to do", flush=True)
+                elif _hq == "int8" and _tied:
+                    print("[head-quant] int8 head SKIPPED: tie_word_embeddings — lm_head aliases "
+                          "embed_tokens, so packing it would add a copy, not replace one",
+                          flush=True)
+                elif _hq == "int8":
+                    _dev = self.head_device
+                    _bf = self.head.weight.numel() * self.head.weight.element_size()
+                    _q = _quantize_linear(self.head.to(self.cpu)).to(_dev)
+                    self.head = self.model.lm_head = _q
+                    _pk = _q.qweight.numel() + _q.scale.numel() * _q.scale.element_size()
+                    print(f"[head-quant] lm_head int8: {_bf / 2**30:.2f} GB bf16 -> "
+                          f"{_pk / 2**30:.2f} GB ({_bf / max(1, _pk):.1f}x fewer bytes read per "
+                          f"decoded token)", flush=True)
+                elif _hq == "bf16" and not isinstance(self.head, torch.nn.Linear):
+                    print("[head-quant] bf16 head requested but this shard's head is already "
+                          "quantized by the load tier — leaving it (no dequantized source kept)",
+                          flush=True)
+            except Exception as exc:
+                # A failed head pack must never cost the load — keep whatever head we had.
+                print(f"[head-quant] FAILED ({exc!r}) -> leaving the lm_head as built", flush=True)
         if worker_quant._CPU_FP32_GEMM:   # Inc 10: live attr (rebound by --no-cpu-fp32)
             for _m in (([self.embed] if self.has_embed else [])
                        + list(self.owned_layers)

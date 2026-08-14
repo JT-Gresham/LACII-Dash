@@ -531,7 +531,8 @@ class ShardBuildMixin:
                     plan_ram_bytes: int = 0, tp_weights=None, ctx: int = 0,
                     gpu_budget_gb: float = -1.0, moe_offload: bool = False,
                     cache: str = "", kv_quant: str = "none",
-                    kv_offload: bool = False, kv_slots: int = 1) -> "Shard":
+                    kv_offload: bool = False, kv_slots: int = 1,
+                    head_quant: str = "") -> "Shard":
         """Build a shard by STREAMING weights one layer at a time straight into RAM — no temp
         file, no disk. `fetch(start, end, embed, head) -> bytes` returns a safetensors blob for
         that slice. Each layer is fetched, loaded, quantized and FREED before the next, so peak
@@ -1165,6 +1166,8 @@ class ShardBuildMixin:
                                ".to(device)): " + ", ".join(_stuck[:12])
                                + (" ...+%d more" % (len(_stuck) - 12) if len(_stuck) > 12 else ""))
         self._moe_offload = bool(moe_offload)   # #moe-offload: split MoE layers (attn->GPU, experts->CPU)
+        self._head_quant = (head_quant or "").strip().lower()   # #head-quant (applied in
+                                                                # _finalize_placement)
         self._place_modules(device, gpu_mem_gb, ctx, gpu_budget_gb)   # ctx -> reserve full-ctx KV; budget -> #95 coexistence cap
         return self
 

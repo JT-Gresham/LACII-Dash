@@ -30,6 +30,10 @@ class WorkerLoadMixin:
         # routed-expert block in CPU RAM (llama.cpp --override-tensor experts=CPU, intra-layer).
         # Pipeline-only (the TP path ignores it); the worker further gates to int4 experts.
         moe_offload = bool(a.get("moe_offload", False))
+        # #head-quant: per-load override of the lm_head's precision, independent of the body
+        # ('' = leave alone, 'int8' = pack the head int8 beside an int4 body, 'bf16' = force
+        # bf16). Absent on an old controller -> '' -> byte-identical to before.
+        head_quant = (a.get("head_quant", "") or "").strip().lower()
         # #shard-cache Inc 2 (serve-from-cache): controller flags '' | 'int4' | 'int2'. When set,
         # fetch PRE-PACKED layer units (cache=<quant> on /weights) and install them directly — no
         # bf16 stream, no per-layer re-quant. Pipeline only (the controller never sets it for TP);
@@ -86,7 +90,8 @@ class WorkerLoadMixin:
                                       cache=cache,                   # #shard-cache Inc 2 serve-from-cache
                                       kv_quant=a.get("kv_quant", "none"),   # #172 TurboQuant KV preset
                                       kv_offload=bool(a.get("kv_offload", False)),  # #kv-offload: KV in RAM
-                                      kv_slots=int(a.get("kv_slots", 1) or 1))  # #kv-slots: C KV streams
+                                      kv_slots=int(a.get("kv_slots", 1) or 1),  # #kv-slots: C KV streams
+                                      head_quant=head_quant)   # #head-quant: lm_head precision
         else:
             # TENSOR-PARALLEL PATH (tp>1) — TP-v2 PER-RANK STREAMING: this rank fetches ONLY its
             # 1/tp tensor slice from /weights_tp and builds reduced-dim modules directly, so a node

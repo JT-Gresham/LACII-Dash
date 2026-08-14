@@ -434,7 +434,7 @@ class EngineLoadMixin:
                    force: bool = False, moe_offload: bool = False,
                    gpu_spread: bool = False, pin_host: str = "",
                    kv_quant: str = "", kv_offload: bool = False,
-                   kv_slots: int = 1,
+                   kv_slots: int = 1, head_quant: str = "",
                    default_temp: Optional[float] = None,
                    default_min_p: Optional[float] = None,
                    requested_by: str = "",
@@ -491,6 +491,7 @@ class EngineLoadMixin:
                                          moe_offload=moe_offload, gpu_spread=gpu_spread,
                                          pin_host=pin_host, kv_quant=kv_quant,
                                          kv_offload=kv_offload, kv_slots=kv_slots,
+                                         head_quant=head_quant,
                                          default_temp=default_temp,
                                          default_min_p=default_min_p,
                                          requested_by=requested_by,
@@ -536,7 +537,7 @@ class EngineLoadMixin:
                    force: bool = False, moe_offload: bool = False,
                    gpu_spread: bool = False, pin_host: str = "",
                    kv_quant: str = "", kv_offload: bool = False,
-                   kv_slots: int = 1,
+                   kv_slots: int = 1, head_quant: str = "",
                    default_temp: Optional[float] = None,
                    default_min_p: Optional[float] = None,
                    requested_by: str = "",
@@ -1387,6 +1388,11 @@ class EngineLoadMixin:
                         "kv_quant": kv_quant,        # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4)
                         "kv_offload": kv_offload,    # #kv-offload: KV cache in system RAM (OffloadedCache)
                         "kv_slots": kv_slots,        # #kv-slots: C per-request KV streams (worker reserves xC)
+                        # #head-quant: override the lm_head's precision independently of the
+                        # body. '' = leave it alone (bf16 on int4/int2, int8 on the int8
+                        # tier). 'int8' pairs an int4 body with an int8 head, which is the
+                        # trade #8 measured as worth making; 'bf16' forces it back.
+                        "head_quant": head_quant,
                         "ctx": ctx,                  # full ctx -> worker pre-reserves KV (fail-fast)
                         # #63: this stage's planned resident bytes (quantized). The worker reserves
                         # this much RAM up front (a balloon) and consumes it shard-by-shard as layers
@@ -1579,6 +1585,12 @@ class EngineLoadMixin:
                 stage0_dial=_s0_dial, last_send_ts=now)   # #stage0-stale-reconnect: how to re-dial + freshness clock
             self._init_slot_pool(lm)   # #kv-slots: semaphore + slot pool (no-op at C=1)
             lm.base, lm.replica_idx = friendly, replica_idx   # data-parallel grouping (#39)
+            # Build-shaping knobs that are NOT LoadedModel fields, recorded on the instance so the
+            # #load-faster re-place snapshot can carry them across a rebuild. moe_offload was
+            # already READ there (getattr(m, "moe_offload", False)) but never written anywhere, so
+            # that read always returned False and a re-placed MoE model silently lost its offload
+            # split; head_quant would have inherited the same bug.
+            lm.moe_offload, lm.head_quant = bool(moe_offload), (head_quant or "")
             lm.plan_basis = basis                             # placement basis (#65)
             lm.load_warnings, lm.load_assess = load_warnings, assess   # pre-load guardrail (#76)
             # #cpu-bound-visibility: the #76 assess warns from ESTIMATES; here we know the ACTUAL
@@ -2745,6 +2757,7 @@ class EngineLoadMixin:
                         consolidate: bool = True, prefer_vram: bool = True,
                         quant: str = "none", kv_quant: str = "",
                         kv_offload: bool = False, kv_slots: int = 1,
+                        head_quant: str = "",
                         default_temp: Optional[float] = None,
                         default_min_p: Optional[float] = None) -> list["LoadedModel"]:
         """Load `count` full copies of `friendly` on DISJOINT node sets — the small-model
@@ -2766,6 +2779,7 @@ class EngineLoadMixin:
                     lm = await self.load(friendly, ctx, consolidate=consolidate,
                                          prefer_vram=prefer_vram, quant=quant, kv_quant=kv_quant,
                                          kv_offload=kv_offload, kv_slots=kv_slots,
+                                         head_quant=head_quant,
                                          default_temp=default_temp,
                                          default_min_p=default_min_p,
                                          reg_key=key, exclude_nodes=set(used), replica_idx=i)
@@ -3589,7 +3603,8 @@ class EngineLoadMixin:
                         kv_slots=max(1, int(getattr(m, "kv_slots", 1) or 1)),   # #kv-slots kept
                         default_temp=getattr(m, "default_temperature", None),
                         default_min_p=getattr(m, "default_min_p", None),
-                        moe_offload=bool(getattr(m, "moe_offload", False)))
+                        moe_offload=bool(getattr(m, "moe_offload", False)),
+                        head_quant=(getattr(m, "head_quant", "") or ""))   # #head-quant kept
             cpu0, n0 = self._model_cpu_frac(m), len(m.plan.stages)
             gate = asyncio.Event()                          # present+clear = barrier engaged (holds new reqs)
             self._promote_gates[base] = gate
@@ -3610,7 +3625,8 @@ class EngineLoadMixin:
                                     kv_quant=snap["kv_quant"], kv_offload=snap["kv_offload"],
                                     kv_slots=snap["kv_slots"],
                                     default_temp=snap["default_temp"], default_min_p=snap["default_min_p"],
-                                    moe_offload=snap["moe_offload"])
+                                    moe_offload=snap["moe_offload"],
+                                    head_quant=snap.get("head_quant", ""))
                 except Exception as exc:
                     log_activity(f"load-faster: {friendly} faster placement FAILED ({exc!r}) — rolling back")
                     try:
@@ -3618,7 +3634,8 @@ class EngineLoadMixin:
                                         force=True, kv_quant=snap["kv_quant"], kv_offload=snap["kv_offload"],
                                         kv_slots=snap["kv_slots"],
                                         default_temp=snap["default_temp"],
-                                        default_min_p=snap["default_min_p"], moe_offload=snap["moe_offload"])
+                                        default_min_p=snap["default_min_p"], moe_offload=snap["moe_offload"],
+                                        head_quant=snap.get("head_quant", ""))
                     except Exception as exc2:
                         log_activity(f"load-faster: {friendly} ROLLBACK ALSO FAILED ({exc2!r}) — NOT resident")
                         return {"ok": False, "error": f"upgrade failed AND rollback failed: {exc} || {exc2}"}
