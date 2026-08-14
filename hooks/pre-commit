@@ -1,0 +1,41 @@
+#!/bin/sh
+# pre-commit: refuse to COMMIT a secret, on any remote, at all.
+#
+# Why this exists alongside pre-push: pre-push is too late. By the time it fires the secret is
+# already in a local commit, and removing it means an interactive rebase or a reset — on a branch
+# that may already have work stacked on top. Blocking at commit keeps the working tree the only
+# place it ever existed, so the fix is `git restore --staged` and an edit.
+#
+# It is also stricter than pre-push on purpose: pre-push exempts LAN remotes (LAN-scoped secrets
+# are policy-allowed there), but a commit has no remote yet — the same commit can later be pushed
+# anywhere, so "which remote" is not yet knowable and must not be assumed benign.
+#
+# Enable (once per clone; core.hooksPath is local config, not tracked):
+#     git config core.hooksPath hooks
+# Bypass, only when certain a match is a false positive:  git commit --no-verify
+
+. "$(dirname "$0")/_secret-patterns.sh"
+
+hit=0
+# Added lines only, staged content only. --diff-filter=d skips deletions (removing a secret is
+# exactly what we want to encourage, and must never itself be blocked).
+if git diff --cached --no-color --diff-filter=d -U0 | grep -Eq "^\+.*($SECRET_PAT)"; then
+  hit=1
+fi
+
+if [ "$hit" -eq 1 ]; then
+  echo "pre-commit ABORTED: a secret pattern (forge token / cleartext sshpass password) is in the" >&2
+  echo "STAGED changes. Blocking here rather than at push, so it never enters history at all." >&2
+  echo "" >&2
+  echo "Offending file(s):" >&2
+  git diff --cached --no-color --diff-filter=d --name-only | while read -r f; do
+    if git diff --cached --no-color --diff-filter=d -U0 -- "$f" | grep -Eq "^\+.*($SECRET_PAT)"; then
+      echo "  $f" >&2
+    fi
+  done
+  echo "" >&2
+  echo "Unstage it (git restore --staged <file>) and remove the literal, or --no-verify if it is" >&2
+  echo "a false positive. Session notes belong OUTSIDE the repo — see ../im-session-notes/." >&2
+  exit 1
+fi
+exit 0
