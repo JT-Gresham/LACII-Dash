@@ -631,27 +631,33 @@ class EngineLoadMixin:
                     return await self._load_t2a_locked(
                         friendly, _tgt, reg_key or friendly, quant, replica_idx=replica_idx,
                         offload=(t2i_offload or bool(ENGINE_CONFIG.get("t2a_offload_default", True))),
-                        cpu_only=cpu_only)
+                        cpu_only=cpu_only, pin_host=pin_host, exclude_nodes=exclude_nodes)
                 # #stt-serve: a Whisper ASR checkpoint (config model_type 'whisper') loads via the
                 # single-node speech-to-TEXT path — an encoder-decoder model, never pipeline-split.
                 if _d and _is_whisper_dir(_d):
                     return await self._load_stt_locked(friendly, _tgt, reg_key or friendly,
-                                                       replica_idx=replica_idx)
+                                                       replica_idx=replica_idx, pin_host=pin_host,
+                                                       exclude_nodes=exclude_nodes)
                 # #t2music-serve: a MusicGen text-to-music checkpoint (config model_type
                 # 'musicgen'/'musicgen_melody') loads via the single-node MusicGen path — a composite
                 # (text encoder + audio-token LM + EnCodec), never pipeline-split.
                 if _d and _is_musicgen_dir(_d):
                     return await self._load_t2music_locked(friendly, _tgt, reg_key or friendly,
-                                                           replica_idx=replica_idx)
+                                                           replica_idx=replica_idx,
+                                                           pin_host=pin_host,
+                                                           exclude_nodes=exclude_nodes)
                 # #tts-serve: a Kokoro speech checkpoint (kokoro-v1_0.pth + voices/, no
                 # safetensors, no model_index.json) loads via the single-node speech path.
                 if _d and _is_kokoro_dir(_d):
                     return await self._load_tts_locked(friendly, _tgt, reg_key or friendly,
-                                                       replica_idx=replica_idx)
+                                                       replica_idx=replica_idx, pin_host=pin_host,
+                                                       exclude_nodes=exclude_nodes)
                 if _d and _is_diffusers_dir(_d):
                     return await self._load_t2i_locked(friendly, _tgt, reg_key or friendly,
                                                        quant, replica_idx=replica_idx,
-                                                       offload=t2i_offload, force=force)
+                                                       offload=t2i_offload, force=force,
+                                                       pin_host=pin_host,
+                                                       exclude_nodes=exclude_nodes)
                 raise ValueError(f"unknown model '{friendly}'")
             target_id = MODELS[friendly][0] if friendly in MODELS else friendly
             # ENCODER / sentence-embedding model: a whole-model single-node load (no pipeline/TP/KV
@@ -1644,6 +1650,30 @@ class EngineLoadMixin:
             if _held:
                 self.lock.release()
 
+    def _place_filter(self, cand: list, pin_host: str = "", exclude_nodes: Optional[set] = None,
+                      what: str = "model") -> list:
+        """#media-pin: apply the placement constraints to an already-built candidate list, WITHOUT
+        touching the caller's preference ordering (each media leaf has its own can_X/co-location/VRAM
+        ranking and that stays its business).
+
+        The single-node leaves were each written as "find a capable node" and never revisited as
+        placement grew pin / replica / federation semantics, so all three constraints were silently
+        absent. An unsatisfiable pin RAISES naming the survivors: quietly placing elsewhere is the
+        failure mode that let this hide, because a wrong-but-working placement looks fine."""
+        cand = [x for x in cand if not _peer_claimed_host(x.hostname)]
+        if exclude_nodes:
+            cand = [x for x in cand if x.node_id not in exclude_nodes]
+        if pin_host:
+            _p = [x for x in cand if x.hostname == pin_host]
+            if not _p:
+                raise RuntimeError(
+                    f"{what} pinned to '{pin_host}', which is not an eligible node for it "
+                    f"(candidates: {', '.join(x.hostname for x in cand) or 'none'})")
+            return _p
+        if not cand:
+            raise RuntimeError(f"no eligible node for the {what} after peer-claim/replica filtering")
+        return cand
+
     def _embed_candidates(self, pin_host: str = "", exclude_nodes: Optional[set] = None) -> list:
         """#embed-pin: the nodes this embedding model may legally land on, or raise saying why not.
 
@@ -1763,7 +1793,9 @@ class EngineLoadMixin:
 
     async def _load_t2i_locked(self, friendly: str, target_id: str, reg_key: str,
                                quant: str = "int4", replica_idx: int = 0,
-                               offload: bool = False, force: bool = False) -> LoadedModel:
+                               offload: bool = False, force: bool = False,
+                               pin_host: str = "",
+                               exclude_nodes: Optional[set] = None) -> LoadedModel:
         """#t2i-serve (task #37): load a DIFFUSERS image-generation checkpoint (Qwen-Image
         class) WHOLE onto ONE controller-CO-LOCATED GPU worker — the diffusion sibling of
         _load_embedding_locked. v1 constraints, by design: the worker must share this box's
@@ -1838,11 +1870,22 @@ class EngineLoadMixin:
         _OFFLOAD_VRAM_GB = 4.0   # #t2i-offload: transient blocks + activations + VAE only
         want_edge = 2 if quant != "none" else 0
         await self.ensure_data_listener()
+        # #media-pin: the candidate PREDICATE below is entirely static (capability + tier toggles +
+        # co-location) — only the RANKING needs the VRAM the unload frees. So validate placement
+        # here, before the destructive unload, and let the loop re-derive and re-filter for the
+        # actual choice. Without this, an unsatisfiable pin would unload the resident pipeline and
+        # then raise, leaving nothing serving.
+        _ctrl_host = socket.gethostname()
+        self._place_filter(
+            [n for n in registry.alive_sorted()
+             if n.can_infer and n.vram_total_gb > 0 and (n.ram_enabled or n.vram_enabled)
+             and (n.hostname == _ctrl_host or str(n.data_host).startswith(("127.", "::1"))
+                  or str(n.data_host) in _LOCAL_IPS)],
+            pin_host, exclude_nodes, "t2i (image) model")
         if reg_key in self.models:
             await self._unload_model_locked(reg_key, "reload (t2i)")
             await self._await_free_refresh()
         node = edge = None
-        _ctrl_host = socket.gethostname()
         _refreshed = False
         while True:
             # co-located = same box as the controller: hostname match (the robust signal —
@@ -1858,6 +1901,7 @@ class EngineLoadMixin:
                     and (n.hostname == _ctrl_host
                          or str(n.data_host).startswith(("127.", "::1"))
                          or str(n.data_host) in _LOCAL_IPS)]
+            cand = self._place_filter(cand, pin_host, exclude_nodes, "t2i (image) model")
             # In-flight loads' reservations count as USED (they're streaming toward that size —
             # observed: a cache-served 14b auto-load planned seconds before this one filled the
             # card mid-t2i-build and OOM'd even the offload transients). Same discipline as the
@@ -2055,7 +2099,8 @@ class EngineLoadMixin:
 
     async def _load_t2a_locked(self, friendly: str, target_id: str, reg_key: str,
                                quant: str = "none", replica_idx: int = 0,
-                               offload: bool = False,
+                               offload: bool = False, pin_host: str = "",
+                               exclude_nodes: Optional[set] = None,
                                cpu_only: bool = False) -> LoadedModel:
         """#t2a-serve (M1): load an ACE-Step music checkpoint WHOLE onto ONE controller-
         CO-LOCATED GPU worker — the audio sibling of _load_t2i_locked. bf16-only for M1
@@ -2101,6 +2146,16 @@ class EngineLoadMixin:
             return _T2A_OFFLOAD_VRAM_GB if offload else max(all_b / GB + _MARGIN_GB,
                                                             _T2A_RENDER_FLOOR_GB)
         await self.ensure_data_listener()
+        # #media-pin: static predicate -> validate before the destructive unload (see
+        # _load_t2i_locked); the loop below re-derives and re-filters for the actual ranking.
+        _ch = socket.gethostname()
+        self._place_filter(
+            [n for n in registry.alive_sorted()
+             if n.can_infer and (cpu_only or n.vram_total_gb > 0)
+             and (n.ram_enabled or n.vram_enabled)
+             and (n.hostname == _ch or str(n.data_host).startswith(("127.", "::1"))
+                  or str(n.data_host) in _LOCAL_IPS or getattr(n, "can_t2a", False))],
+            pin_host, exclude_nodes, "t2a (ACE-Step) model")
         if reg_key in self.models:
             await self._unload_model_locked(reg_key, "reload (t2a)")
             await self._await_free_refresh()
@@ -2128,6 +2183,7 @@ class EngineLoadMixin:
                     if n.can_infer and (cpu_only or n.vram_total_gb > 0)
                     and (n.ram_enabled or n.vram_enabled)
                     and (_is_colo(n) or getattr(n, "can_t2a", False))]
+            cand = self._place_filter(cand, pin_host, exclude_nodes, "t2a (ACE-Step) model")
             # in-flight loads' reservations count as USED (same discipline as the t2i/LLM planners)
             _res_ram_b, _res_vram_b = self._reserved_bytes(exclude_key=reg_key)
             def _t2a_free(x):
@@ -2271,7 +2327,8 @@ class EngineLoadMixin:
         return lm
 
     async def _load_tts_locked(self, friendly: str, target_id: str, reg_key: str,
-                               replica_idx: int = 0) -> LoadedModel:
+                               replica_idx: int = 0, pin_host: str = "",
+                               exclude_nodes: Optional[set] = None) -> LoadedModel:
         """#tts-serve: load a Kokoro-82M speech checkpoint WHOLE onto ONE controller-
         CO-LOCATED worker — the speech sibling of _load_t2i_locked, but tiny (~0.33 GB),
         so no VRAM edge/quant tiers and no eviction dance. Prefers a co-located GPU
@@ -2280,9 +2337,10 @@ class EngineLoadMixin:
         self.lock (reached only from load())."""
         model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
         await self.ensure_data_listener()
-        if reg_key in self.models:
-            await self._unload_model_locked(reg_key, "reload (tts)")
-            await self._await_free_refresh()
+        # #media-pin: candidates are built and FILTERED before the unload below. The predicate is
+        # static (co-location only), so nothing here needs the unload to have happened — and doing
+        # it in this order means an unsatisfiable pin fails with the resident copy still serving,
+        # instead of unloading it and then raising.
         _ctrl_host = socket.gethostname()
         cand = [n for n in registry.alive_sorted()
                 if n.can_infer and (n.hostname == _ctrl_host
@@ -2292,6 +2350,10 @@ class EngineLoadMixin:
             raise RuntimeError("no controller-co-located worker for the tts (Kokoro) model "
                                "— v1 serves speech models only on a worker sharing the "
                                "controller's box")
+        cand = self._place_filter(cand, pin_host, exclude_nodes, "tts (Kokoro) model")
+        if reg_key in self.models:
+            await self._unload_model_locked(reg_key, "reload (tts)")
+            await self._await_free_refresh()
         # prefer a GPU-capable co-located node (faster); fall back to a CPU node.
         node = next((n for n in cand if n.vram_total_gb > 0), cand[0])
         device = "cuda" if node.vram_total_gb > 0 else "cpu"
@@ -2360,7 +2422,8 @@ class EngineLoadMixin:
         return lm
 
     async def _load_stt_locked(self, friendly: str, target_id: str, reg_key: str,
-                               replica_idx: int = 0) -> LoadedModel:
+                               replica_idx: int = 0, pin_host: str = "",
+                               exclude_nodes: Optional[set] = None) -> LoadedModel:
         """#stt-serve: load a Whisper ASR checkpoint WHOLE onto ONE worker — the transcription
         sibling of _load_tts_locked. Whisper is a small (~0.8-1.5 GB) ENCODER-DECODER model, so no
         VRAM edge/quant tiers and no eviction dance. Prefers a co-located GPU worker; a REMOTE
@@ -2369,9 +2432,6 @@ class EngineLoadMixin:
         fallback. MUST hold self.lock (reached only from load())."""
         model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
         await self.ensure_data_listener()
-        if reg_key in self.models:
-            await self._unload_model_locked(reg_key, "reload (stt)")
-            await self._await_free_refresh()
 
         def _is_colo(n):
             return (n.hostname == socket.gethostname()
@@ -2392,6 +2452,12 @@ class EngineLoadMixin:
         if not cand:
             raise RuntimeError("no worker can serve the stt (Whisper) model — need a co-located "
                                "worker or one advertising the transcription runtime (can_stt)")
+        # #media-pin: filter BEFORE the unload (see _load_tts_locked) — the predicate above is
+        # static, so an unsatisfiable pin fails with the resident copy still serving.
+        cand = self._place_filter(cand, pin_host, exclude_nodes, "stt (Whisper) model")
+        if reg_key in self.models:
+            await self._unload_model_locked(reg_key, "reload (stt)")
+            await self._await_free_refresh()
         node = sorted(cand, key=lambda _n: (bool(getattr(_n, "can_stt", False)),
                                             _is_colo(_n), _n.vram_total_gb), reverse=True)[0]
         device = "cuda" if node.vram_total_gb > 0 else "cpu"
@@ -2459,7 +2525,8 @@ class EngineLoadMixin:
         return lm
 
     async def _load_t2music_locked(self, friendly: str, target_id: str, reg_key: str,
-                                   replica_idx: int = 0) -> LoadedModel:
+                                   replica_idx: int = 0, pin_host: str = "",
+                                   exclude_nodes: Optional[set] = None) -> LoadedModel:
         """#t2music-serve: load a MusicGen text-to-music checkpoint WHOLE onto ONE worker — the music
         sibling of _load_stt_locked. MusicGen is a small (~0.3-3.3 GB) autoregressive transformer +
         EnCodec, so no VRAM edge/quant tiers and no eviction dance. Prefers a co-located GPU worker;
@@ -2468,9 +2535,6 @@ class EngineLoadMixin:
         GPU->CPU fallback). MUST hold self.lock (reached only from load())."""
         model_dir = await asyncio.to_thread(_controller_model_dir, target_id)
         await self.ensure_data_listener()
-        if reg_key in self.models:
-            await self._unload_model_locked(reg_key, "reload (t2music)")
-            await self._await_free_refresh()
 
         def _is_colo(n):
             return (n.hostname == socket.gethostname()
@@ -2486,6 +2550,12 @@ class EngineLoadMixin:
         if not cand:
             raise RuntimeError("no worker can serve the t2music (MusicGen) model — need a co-located "
                                "worker or one advertising the MusicGen runtime (can_t2music)")
+        # #media-pin: filter BEFORE the unload (see _load_tts_locked) — the predicate above is
+        # static, so an unsatisfiable pin fails with the resident copy still serving.
+        cand = self._place_filter(cand, pin_host, exclude_nodes, "t2music (MusicGen) model")
+        if reg_key in self.models:
+            await self._unload_model_locked(reg_key, "reload (t2music)")
+            await self._await_free_refresh()
         node = sorted(cand, key=lambda _n: (bool(getattr(_n, "can_t2music", False)),
                                             _is_colo(_n), _n.vram_total_gb), reverse=True)[0]
         device = "cuda" if node.vram_total_gb > 0 else "cpu"
