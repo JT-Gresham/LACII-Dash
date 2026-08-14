@@ -85,6 +85,14 @@ if triton is not None:
 # QuantLinear4 at placement, self-checked vs the naive dequant, naive fallback on any mismatch /
 # unsupported device. Off-switch: IM_FUSED_INT4=0.
 _FUSED_INT4 = (os.environ.get("IM_FUSED_INT4", "1") != "0")
+
+# #w8a16: same doctrine for the int8 tier — bind a Triton int8 GEMM/GEMV so QuantLinear stops
+# rematerializing its bf16 weight every call. Kept BEHAVIOUR-GATED as well as env-gated: the op
+# is only retained when it self-checks AND out-benchmarks the naive path on the actual device
+# (see QuantLinear.prepare_fused), because on a discrete NVIDIA card cuBLAS bf16 is fast enough
+# that dequant-once can win — the same trap that made torch's _weight_int8pack_mm measure 2-5x
+# SLOWER than bf16 F.linear on CUDA. Off-switch: IM_FUSED_W8A16=0.
+_FUSED_W8A16 = (os.environ.get("IM_FUSED_W8A16", "1") != "0")
 # Fused-dequant int2 GEMM (Triton w2a16 — there is NO torch tinygemm for 2-bit): same contract
 # as _FUSED_INT4 but for QuantLinear2; the one Triton kernel serves BOTH CUDA and ROCm (no-triton
 # workers self-gate to the naive dequant path). Off-switch: IM_FUSED_INT2=0.
@@ -397,8 +405,74 @@ def _quant_linear_cls():
                     y = F.linear(x.to(torch.float32), w,
                                  None if b is None else b.to(torch.float32))
                     return y.to(x.dtype)
+                # #w8a16: read the int8 weight DIRECTLY (no bf16 rematerialization). Bound by
+                # prepare_fused only after it self-checks AND out-benchmarks the line below on this
+                # device, so reaching here at all means it measured faster. bf16 activations only:
+                # the kernel accumulates in fp32 and applies the per-row scale afterwards, but an
+                # fp32 or fp16 input would have to be down-converted to feed tl.dot, which is a
+                # silent precision change the naive path does not make.
+                _op = getattr(self, "_w8", None)
+                if _op is not None and x.dtype == torch.bfloat16:
+                    _shape = x.shape
+                    y = _op(x.reshape(-1, _shape[-1]), self.qweight, self.scale)
+                    y = y.reshape(*_shape[:-1], y.shape[-1])
+                    return y if self.bias is None else y + self.bias
                 w = self.qweight.to(x.dtype) * self.scale    # dequant one weight matrix
                 return F.linear(x, w, self.bias)
+
+            def prepare_fused(self):
+                """#w8a16: bind the Triton int8 kernel to THIS linear, but only if it is both
+                correct and actually faster here. Picked up automatically by the same
+                client._finalize_placement sweep that calls QuantLinear4.prepare_fused (it dispatches
+                on hasattr), so no caller changes — and, like that one, it must run AFTER final
+                device placement.
+
+                Gated on a BENCHMARK, not just a self-check, because 'reads fewer bytes' does not
+                imply 'faster': on a discrete NVIDIA card cuBLAS bf16 is fast enough that
+                dequant-once-then-GEMM can beat reading int8 in the GEMM, which is exactly how
+                torch's own _weight_int8pack_mm measured 2-5x SLOWER than bf16 F.linear on CUDA.
+                The win is real on a bandwidth-saturated iGPU and assumed nowhere.
+
+                The self-check runs at M=1 AND M=4 — the two kernels are DIFFERENT (split-K GEMV
+                with atomic accumulation vs tl.dot GEMM) and only the GEMV has the reset_to_zero
+                hazard, so an M=4-only check (what the int4 path does) would not see a broken
+                decode path at all."""
+                if getattr(self, "_fused_tried", False) or not _FUSED_W8A16:
+                    return
+                self._fused_tried = True
+                dev = self.qweight.device
+                if dev.type != "cuda":          # torch reports ROCm as 'cuda' too
+                    return
+                op = _w8a16_triton_op()
+                if op is None:
+                    return
+                try:
+                    K = int(self.qweight.shape[1])
+                    wref = self.qweight.to(torch.bfloat16) * self.scale.to(torch.bfloat16)
+                    for M in (1, 4):
+                        xt = torch.randn(M, K, device=dev, dtype=torch.bfloat16)
+                        yf = op(xt, self.qweight, self.scale).float()
+                        yn = F.linear(xt, wref).float()
+                        rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
+                        if not (rel < 0.05):
+                            print(f"[int8] w8a16 self-check rel={rel:.3f} at M={M} on {dev} "
+                                  f"-> naive path", flush=True)
+                            del wref
+                            return
+                    # Decode is the case this exists for, so decode is what decides it.
+                    x1 = torch.randn(1, K, device=dev, dtype=torch.bfloat16)
+                    t_f = _time_cuda(lambda: op(x1, self.qweight, self.scale), dev)
+                    t_n = _time_cuda(
+                        lambda: F.linear(x1, self.qweight.to(torch.bfloat16) * self.scale), dev)
+                    del wref
+                    if t_f < t_n:
+                        self._w8 = op
+                        _w8a16_note(self.qweight.numel(), t_n / max(t_f, 1e-9), dev)
+                    else:
+                        _w8a16_note_lost(t_f, t_n, dev)
+                except Exception as exc:
+                    print(f"[int8] w8a16 prepare failed on {dev} ({exc!r}) -> naive path",
+                          flush=True)
 
         _QUANT_LINEAR = QuantLinear
     return _QUANT_LINEAR
@@ -658,6 +732,201 @@ def _quant4_linear_cls():
 
         _QUANT_LINEAR4 = QuantLinear4
     return _QUANT_LINEAR4
+
+
+# --- Triton w8a16 int8 GEMM/GEMV (makes the int8 tier a SPEED tier) --------------------------
+# int8 weight-only quant shipped as a pure MEMORY tier, and was actively ANTI-speed: QuantLinear's
+# forward did `qweight.to(x.dtype) * scale` then F.linear, so one decode step read the int8 weight,
+# WROTE a full bf16 copy of it, and read that back — ~2.5x the traffic of just keeping the weight
+# in bf16. That is why the #8 lm_head investigation (2026-08-13) found int8 to be the quality-safe
+# head quant (+0.0050 nats, 98.4% top-1 agreement on Qwen2.5-7B — ~25x less damage than int4-g128)
+# and STILL unusable for speed: the kernel did not exist. This is that kernel.
+#
+# The int8 format is much simpler than int4 and the kernel is simpler with it:
+#   qweight int8 [N, K] row-major (NO packing, NO padding), scale bf16 [N, 1], symmetric w = q*s.
+# Because the scale is PER OUTPUT ROW it factors straight out of the K loop — the inner loop is a
+# plain dot product and the scale is applied once, after an fp32 accumulation. That is strictly
+# MORE accurate than the w4a16 kernel below, which must dequantize to bf16 inside the loop: int8
+# values (|q| <= 127) are represented EXACTLY in bf16's 8 mantissa bits, so converting q for tl.dot
+# loses nothing, and the only rounding is the fp32 accumulator's.
+#
+# Split-K on the GEMV is what makes decode fast (same reasoning as _ksk): at M=1 a tl.dot kernel
+# launches only ~cdiv(N,BN) programs, far too few to hide memory latency on an iGPU. Splitting K
+# and atomic-adding fp32 partials grows the grid ~SPLITKx. Scaling a partial is safe precisely
+# because the scale is per-row and linear: sum_i(acc_i * s) == s * sum_i(acc_i).
+_W8A16_OP = None
+_W8A16_TRIED = False
+_W8A16_BUILD_LOCK = threading.RLock()   # #triton-race: see _W4A16_BUILD_LOCK below
+_W8A16_LOGGED = False
+
+
+def _time_cuda(fn, dev, iters: int = 30, warmup: int = 8) -> float:
+    """Wall time per call in ms, with the device synchronized. Small helper so prepare_fused can
+    make a decision from a measurement instead of an assumption."""
+    import torch
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize(dev)
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        fn()
+    torch.cuda.synchronize(dev)
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
+def _w8a16_note(nweights: int, speedup: float, dev) -> None:
+    """One line per SHARD, not per linear — a 7B has ~200 of these and the per-linear spam would
+    bury the load log (and every line costs a flush on a box that is mid-load)."""
+    global _W8A16_LOGGED
+    if _W8A16_LOGGED:
+        return
+    _W8A16_LOGGED = True
+    print(f"[int8] w8a16 triton kernel ACTIVE on {dev} — {speedup:.2f}x vs dequant+F.linear at "
+          f"decode (first linear: {nweights / 2 ** 20:.0f} MB int8, bf16 copy no longer "
+          f"materialized per call)", flush=True)
+
+
+def _w8a16_note_lost(t_f: float, t_n: float, dev) -> None:
+    global _W8A16_LOGGED
+    if _W8A16_LOGGED:
+        return
+    _W8A16_LOGGED = True
+    print(f"[int8] w8a16 triton {t_f:.3f}ms vs dequant+F.linear {t_n:.3f}ms at decode on {dev} "
+          f"-> keeping the naive path (measured, not assumed)", flush=True)
+
+
+def _w8a16_triton_op():
+    """Callable op(x[M,K] bf16, qweight int8[N,K], scale bf16[N,1]) -> y[M,N] bf16, or None if
+    triton is unavailable / fails to build. Thread-safe lazy build (see _W4A16_BUILD_LOCK)."""
+    global _W8A16_OP, _W8A16_TRIED
+    if _W8A16_TRIED:
+        return _W8A16_OP
+    with _W8A16_BUILD_LOCK:
+        return _w8a16_triton_op_locked()
+
+
+def _w8a16_triton_op_locked():
+    global _W8A16_OP, _W8A16_TRIED
+    if _W8A16_TRIED:            # a racer built it while we waited on the lock
+        return _W8A16_OP
+    try:
+        import torch
+        if triton is None:
+            raise ImportError("triton unavailable")
+
+        @triton.autotune(
+            configs=[triton.Config({"BM": bm, "BN": bn, "BK": bk}, num_warps=w, num_stages=st)
+                     for (bm, bn, bk, w, st) in ((32, 128, 64, 4, 3), (32, 128, 128, 8, 3),
+                                                 (64, 128, 64, 8, 3), (64, 64, 128, 4, 3),
+                                                 (128, 128, 64, 8, 3), (16, 128, 128, 4, 3))],
+            key=["M", "N", "K"],
+        )
+        @triton.jit
+        def _k8(x_ptr, q_ptr, s_ptr, y_ptr, M, N, K,
+                sxm, sxk, sqk, sqn, ssn, sym, syn,
+                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+            """PREFILL (M>1): ordinary blocked GEMM. int8 -> bf16 is exact, so the only
+            approximation is the fp32 accumulator; the per-row scale is applied after the loop."""
+            pid_m = tl.program_id(0)
+            pid_n = tl.program_id(1)
+            offs_m = pid_m * BM + tl.arange(0, BM)
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            offs_k = tl.arange(0, BK)
+            mmask = offs_m < M
+            nmask = offs_n < N
+            acc = tl.zeros((BM, BN), dtype=tl.float32)
+            for kb in range(0, tl.cdiv(K, BK)):
+                ks = kb * BK + offs_k
+                kmask = ks < K
+                xv = tl.load(x_ptr + offs_m[:, None] * sxm + ks[None, :] * sxk,
+                             mask=mmask[:, None] & kmask[None, :], other=0.0)
+                # q is [N, K] row-major, so ks (stride 1) is the CONTIGUOUS axis of this tile —
+                # each output row reads BK consecutive bytes per step, which is what keeps the
+                # loads coalesced despite the weight being indexed [n, k].
+                qv = tl.load(q_ptr + ks[:, None] * sqk + offs_n[None, :] * sqn,
+                             mask=kmask[:, None] & nmask[None, :], other=0)
+                acc += tl.dot(xv.to(tl.bfloat16), qv.to(tl.bfloat16))
+            s = tl.load(s_ptr + offs_n * ssn, mask=nmask, other=0.0).to(tl.float32)
+            acc = acc * s[None, :]
+            tl.store(y_ptr + offs_m[:, None] * sym + offs_n[None, :] * syn,
+                     acc.to(tl.bfloat16), mask=mmask[:, None] & nmask[None, :])
+
+        # reset_to_zero on y_ptr: this kernel ATOMIC-ADDS, so autotune's own timing reruns would
+        # otherwise accumulate into the same buffer and corrupt the first call for each (N,K).
+        # The int4 twin shipped without this at first and the bug hid behind the load-time
+        # self-check absorbing the corrupted first launch — hence the M=1 self-check above.
+        @triton.autotune(
+            configs=[triton.Config({"BN": bn, "BK": bk, "SPLITK": s}, num_warps=w)
+                     for bn in (64, 128) for bk in (128, 256)
+                     for s in (4, 8, 16) for w in (4, 8, 16)],
+            key=["N", "K"],
+            reset_to_zero=["y_ptr"],
+        )
+        @triton.jit
+        def _ksk8(x_ptr, q_ptr, s_ptr, y_ptr, N, K,
+                  sxk, sqk, sqn, ssn, syn,
+                  BN: tl.constexpr, BK: tl.constexpr, SPLITK: tl.constexpr):
+            """DECODE (M=1): split-K GEMV. Each program reduces a slice of K for a block of N and
+            atomic-adds its fp32 partial. Applying the per-row scale to the PARTIAL is exact —
+            sum_i(acc_i * s) == s * sum_i(acc_i) — which is only true because the scale is per
+            output row; a group-wise scale could not be hoisted like this."""
+            pid_n = tl.program_id(0)
+            pid_k = tl.program_id(1)
+            offs_n = pid_n * BN + tl.arange(0, BN)
+            nmask = offs_n < N
+            offs_k = tl.arange(0, BK)
+            nkb = tl.cdiv(K, BK)
+            kpb = (nkb + SPLITK - 1) // SPLITK
+            k0 = pid_k * kpb
+            acc = tl.zeros((BN,), dtype=tl.float32)
+            for i in range(0, kpb):
+                kb = k0 + i
+                if kb < nkb:
+                    ks = kb * BK + offs_k
+                    kmask = ks < K
+                    xv = tl.load(x_ptr + ks * sxk, mask=kmask, other=0.0).to(tl.float32)
+                    qv = tl.load(q_ptr + ks[:, None] * sqk + offs_n[None, :] * sqn,
+                                 mask=kmask[:, None] & nmask[None, :], other=0).to(tl.float32)
+                    acc += tl.sum(xv[:, None] * qv, axis=0)
+            s = tl.load(s_ptr + offs_n * ssn, mask=nmask, other=0.0).to(tl.float32)
+            tl.atomic_add(y_ptr + offs_n * syn, acc * s, mask=nmask)
+
+        def _op(x, qweight, scale):
+            if x.dim() != 2:
+                x = x.reshape(-1, x.shape[-1])
+            x = x.contiguous()
+            M, K = x.shape
+            N = qweight.shape[0]
+            if M == 1:
+                yf = torch.zeros((N,), device=x.device, dtype=torch.float32)
+                grid = lambda meta: (triton.cdiv(N, meta["BN"]), meta["SPLITK"])  # noqa: E731
+                _ksk8[grid](x.view(-1), qweight, scale, yf, N, K,
+                            x.stride(1), qweight.stride(1), qweight.stride(0),
+                            scale.stride(0), yf.stride(0))
+                return yf.to(torch.bfloat16).view(1, N)
+            # #m-bucket: pad rows to the power-of-two bucket so this kernel is JIT-specialized at
+            # ~log2(chunk) distinct M shapes instead of once per novel prompt length (seen live on
+            # gfx1151 as tens of seconds per new length). Zero rows are exact — the dot products
+            # are row-independent — and are sliced back off.
+            Mp = _m_bucket(M)
+            if Mp != M:
+                import torch.nn.functional as _F
+                x = _F.pad(x, (0, 0, 0, Mp - M))
+            y = torch.empty((Mp, N), device=x.device, dtype=torch.bfloat16)
+            grid = lambda meta: (triton.cdiv(Mp, meta["BM"]), triton.cdiv(N, meta["BN"]))  # noqa: E731
+            _k8[grid](x, qweight, scale, y, Mp, N, K,
+                      x.stride(0), x.stride(1), qweight.stride(1), qweight.stride(0),
+                      scale.stride(0), y.stride(0), y.stride(1))
+            return y if Mp == M else y[:M]
+
+        _W8A16_OP = _op
+        _builtins.print("[int8] triton w8a16 kernel built", flush=True)
+    except Exception as exc:
+        _builtins.print(f"[int8] triton w8a16 unavailable ({exc!r}) -> naive int8", flush=True)
+        _W8A16_OP = None
+    finally:
+        _W8A16_TRIED = True
+    return _W8A16_OP
 
 
 # --- Triton w4a16 int4 GEMM (ROCm fast int4 decode) ------------------------------------------
