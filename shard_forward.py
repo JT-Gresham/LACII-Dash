@@ -502,9 +502,22 @@ class ShardForwardMixin:
                     if getattr(self.torch.version, "hip", None):
                         print("[kv_offload] ROCm/HIP: offloaded-KV prefetch garbles decode "
                               "(stream race, validated live) -> plain on-device KV", flush=True)
-                    elif any(getattr(d, "type", "") == "cuda"
-                             for d in (getattr(self, "layer_devices", None) or [])):
-                        self.kv = DynamicCache(offloading=True)
+                    else:
+                        # ALL, not ANY. `DynamicCache(offloading=True)` prefetches every layer's
+                        # K/V to "the" compute device — it assumes ONE. On a mixed shard (some
+                        # layers GPU, the rest spilled to CPU, which is the ordinary shape here
+                        # whenever a model doesn't fit) `any` was true, so the CPU layers were
+                        # offloaded too and their prefetch targets the wrong device.
+                        # The empty case must be excluded explicitly: all([]) is vacuously True,
+                        # so a shard that never populated layer_devices would otherwise turn
+                        # offloading ON precisely when we know least about the placement.
+                        _ld = getattr(self, "layer_devices", None) or []
+                        if _ld and all(getattr(d, "type", "") == "cuda" for d in _ld):
+                            self.kv = DynamicCache(offloading=True)
+                        elif _ld:
+                            print("[kv_offload] shard spans "
+                                  f"{sorted({getattr(d, 'type', '?') for d in _ld})} — offloaded KV "
+                                  "assumes a single compute device -> plain on-device KV", flush=True)
                 except Exception as exc:
                     print(f"[kv_offload] unavailable ({exc!r}) -> plain bf16 KV on device", flush=True)
                 if self.kv is None:

@@ -606,12 +606,27 @@ def _quant4_linear_cls():
                             buf[:, :qw.shape[1]].copy_(qw)
                             self.qweight = buf[:, :qw.shape[1]]
                         sz = (self.scale, self.zero)
-                        xt = torch.randn(8, self.in_features, device=dev, dtype=torch.bfloat16)
-                        xk = xt if in_pad == self.in_features else F.pad(xt, (0, in_pad - self.in_features))
-                        yf = op(xk.contiguous(), self.qweight, G, sz).float()
-                        yn = F.linear(xt, self._dequant(torch.bfloat16)).float()
-                        rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
-                        if rel < 0.05:
+                        # The M=1 probe is NOT redundant with M=8. `_op` dispatches on M: M==1 goes
+                        # to `_ksk`, a split-K GEMV that tl.atomic_adds into a zeroed accumulator,
+                        # and every other M goes to `_k`, a tl.dot GEMM. They share no code. An
+                        # M=8-only check (what this was) validates the GEMM and says NOTHING about
+                        # the kernel that runs on every decoded token — and the GEMV is the one
+                        # carrying the reset_to_zero hazard, where a stale accumulator shows up as
+                        # wrong logits rather than an error. Decode is the hot path; check it.
+                        wref = self._dequant(torch.bfloat16)
+                        rel = 0.0
+                        bad_m = 0
+                        for _M in (1, 8):
+                            xt = torch.randn(_M, self.in_features, device=dev, dtype=torch.bfloat16)
+                            xk = xt if in_pad == self.in_features else F.pad(xt, (0, in_pad - self.in_features))
+                            yf = op(xk.contiguous(), self.qweight, G, sz).float()
+                            yn = F.linear(xt, wref).float()
+                            rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
+                            if not (rel < 0.05):
+                                bad_m = _M
+                                break
+                        del wref
+                        if not bad_m:
                             self._fused = (self.qweight, sz, op, in_pad)   # kernel reads qweight; keep it
                             print(f"[int4] triton w4a16 kernel active on {dev}", flush=True)
                             # #large-m-naive: fused is now proven for correctness; bench whether
@@ -619,7 +634,8 @@ def _quant4_linear_cls():
                             # of the decode-tuned _k (threshold 0 = never; cached per shape).
                             self._naive_m_min = _bench_large_m_naive(self, "int4")
                         else:
-                            print(f"[int4] triton w4a16 self-check rel={rel:.3f} on {dev} -> naive", flush=True)
+                            print(f"[int4] triton w4a16 self-check rel={rel:.3f} at M={bad_m} "
+                                  f"on {dev} -> naive", flush=True)
                     except Exception as exc:
                         print(f"[int4] triton w4a16 prepare failed on {dev} ({exc!r}) -> naive", flush=True)
                     return
@@ -1603,12 +1619,23 @@ def _quant2_linear_cls():
                         buf[:, :qw.shape[1]].copy_(qw)
                         self.qweight = buf[:, :qw.shape[1]]
                     sz = (self.scale, self.zero)
-                    xt = torch.randn(8, self.in_features, device=dev, dtype=torch.bfloat16)
-                    xk = xt if in_pad == self.in_features else F.pad(xt, (0, in_pad - self.in_features))
-                    yf = op(xk.contiguous(), self.qweight, G, sz).float()
-                    yn = F.linear(xt, self._dequant(torch.bfloat16)).float()
-                    rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
-                    if rel < 0.05:
+                    # M=1 and M=8 hit DIFFERENT kernels (`_ksk2` split-K GEMV vs `_k2` tl.dot GEMM),
+                    # exactly as in QuantLinear4 — see the note there. Probing only M=8 validated the
+                    # prefill kernel and left the decode kernel, the one that runs per token, unchecked.
+                    wref = self._dequant(torch.bfloat16)
+                    rel = 0.0
+                    bad_m = 0
+                    for _M in (1, 8):
+                        xt = torch.randn(_M, self.in_features, device=dev, dtype=torch.bfloat16)
+                        xk = xt if in_pad == self.in_features else F.pad(xt, (0, in_pad - self.in_features))
+                        yf = op(xk.contiguous(), self.qweight, G, sz).float()
+                        yn = F.linear(xt, wref).float()
+                        rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
+                        if not (rel < 0.05):
+                            bad_m = _M
+                            break
+                    del wref
+                    if not bad_m:
                         self._fused = (self.qweight, sz, op, in_pad)   # kernel reads qweight; keep it
                         print(f"[int2] triton w2a16 kernel active on {dev}", flush=True)
                         # #large-m-naive: same measured prefill dispatch as QuantLinear4 — the
@@ -1617,7 +1644,8 @@ def _quant2_linear_cls():
                         # this fused path exists.
                         self._naive_m_min = _bench_large_m_naive(self, "int2")
                     else:
-                        print(f"[int2] triton w2a16 self-check rel={rel:.3f} on {dev} -> naive", flush=True)
+                        print(f"[int2] triton w2a16 self-check rel={rel:.3f} at M={bad_m} "
+                              f"on {dev} -> naive", flush=True)
                 except Exception as exc:
                     print(f"[int2] triton w2a16 prepare failed on {dev} ({exc!r}) -> naive", flush=True)
 
@@ -1907,16 +1935,30 @@ def _packed4_3d_cls():
                                 import torch.nn.functional as _F
                                 w0 = wc(self.qweight[0], self.scale[0], self.zero[0],
                                         self.group_size, self.in_features)
-                                xt = torch.randn(8, self.in_features, device=self.qweight.device,
-                                                 dtype=torch.bfloat16)
-                                yn = _F.linear(xt, w0._materialize()).float()
-                                yf = _F.linear(xt, w0).float()
-                                rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
-                                if rel < 0.05:
+                                # M=1 matters MORE here than in the dense case, not less: at decode
+                                # a MoE routes ONE token to each active expert, so the per-expert
+                                # GEMM is M=1 and lands on `_ksk` — the split-K GEMV — every single
+                                # token. An M=8-only check validated the prefill kernel and left the
+                                # entire routed-expert decode path unverified.
+                                wref = w0._materialize()
+                                rel = 0.0
+                                bad_m = 0
+                                for _M in (1, 8):
+                                    xt = torch.randn(_M, self.in_features,
+                                                     device=self.qweight.device, dtype=torch.bfloat16)
+                                    yn = _F.linear(xt, wref).float()
+                                    yf = _F.linear(xt, w0).float()
+                                    rel = ((yf - yn).abs().mean() / (yn.abs().mean() + 1e-6)).item()
+                                    if not (rel < 0.05):
+                                        bad_m = _M
+                                        break
+                                del wref
+                                if not bad_m:
                                     self._expert_triton = True
                                     _builtins.print(f"[int4] triton w4a16 experts active (rel={rel:.4f})", flush=True)
                                 else:
-                                    _builtins.print(f"[int4] triton w4a16 experts self-check rel={rel:.3f} -> bf16 dequant", flush=True)
+                                    _builtins.print(f"[int4] triton w4a16 experts self-check rel={rel:.3f} "
+                                                    f"at M={bad_m} -> bf16 dequant", flush=True)
                 if self._expert_triton:
                     return _w4a16_expert_cls()(self.qweight[e], self.scale[e], self.zero[e],
                                                self.group_size, self.in_features)

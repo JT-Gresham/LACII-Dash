@@ -17,7 +17,7 @@ from typing import Optional
 import json
 import os
 
-from shards import (INT4_GROUP, INT2_GROUP, _dequant_fp8_to_bf16, _dequant_nvfp4_to_bf16, _fp8_block_size, _fp8_scale_name, _has_moe_experts, _head_key, _is_fp8_meta_name, _is_tied, _model_num_layers, _nvfp4_global_scale_name, _nvfp4_group_size, _nvfp4_scale_name, _skeleton_from_cfg, _text_prefix, _weight_map, build_skeleton_from_config)   # noqa: F401  (shared helpers STAY in shards)
+from shards import (INT4_GROUP, INT2_GROUP, _dequant_fp8_to_bf16, _dequant_nvfp4_to_bf16, _fp8_block_size, _fp8_scale_name, _has_moe_experts, _head_key, _is_fp8_meta_name, _is_tied, _model_num_layers, _mxfp4_quantized, _nvfp4_global_scale_name, _nvfp4_group_size, _nvfp4_scale_name, _skeleton_from_cfg, _text_prefix, _weight_map, build_skeleton_from_config)   # noqa: F401  (shared helpers STAY in shards)
 from wire import (_fuse_moe_experts)   # noqa: F401
 
 # #distributed-packing Inc 4: a packer-identity tag stamped into the manifest so a load REJECTS a
@@ -328,6 +328,22 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
             if not _q_perexpert:
                 raise ValueError("fused-3D fp8/nvfp4-source MoE shard compile not supported "
                                  "(no 3D serve-dequant path); per-expert quantized MoE is supported")
+        # MXFP4-source MoE (gpt-oss): the ONE case that would produce a silently WRONG cache rather
+        # than fail. gpt-oss stores its fused experts IN-MAJOR — `_dequant_mxfp4_to_bf16` returns
+        # [E, in, out] (its own docstring says so), because gpt-oss applies experts as `y = x @ W`.
+        # `pack_linear_int4_3d` packs W3[e] as a 2D [out, in]. Nothing here reconciles the two, so
+        # every expert would be packed transposed and the w4a16 kernel would read the wrong axis —
+        # producing a cache that loads, verifies its own sha, and generates garbage.
+        # The WORKER does handle it (worker_quant.py transposes to [E, out, in] before packing,
+        # `_install_gptoss_fused_forward`), which is exactly why this went unnoticed: cold loads
+        # are correct and only the cache is wrong. Refuse until the packer transposes too — a
+        # missing cache costs a re-quantize per load, a wrong one costs silent corruption.
+        if _mxfp4_quantized(model_dir) and (_moe_fused or _exp3d):
+            raise ValueError("MXFP4-source fused MoE (gpt-oss) shard compile not supported: its "
+                             "experts are IN-major [E, in, out] and the 3D packer assumes "
+                             "[E, out, in], which would produce a silently transposed cache. "
+                             "Load gpt-oss at int4 without a shard cache (the worker transposes "
+                             "correctly on the cold path), or at quant=none for bf16")
         if not _moe_fused and not _exp3d and not _moe_per_expert:
             raise ValueError("per-expert MoE shard compile needs the model skeleton (it failed to "
                              "build — no fused-3D layout to fuse into nor per-expert scope to pack); "
