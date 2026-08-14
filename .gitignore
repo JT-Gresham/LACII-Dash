@@ -12,6 +12,18 @@ Brain_Dump.md
 **/BRAIN_DUMP.md
 **/Brain_Dump.md
 
+# --- Session handoff / planning notes — never commit (same class as braindump.md) ---
+# These are per-session working records. They were untracked but NOT ignored, which meant a single
+# `git add -A` would have committed them — and 13 of the 14 present on 2026-08-14 contained CLEARTEXT
+# SSH PASSWORDS for the fleet (node/PVE/deck logins), alongside LAN addressing and host inventory.
+# `origin` is the PUBLIC github.com mirror, so that push would have been permanent and irreversible.
+# Verified at the time: `git log --all -S<secret>` returned 0 commits and HEAD was clean, so nothing
+# had leaked — this closes a prospective hole, it does not paper over an actual one.
+# Durable knowledge belongs in the vault or CHANGELOG.md, which are written for publication.
+INFINITEMODEL_SESSION_HANDOFF_*.md
+INFINITEMODEL_CODE_SPLIT_PLAN_*.md
+INFINITEMODEL_OPEN_TASKS_*.md
+
 # --- Secrets — never commit (see CLAUDE.md) ---
 hf_token.txt
 **/hf_token.txt
@@ -68,6 +80,14 @@ vision_diag.log
 speech_resp.json
 tts_api.*
 
+# --- Claude Code machine-local state ---
+# settings.local.json is per-machine by Claude Code's own convention (settings.json is the shared
+# one); this copy still carries Windows paths from before the Debian reinstall. worktrees/ holds
+# throwaway checkouts — three dead ones registered under C:/Users/... survived the reinstall and
+# their stale July copies of CHANGELOG/MODEL_TEST_STATUS/docs polluted every repo-wide grep.
+.claude/settings.local.json
+.claude/worktrees/
+
 # --- Editor / OS noise ---
 .vscode/
 .idea/
@@ -92,3 +112,5 @@ _nvfp4_meastest.py
 
 # scratch curl/test outputs (underscore-prefixed)
 _*.json
+# one-off API-response dumps (t.json was an 88 KB GitHub tree listing left from Jul 22)
+t.json

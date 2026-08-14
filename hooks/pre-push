@@ -1,0 +1,66 @@
+#!/bin/sh
+# pre-push: refuse to push a secret to a PUBLIC github.com remote.
+#
+# Why this lives in the repo (hooks/) rather than only in .git/hooks: .git/ is not cloned, so a
+# hook kept there protects exactly one working copy. This one was in exactly one clone, and it was
+# not even executable (mode 0644), so git had never run it — an inert guard reads identically to a
+# working one right up until the day it matters.
+#
+# Enable it in a fresh clone (once, per clone — core.hooksPath is local config, not tracked):
+#     git config core.hooksPath hooks
+#
+# Scans only the ADDED lines of the OUTGOING commits. LAN remotes are unguarded on purpose:
+# LAN-scoped secrets in a LAN GitLab are policy-allowed; github.com is public and permanent.
+# Bypass, only when certain a match is a false positive:  git push --no-verify
+
+remote_url="$2"
+case "$remote_url" in
+  *github.com*) ;;
+  *) exit 0 ;;                      # not the public mirror — nothing to enforce
+esac
+
+# 1. Forge tokens. The glpat- rule also mechanically enforces "never push the android branch
+#    (old tokened history) to GitHub as-is".
+pat='(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,})'
+
+# 2. Cleartext passwords, by SHAPE rather than by value. The literals are deliberately NOT written
+#    here: this file is itself pushed to the public mirror, so hardcoding the fleet's SSH passwords
+#    to detect them would publish the very thing it is meant to stop.
+#    The inline `-p<literal>` form of sshpass is the marker that actually occurs in this project's
+#    notes and runbooks. A shell variable ($PW, ${PW}) is fine and is not matched.
+#    NOTE: this comment deliberately does not spell that invocation out verbatim — an earlier draft
+#    did, and the hook then matched ITSELF and blocked every push. Tested, not assumed.
+pat="$pat|sshpass[[:space:]]+-p[[:space:]]*[\"']?[^\$\"'[:space:]]{4,}"
+
+# 3. Site-specific literals, kept OUT of the repo: one extended-regex per line in an untracked
+#    .git/secret-patterns (blank lines and #-comments ignored). Optional — absent is fine.
+if [ -r "$(git rev-parse --git-dir)/secret-patterns" ]; then
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    pat="$pat|$line"
+  done < "$(git rev-parse --git-dir)/secret-patterns"
+fi
+
+hit=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_sha" in *[!0]*) : ;; *) continue ;; esac   # skip branch deletions (all-zero local)
+  case "$remote_sha" in
+    *[!0]*) revs=$(git rev-list "$remote_sha..$local_sha") ;;   # existing ref: new commits only
+    *)      revs=$(git rev-list "$local_sha" --not --remotes=origin) ;;  # new ref: not-on-origin
+  esac
+  [ -z "$revs" ] && continue
+  for rev in $revs; do
+    if git show --no-color --format= "$rev" 2>/dev/null | grep -Eq "^\+.*($pat)"; then
+      echo "  secret pattern in commit $rev" >&2
+      hit=1
+    fi
+  done
+done
+
+if [ "$hit" -eq 1 ]; then
+  echo "pre-push ABORTED: a secret pattern (forge token / cleartext sshpass password) was found" >&2
+  echo "in commits bound for github.com — a push there is public and irreversible." >&2
+  echo "Scrub it (git rebase -i / amend) before pushing, or --no-verify if it is a false positive." >&2
+  exit 1
+fi
+exit 0
