@@ -4,7 +4,62 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-14 (latest) — `#media-pin`: the same defect in all five media leaves
+## 2026-08-14 (latest) — infrastructure: mini05 retired as a models source (beast only)
+
+Not a code change — controller-host configuration, recorded here because it changes boot config
+(`/etc/fstab`) and removes an operational lever that older runbooks still describe.
+
+### Changed
+
+- **`mini05` (`10.10.100.35`) is no longer a models source for the controller.** Its export
+  `/mnt/sda1/external/iM-models` is being deleted and the disk reclaimed by another project, so a
+  failover to it would mount an empty or *foreign* filesystem at `/root/infinitemodel/models` and
+  the controller would come up serving nothing. **beast (`10.10.100.38`) is the only source.**
+
+  `/usr/local/sbin/im-models-source` on iM: the `mini05` and `auto` subcommands now **hard-refuse
+  (exit 2)** with an explanation rather than being deleted, so a stale runbook or an old habit gets
+  a reason instead of a bare `usage:` line. `status` no longer probes or advertises mini05. The
+  `beast` arm and the `switch()` body are byte-for-byte unchanged.
+
+- **The fallback had already stopped meaning anything.** It existed because *"beast gets shut down
+  on hot days — then iM runs from mini05 alone."* But VM 116 (`iM`) has since migrated onto beast
+  (`/etc/pve/nodes/beast/qemu-server/116.conf`, `local-zfs:vm-116-disk-0`), so beast being off
+  takes the **controller** down with it. Storage cannot fail over from a host the VM dies with.
+  Retiring it removes a false sense of redundancy, not real redundancy. Consequence accepted
+  deliberately: controller VM and weights are now a single point of failure on beast, and the
+  models tree is replicated nowhere — beast down means *fix beast*, not re-point the mount.
+
+- **Three stale `fstab` backups on iM neutralized.** `fstab.bak-nfsv3` (models **and** cache),
+  `fstab.bak-cache38-20260802-185834` (cache) and `fstab.jtbak` (models) all still carried live
+  `.35` lines; a blind `cp` restore would have silently re-pointed the mount. Each such line is now
+  prefixed `# RETIRED-mini05-20260814` — commented, **not deleted**, so the original text survives
+  verbatim — and each file carries a header saying why. When retiring a source, grep the backups,
+  not just the live file.
+
+### Noted, not fixed
+
+- `switch()` **destroys before it validates**: it stops `im-controller`, unmounts, and rewrites
+  `/etc/fstab` *before* it knows the new mount works, so a failure leaves fstab pointing at a dead
+  source — and that survives a reboot. The same destroy-before-validate shape as the `#embed-pin`
+  bug fixed earlier today. Much less dangerous now that beast is the only reachable target, but it
+  should be fixed if that function is touched again.
+
+### Verification
+
+`im-models-source status` → `mounted : beast`, `service : running`, 35 model dirs. `mini05` and
+`auto` both exit 2 with the mount, fstab and service **provably untouched afterwards** (`findmnt`
+still beast, zero mini05 lines in fstab, `im-controller` `active`). Controller HTTP healthy: `iM`
+v0.3.14, 40 models visible, 11 nodes. No timer, cron or autofs entry ever referenced mini05 — the
+only path back was a human running the command, which is now closed.
+
+### Undo
+
+Previous script preserved at `/usr/local/sbin/im-models-source.bak-premini05retire-20260814`;
+restoring it re-arms the `mini05` and `auto` arms. Per the above, those would now point at a
+deleted export, so this is a rollback of last resort. The commented `.35` lines in the three fstab
+backups can be reactivated by removing the `# RETIRED-mini05-20260814 ` prefix.
+
+## 2026-08-14 — `#media-pin`: the same defect in all five media leaves
 
 ### Fixed
 
