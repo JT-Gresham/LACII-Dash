@@ -779,11 +779,17 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
     # emitted <tool_call>/<invoke>/<function> markup back into structured tool_calls (the same
     # format-agnostic parser the Anthropic path uses). openai_text (legacy completions) has no tools.
     tools_req = bool(body.get("tools")) and body.get("tool_choice") != "none" and mode in ("chat", "openai")
+    # Whether the template opened <think> is a property of the PROMPT, not of the request's tools.
+    # This detection used to sit inside `if tools_req:`, so a reasoning model leaked its entire
+    # chain-of-thought into `content` — ending with a bare, unpaired `</think>` — for every caller
+    # that did not happen to send a tool. Observed on qwen3.8:27b, but it was never model-specific:
+    # it hit every <think>-opening model on the OpenAI and Ollama endpoints. The Anthropic path
+    # (serving_anthropic.py) always computed this unconditionally, which is why only these two
+    # endpoints were affected and why the bug survived the qwen3.6 reasoning work.
     starts_in_think = False   # reasoning template opened <think> in the prompt -> hold reasoning back
-    if tools_req:
-        with contextlib.suppress(Exception):
-            _tail = P["tok"].decode(P["ids"][-24:])
-            starts_in_think = "<think>" in _tail and "</think>" not in _tail.split("<think>")[-1]
+    with contextlib.suppress(Exception):
+        _tail = P["tok"].decode(P["ids"][-24:])
+        starts_in_think = "<think>" in _tail and "</think>" not in _tail.split("<think>")[-1]
 
     # ---------- streaming ----------
     if stream:
@@ -903,8 +909,11 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
             # Model already loaded above (#cold-contract): stream the decode directly — no in-stream
             # load, no keepalive-empty-chunk that could become an empty-200 on a load failure. run()
             # owns + releases the inflight slot.
+            _gate = _ReasonGate(starts_in_think)   # hold back the prompt-opened thought
             try:
                 async for piece, reason in run():
+                    if piece:
+                        piece = _gate.feed(piece)
                     if piece:
                         val = {"role": "assistant", "content": piece} if mode == "chat" else piece
                         s = json.dumps({"model": model, "created_at": _iso(),
@@ -954,8 +963,11 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                         "model": model, "choices": [ch]}
             finish = "stop"
             # Model already loaded above (#cold-contract): stream directly; run() owns+releases rec.
+            _gate = _ReasonGate(starts_in_think)   # hold back the prompt-opened thought
             try:
                 async for piece, reason in run():
+                    if piece:
+                        piece = _gate.feed(piece)
                     if piece:
                         s = "data: " + json.dumps(_chunk(piece, None)) + "\n\n"
                         METRICS["api_out"] += len(s)
@@ -1035,6 +1047,11 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
     tcalls = []
     if tools_req:
         text, tcalls = _extract_tools(text)
+    # Lift the prompt-opened thought out of the answer (see starts_in_think above). _extract_tools
+    # already handles the tools path, so this only has work to do when it did not run.
+    reasoning = ""
+    if starts_in_think and not tools_req:
+        text, reasoning = _split_reasoning(text, True)
     if _json_mode_instruction(body) is not None:   # #json-mode: strip md fences so json.loads() works
         text = _strip_json_fences(text)
 
@@ -1049,6 +1066,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
                 "usage": usage}
         else:
             msg = {"role": "assistant", "content": (text or None) if tcalls else text}
+            if reasoning:      # OpenAI-style reasoning field; omitted entirely when there is none
+                msg["reasoning_content"] = reasoning
             if tcalls:
                 msg["tool_calls"] = _openai_tool_calls(tcalls)
             payload = {
@@ -1064,6 +1083,8 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
            "prompt_eval_duration": _pf_ns, "eval_count": n, "eval_duration": _ev_ns}
     if mode == "chat":
         msg = {"role": "assistant", "content": text}
+        if reasoning:          # Ollama names this field `thinking`
+            msg["thinking"] = reasoning
         if tcalls:
             msg["tool_calls"] = _ollama_tool_calls(tcalls)   # Ollama: arguments as an object
         out["message"] = msg

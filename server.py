@@ -65,7 +65,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.15"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.16"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -2483,7 +2483,8 @@ from formats import (_iso, _digest, _human_params, _details, _model_info,
                      _anth_id, _anth_flatten, _anthropic_messages_to_chat,
                      _expand_image_placeholders, _mrope_position_ids, _audio_position_ids,
                      _anthropic_tools_to_hf, _tool_to_block, _extract_tools,
-                     _partial_suffix_len, _segment_tools, _estimate_tokens)   # noqa: E402,F401
+                     _partial_suffix_len, _segment_tools, _split_reasoning, _ReasonGate,
+                     _estimate_tokens)   # noqa: E402,F401
 
 
 # #failover: set from INFINITEMODEL_DISCOVERY_RESPOND=standby in _start_discovery_responder().

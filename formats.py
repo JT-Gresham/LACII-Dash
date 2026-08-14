@@ -629,6 +629,64 @@ def _partial_suffix_len(s: str, tag: str) -> int:
     return 0
 
 
+def _split_reasoning(raw: str, starts_in_think: bool = False):
+    """Split a COMPLETED generation into (visible, reasoning).
+
+    `starts_in_think` means the chat template opened <think> in the PROMPT, so the model begins
+    already mid-thought and emits reasoning, then a bare `</think>`, then the answer — with no
+    opening tag anywhere in its output. Returning that raw is not merely untidy, it is malformed:
+    the client receives an unpaired closing tag and cannot separate thought from answer.
+    Budget exhaustion inside the thought (no `</think>` at all) yields ("", raw) — an empty answer
+    is honest, whereas emitting the raw chain-of-thought as the answer is not.
+
+    Without the flag, only COMPLETE <think>…</think> pairs the model opened itself are lifted out."""
+    if starts_in_think:
+        c = raw.find("</think>")
+        if c == -1:
+            return "", raw
+        return raw[c + len("</think>"):].lstrip("\n"), raw[:c]
+    think = "\n".join(m.group(0)[len("<think>"):-len("</think>")] for m in _THINK_RE.finditer(raw))
+    return _THINK_RE.sub("", raw).lstrip("\n"), think
+
+
+class _ReasonGate:
+    """Streaming counterpart of _split_reasoning for the plain (no-tools) streamers.
+
+    Buffers until the closing `</think>` arrives, then releases everything after it and passes
+    subsequent pieces straight through. Only engaged when the prompt opened the thought; a model
+    that opens its own <think> still streams as before, because that output is well-formed and
+    some clients deliberately display it.
+
+    Three states, not two. Releasing on `</think>` and stripping the blank lines after it in one
+    step only works when both land in the same chunk — at one token per piece the closer arrives
+    alone, the gate opens with nothing left to strip, and the following newlines stream through as
+    the answer's first characters. So leading-newline suppression survives the release as its own
+    state until real text appears. Found by testing the gate at every chunk size from 1 up, not by
+    reading it."""
+
+    __slots__ = ("active", "buf", "_lead")
+
+    def __init__(self, active: bool):
+        self.active = bool(active)
+        self.buf = ""
+        self._lead = bool(active)
+
+    def feed(self, piece: str) -> str:
+        if self.active:
+            self.buf += piece
+            c = self.buf.find("</think>")
+            if c == -1:
+                return ""
+            piece = self.buf[c + len("</think>"):]
+            self.active, self.buf = False, ""
+        if self._lead:
+            piece = piece.lstrip("\n")
+            if not piece:
+                return ""
+            self._lead = False
+        return piece
+
+
 def _segment_tools(raw: str, starts_in_think: bool = False):
     """Prefix-stable split of streamed raw text into (visible_plain, completed_tools).
     Reasoning is stripped and tool markup held back until complete, so neither leaks to
