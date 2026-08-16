@@ -24,6 +24,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import ast          # #newmodule-2cycle: static read of a FETCHED server.py's EXTRA_UPDATE_FILES
 import asyncio
 import contextlib
 import hashlib
@@ -65,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.17"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.18"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -176,6 +177,33 @@ def _code_date() -> str:
 CODE_DATE = _code_date()
 
 
+def _extra_update_files(src: bytes) -> list[str]:
+    """The EXTRA_UPDATE_FILES list as literally written in ``src`` — a just-fetched copy of the
+    self-update primary file — or [] when it cannot be read out of it.
+
+    Parsed with ``ast``, NEVER imported or exec'd. This runs on bytes pulled straight off the raw
+    CDN, before any of the update's own gates (#no-downgrade, the idle check, the VERSION compare)
+    have had a say on whether we even want that copy — so executing it would hand a stale or
+    tampered repo file a foothold in the LIVE controller minutes before we decided to install it.
+    Statically reading one list-of-string-literals assignment has no such reach and costs one
+    ast.parse per poll.
+
+    Matches AnnAssign as well as Assign on purpose: the real declaration is
+    ``EXTRA_UPDATE_FILES: list[str] = [...]``, which is an AnnAssign, and matching only Assign
+    would silently always return [] — i.e. look like it worked while changing nothing."""
+    with contextlib.suppress(Exception):
+        for node in ast.parse(src.decode("utf-8", "replace")).body:   # module level only
+            if isinstance(node, ast.Assign):
+                targets = node.targets
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            else:
+                continue
+            if any(isinstance(t, ast.Name) and t.id == "EXTRA_UPDATE_FILES" for t in targets):
+                return [str(x) for x in ast.literal_eval(node.value)]
+    return []
+
+
 def _self_update_check(fname: str, is_idle, force: bool = False) -> None:
     """Multi-file self-update: fetch the primary file + EXTRA_UPDATE_FILES, and if ANY changed
     (and we're idle, OR force=True) stage ALL changed files together. RESTART only when the fetched
@@ -184,19 +212,55 @@ def _self_update_check(fname: str, is_idle, force: bool = False) -> None:
     backoff so a CDN-propagation 404 on a freshly-added file (#3) gets time to sync; if a file STILL
     won't fetch, abort THIS cycle (never apply a half-updated set) and retry next poll. force=True is
     the dashboard/API 'Update' button: swap NOW without waiting for idle (the caller has already
-    unloaded models + told workers to free RAM)."""
+    unloaded models + told workers to free RAM). The fetch list comes from the FETCHED primary
+    file unioned with the running one (#newmodule-2cycle, below)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    files = [fname] + [f for f in EXTRA_UPDATE_FILES if f != fname]
-    fetched: dict = {}
-    for fn in files:
-        remote = None
-        for attempt in range(SELF_UPDATE_FETCH_TRIES):   # #3: retry — give the raw CDN time to propagate
+
+    def _fetch_retried(fn: str):
+        """One repo file, bounded-retried with backoff (#3: give the raw CDN time to propagate a
+        freshly-added file). None when it still won't come down."""
+        for attempt in range(SELF_UPDATE_FETCH_TRIES):
             remote = _fetch_repo_file(fn)
             if remote is not None and len(remote) >= 5:
-                break
+                return remote
             if attempt + 1 < SELF_UPDATE_FETCH_TRIES:
                 time.sleep(SELF_UPDATE_FETCH_BACKOFF_S * (attempt + 1))  # runs in a thread; safe to block
-        if remote is None or len(remote) < 5:    # still failing -> abort THIS cycle (stay consistent)
+        return None
+
+    primary = _fetch_retried(fname)
+    if primary is None:                      # still failing -> abort THIS cycle (stay consistent)
+        print(f"[update] {fname} not fetchable (404/transient on raw CDN) - aborting cycle, retry next poll")
+        return
+    # #newmodule-2cycle: the fetch list used to be read ONLY off the running process's globals, so
+    # a commit that ADDED a module needed TWO update cycles to land it — cycle 1 fetched the new
+    # server.py (whose list names the module) but not the module, restarted, and only then did
+    # cycle 2's now-current EXTRA_UPDATE_FILES include it. In between, the box runs new code with
+    # that file absent: exactly the ImportError the perf_profile.py note in the list warns about.
+    # So also read the list out of the server.py we JUST FETCHED — that is the copy we are about
+    # to restart into, so its list is the authoritative statement of what it will need on disk.
+    #
+    # UNION rather than replace, deliberately. Add-only can never DROP a module the running code
+    # still imports, which is the direction that actually breaks a restart; a truncated or oddly
+    # shaped fetched copy can then only ever cost us a redundant fetch. The price is that a module
+    # DELETED from the repo keeps being requested until this process restarts — it 404s and aborts
+    # the cycle — but that is already today's behaviour with the running list, so nothing
+    # regresses. Removing a module still needs the old two-step (ship the list without it, then
+    # delete the file), and this change does not pretend to fix that half.
+    wanted = list(EXTRA_UPDATE_FILES)
+    for f in _extra_update_files(primary):
+        # Plain basenames only. Every entry is one today, and this list is network-sourced input
+        # to an os.path.join that WRITES into the install dir — a "../" in it would write outside.
+        # A genuinely nested path would need a deliberate design change here, not a silent pass.
+        if f and f == os.path.basename(f) and f not in (".", "..") and f not in wanted:
+            wanted.append(f)
+    fetched: dict = {fname: primary}
+    for fn in [f for f in wanted if f != fname]:
+        remote = _fetch_retried(fn)
+        if remote is None:
+            # A module the fetched server.py names but the raw CDN hasn't propagated yet lands
+            # here. Aborting is the right answer: the alternative is restarting into code that
+            # imports a file we KNOW is absent. The next poll retries — which is the propagation
+            # slack the old two-cycle behaviour was getting by accident, now taken on purpose.
             print(f"[update] {fn} not fetchable (404/transient on raw CDN) - aborting cycle, retry next poll")
             return
         fetched[fn] = remote
@@ -541,6 +605,18 @@ class Node:
     # restarts — so surface the gap in /status BEFORE a load trips over it. True unless the worker
     # explicitly reported otherwise, so a pre-feature worker is never shown as missing it.
     has_einops: bool = True
+    # #cc-probe: can this node BUILD the fused quant kernels? has_triton = triton importable;
+    # has_cc = the C toolchain triton JIT-compiles its launcher stubs with (compiler + Python.h).
+    # Missing either is silent — the load succeeds, every int4 linear just takes the naive
+    # rematerialize-per-token path (docs/ROCM.md: 7.4x end-to-end on gfx1151, 14-20x on the
+    # matmul), and the only trace is a worker log line at kernel-build time. Surfacing it here
+    # makes "this node will serve int4 slowly" a placement-time fact instead of a postmortem.
+    # NOT a can_infer gate and NOT a placement input: a CPU-only worker legitimately has neither
+    # (worker_quant's builders are GPU-only and self-guard), so benching nodes on this would
+    # bench the whole CPU tier for a flag that costs them nothing. Both default True so a
+    # pre-feature worker is never displayed as missing a toolchain nobody asked it about.
+    has_triton: bool = True
+    has_cc: bool = True
     can_t2music: bool = False   # #t2music-serve: MusicGen (transformers+soundfile; = can_stt)
     # #wire-caps: wire-protocol capability set the worker advertised at registration (e.g.
     # {"ntensor"}). EMPTY for old workers that sent no 'caps' field — every capability-gated
@@ -662,6 +738,8 @@ class Node:
             "can_t2a": self.can_t2a, "can_t2i": self.can_t2i, "can_stt": self.can_stt,
             "can_tts": self.can_tts,
             "can_t2music": self.can_t2music, "has_einops": self.has_einops,
+            # #cc-probe: fused-quant-kernel buildability (triton + its C toolchain)
+            "has_triton": self.has_triton, "has_cc": self.has_cc,
             "caps": sorted(self.caps),   # #wire-caps: advertised wire capabilities (/status)
             "vram_total_gb": round(self.vram_total_gb, 2),
             "vram_used_gb": round(self.vram_used_gb, 2),
@@ -711,6 +789,8 @@ class Registry:
                 can_stt=bool(reg.get("can_stt", False)),
                 can_t2music=bool(reg.get("can_t2music", False)),
                 has_einops=bool(reg.get("has_einops", True)),   # #einops-probe (absent -> assume OK)
+                has_triton=bool(reg.get("has_triton", True)),   # #cc-probe (absent -> assume OK)
+                has_cc=bool(reg.get("has_cc", True)),
                 # #wire-caps: record the worker's advertised wire capabilities. Absent/unknown
                 # field (old worker) -> empty frozenset -> every gated wire feature stays off.
                 caps=frozenset(str(c) for c in (reg.get("caps") or [])),

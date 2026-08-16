@@ -55,7 +55,7 @@ downloader pulls `.pth`/`.pt` files for any repo that ships **no safetensors**, 
 voice-pack repos download completely instead of grabbing just the config.) The models page shows a
 **🔊 tts** badge.
 
-**Worker deps** (on the co-located serving worker's venv):
+**Worker deps** (on the serving worker's venv — co-located *or* remote):
 
 ```bash
 pip install --no-deps kokoro misaki
@@ -64,6 +64,10 @@ pip install loguru espeakng-loader phonemizer-fork num2words regex scipy soundfi
 
 `KModel` itself only needs `torch` + `transformers` + `scipy` + `numpy`; the rest is the G2P
 front-end. Controller boxes need none of this unless they also host the serving worker.
+Those four packages are not incidental: `can_tts` probes `kokoro` **and** `misaki` **and**
+`espeakng_loader` **and** `soundfile` (`worker_hw.py:500` — all four, because missing any one
+ImportErrors at *load* rather than at registration), so installing them on a node is precisely
+what makes that node an eligible placement candidate.
 
 > **Controller HF-cache gotcha.** The controller sets `HF_HOME=<repo>/cache/huggingface` (not the
 > default `~/.cache`). Acquire the model through **`/add_model`** / the dashboard — a manual
@@ -72,13 +76,21 @@ front-end. Controller boxes need none of this unless they also host the serving 
 
 ## Loading
 
-- **Dashboard:** the Load button on the Kokoro row loads it onto the controller-co-located worker
-  (GPU-preferred, CPU fallback).
+- **Dashboard:** the Load button on the Kokoro row hands the choice to the controller, which takes
+  the first eligible node with VRAM and falls back to a CPU node otherwise
+  (`engine_load.py:2399` builds the pool, `:2410` picks). Since `#media-anywhere` that pool is
+  every `can_tts` + `mediab64` node, so the pick is routinely a *remote* box.
 - **API:** `POST /load?model=kokoro`. `force=1` applies as usual.
+- **Pinning the machine:** the Kokoro row has no "which machine runs it" select — the media node
+  picker (8be766b) covered the t2i / t2a / t2music dialogs only. The backend honours a pin anyway:
+  `POST /load?model=kokoro&node=<hostname>` threads through as `pin_host`
+  (`routes_lifecycle.py:267` → `engine_load.py:652`) into `_place_filter`
+  (`engine_load.py:2405`), which fails the load with a named error rather than silently placing
+  elsewhere if that host isn't eligible.
 - Requests to the speech endpoint **auto-load** a registered-but-cold Kokoro model, like the chat
   and images endpoints do.
 
-It loads at ~0.3 GB. The juggler and the int4/int2 compile paths skip it (it is a co-located media
+It loads at ~0.3 GB. The juggler and the int4/int2 compile paths skip it (it is a single-node media
 model, not a distributable LLM — there is nothing to promote or quantize).
 
 ## The API — `POST /v1/audio/speech`
@@ -146,12 +158,14 @@ uptime. The block is generic across t2i / t2a / tts.
   generation watchdog knows a run's per-chunk progress (a slow synthesis is not a wedge).
 - **Auto-fallback is silent** — if the GPU can't compile Kokoro's kernels the model loads on CPU;
   the load reply and `media_info` report the real device so the dashboard shows `CPU`.
-- **Unload frees the model** on the co-located worker like any other resident.
+- **Unload frees the model** on whichever worker is serving it, like any other resident.
 
 ## Limitations (v1)
 
-- One co-located worker — Kokoro is not distributed across the fleet (it is tiny; it doesn't need
-  to be).
+- One worker — Kokoro is not distributed across the fleet (it is tiny; it doesn't need to be).
+  That worker no longer has to be the controller's: `#media-anywhere` (5c2613a) made any
+  `can_tts` + `mediab64` node eligible (`engine_load.py:2399`), and kokoro runs on remote beast
+  from the `.45` controller today. "One worker" is the limitation; "one *local* worker" is not.
 - English G2P only (EspeakFallback / `misaki.espeak`); other languages would need the language's
   misaki front-end, which pulls the spacy stack this leaf deliberately avoids.
 - WAV / PCM out only (no MP3/Opus encode).

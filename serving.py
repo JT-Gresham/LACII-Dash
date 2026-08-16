@@ -37,6 +37,30 @@ def _transient_gen_exc(exc: BaseException) -> bool:
                                 "no model loaded", "not connected", "went down"))
 
 
+def _tool_gate(starts_in_think: bool):
+    """Build the incremental tool-segmentation gate (formats._ToolGate) for a tool-aware stream.
+
+    The tool streamers used to call _segment_tools(raw, ...) on the WHOLE accumulated answer once
+    per token, so segmentation cost grew with the answer: a regex sub, an rfind and six
+    find/partial-suffix scans over every character emitted so far, redone for the next token. That
+    is O(N^2) and it is reachable ONLY when the request sent tools — i.e. the coding-agent path,
+    which is exactly where answers run longest. The gate rescans only the tail that can still
+    change and hands back the delta directly. Measured on the segmentation alone over a whole
+    answer, old -> new: prose 8.4 -> 0.7 ms at 1000 tokens and 109 -> 2.8 ms at 4000; code-shaped
+    output ending in a tool call 22.6 -> 3.4 ms and 305 -> 12.5 ms. The gap widens with length
+    because the old form is quadratic and this one is linear — the ratio is not the point, the
+    slope is. scratch_segment_tools_test.py is both the equivalence proof and that measurement.
+
+    Imported HERE rather than at module scope, and rather than through the state.bind() namespace:
+    server.py imports serving.py before the formats.py convergence bridge has run, so a
+    module-level `import formats` would turn a checkout that has not fetched formats.py yet into an
+    import-time crash loop instead of the self-heal that bridge exists to provide. _ToolGate is
+    also not in server.py's `from formats import (...)` list, so the bare name would not resolve.
+    By the time a tool stream actually runs, formats is long since in sys.modules."""
+    from formats import _ToolGate
+    return _ToolGate(starts_in_think)
+
+
 def _stream_fail(exc, rec):
     """#endpoint-weather (streaming): classify a MID-STREAM generation failure for the terminal
     error frame. Returns (retryable, message). A 200 + SSE is already open, so the HTTP status can
@@ -795,19 +819,17 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
     if stream:
         # #tools: tool-aware streamers (used only when the request sent tools) — emit visible text as
         # normal content deltas and each COMPLETE tool call as a structured delta, mirroring the proven
-        # Anthropic SSE segmentation (_segment_tools holds back partial markup + reasoning).
+        # Anthropic SSE segmentation (the gate holds back partial markup + reasoning).
         async def openai_tool_stream():
             yield "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]}) + "\n\n"
-            raw = ""; emitted_plain = 0; emitted_tools = 0; finish = "stop"
+            gate = _tool_gate(starts_in_think); emitted_tools = 0; finish = "stop"
             try:
                 async for piece, reason in run():
                     if piece:
-                        raw += piece
-                        plain, tools = _segment_tools(raw, starts_in_think)
-                        if len(plain) > emitted_plain:
-                            delta = plain[emitted_plain:]; emitted_plain = len(plain)
+                        delta, tools = gate.feed(piece)
+                        if delta:
                             s = "data: " + json.dumps({"id": cmpl_id, "object": "chat.completion.chunk",
                                 "created": created, "model": model, "choices": [{"index": 0,
                                 "delta": {"content": delta}, "finish_reason": None}]}) + "\n\n"
@@ -851,14 +873,12 @@ async def _serve(model: str, prompt: Optional[str], messages, body: dict, mode: 
 
         async def ollama_tool_stream():
             t0 = time.perf_counter_ns(); done_reason = "stop"; err = None; retryable = False
-            raw = ""; emitted_plain = 0; emitted_tools = 0
+            gate = _tool_gate(starts_in_think); emitted_tools = 0
             try:
                 async for piece, reason in run():
                     if piece:
-                        raw += piece
-                        plain, tools = _segment_tools(raw, starts_in_think)
-                        if len(plain) > emitted_plain:
-                            delta = plain[emitted_plain:]; emitted_plain = len(plain)
+                        delta, tools = gate.feed(piece)
+                        if delta:
                             s = json.dumps({"model": model, "created_at": _iso(),
                                 "message": {"role": "assistant", "content": delta}, "done": False}) + "\n"
                             METRICS["api_out"] += len(s); yield s

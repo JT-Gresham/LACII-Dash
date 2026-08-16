@@ -157,14 +157,28 @@ async def _serve_anthropic(body: dict, ip: str = "?"):
                                    for m in chat2)
                 return _to_id_list(tok(flat + "\n\nassistant:"))
 
-    # Modality priority: audio-only OR vision-only (Omni's supported single-modality cases).
-    # If both are present, prefer AUDIO and drop images (mixed audio+vision in one prompt =
-    # a future increment; the single mm pair carries one embed set).
+    # Modality contract: audio-only OR vision-only (Omni's supported single-modality cases) —
+    # the single mm pair carries ONE embed set, so serving both at once needs a multi-modality
+    # companion frame (a feature, not a fix). A request carrying both is now REFUSED.
+    # Until 2026-08-16 this path silently preferred AUDIO, discarded the images, and printed the
+    # drop CONTROLLER-side only: the caller got a 200 whose answer was computed from part of the
+    # input it sent, with nothing in the response saying so. That is the worst failure shape
+    # available here — the client cannot detect it, cannot retry into a correct answer, and
+    # cannot fall back to a model that would handle both, because as far as it can tell the
+    # request succeeded. Erroring costs the caller one round trip; degrading costs it a wrong
+    # answer it will believe. Refusal is request-wide because the drop was request-wide:
+    # _collect_images/_collect_audio flatten every message into one list, so images died even
+    # when the audio arrived in a different message than the image did.
+    if images and audios:
+        _inflight_release(rec)
+        return JSONResponse({"type": "error", "error": {"type": "invalid_request_error",
+            "message": f"request carries both audio ({len(audios)} clip(s)) and images "
+                       f"({len(images)}); /v1/messages serves one media modality per request, "
+                       f"and answering this one would mean silently ignoring the images. "
+                       f"Split the audio and the images into separate requests."}},
+            status_code=400)
     do_audio = bool(audios)
     do_vision = bool(images) and not do_audio
-    if images and do_audio:
-        print(f"[v1/messages] both audio + image present -> audio path; {len(images)} "
-              f"image(s) dropped (mixed AV not yet supported)")
     # #off-loop-tokenize: the Claude Code path carries 50-200KB conversations — flatten +
     # Jinja render + encode ran 100-500ms ON the event loop. Same pattern as routes_api's
     # speech-component load; fast-tokenizer encode is Rust &self (concurrent-safe).

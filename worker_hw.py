@@ -506,6 +506,31 @@ def build_registration(args: argparse.Namespace) -> dict:
     # its worker restarts. Report it up front so the gap is visible in /status BEFORE a load
     # trips over it, instead of being diagnosed from a failed placement.
     reg["has_einops"] = _has("einops")
+    # #cc-probe: every fused quant kernel (w4a16 / w8a16 / w2a16) is a @triton.jit kernel, and
+    # triton JIT-compiles a C launcher stub for each one — so a node missing EITHER triton or a
+    # host C toolchain builds none of them and every int4 linear falls through to the naive
+    # "rematerialize the whole bf16 weight per token" path. That is not a rounding error:
+    # docs/ROCM.md measures 2.08 -> 15.4 tok/s (7.4x) end-to-end on gfx1151 qwen3.6-35b-a3b int4,
+    # and 14-20x on the dense matmul alone. Today the ONLY evidence is one line in the worker's
+    # log at kernel-build time ("[int4] triton w4a16 unavailable (RuntimeError('Failed to find C
+    # compiler')) -> naive int4"), which nobody reads until they are already asking why a box is
+    # slow — and by then the model is loaded and the placement decision is spent. Report it at
+    # registration like #einops-probe does so the gap is visible in /status BEFORE placement.
+    reg["has_triton"] = _has("triton")
+    # has_cc is the WHOLE triton JIT toolchain, not just /usr/bin/gcc: a missing Python.h fails the
+    # same stub build, ends at the same naive path, and is fixed by the same one apt line
+    # (`apt-get install -y gcc python3-dev`), so splitting it into two flags would report two
+    # things an operator can only act on as one. Compiler discovery deliberately MIRRORS triton's
+    # own (runtime/build.py: $CC, else gcc, else clang) rather than second-guessing it, including
+    # not validating $CC — the flag is then wrong in exactly the cases triton itself is wrong,
+    # which is the only way it stays true as triton moves.
+    try:
+        import sysconfig as _sysconf
+        _cc = os.environ.get("CC") or shutil.which("gcc") or shutil.which("clang")
+        _pyh = os.path.join(_sysconf.get_paths()["include"], "Python.h")
+        reg["has_cc"] = bool(_cc) and os.path.exists(_pyh)
+    except Exception:
+        reg["has_cc"] = True     # probe itself broke -> don't slander the node (same as #einops-probe)
     reg["can_stt"] = _has("transformers") and _has("soundfile")   # #stt-serve: Whisper ASR leaf
     # #t2music-serve: MusicGen ships inside transformers and needs NO torchaudio (soundfile writes
     # the WAV) — so any Whisper-capable worker is also MusicGen-capable. Runs on AMD/NVIDIA/CPU.

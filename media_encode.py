@@ -3,10 +3,14 @@
 RELOCATED VERBATIM from server.py — originally every function/method body was BYTE-IDENTICAL
 to its server.py original; only this header (and the EngineSpeechMixin class wrapper) was new.
 (Since diverged: the #speech-idle-evict group below — audit #27 — touched _load_speech_components
-and split generate_speech into a pin wrapper + _generate_speech_inner.) Members:
+and split generate_speech into a pin wrapper + _generate_speech_inner. Also dropped: the relocated
+_materialize_from_prefix, which had ZERO callers here and in server.py before it — it was the
+meta-build load path that _load_speech_components' own _load_into closure replaced precisely
+BECAUSE materializing meta buffers zero-filled the BigVGAN resample filters into silent audio, so
+keeping it around only invited someone to reach for the broken path again.) Members:
 _encode_images, _encode_audio_gemma4, _encode_audio, the #P6 speech-out group (_SPEECH_CACHE /
-_SPEECH_MAT / _ensure_spk_dict / _materialize_from_prefix / SPEECH_DEVICE /
-_load_speech_components + the #speech-idle-evict reaper), and Engine.generate_speech as
+_SPEECH_MAT / _ensure_spk_dict / SPEECH_DEVICE / _load_speech_components + the
+#speech-idle-evict reaper), and Engine.generate_speech as
 EngineSpeechMixin (composed into ``class Engine(..., EngineSpeechMixin)`` in server.py;
 self.capture_thinker resolves via MRO from EngineGenMixin).
 
@@ -641,26 +645,6 @@ def _ensure_spk_dict(target_id: str) -> str:
     os.makedirs(os.path.dirname(local), exist_ok=True)
     shutil.copy2(os.path.realpath(src), local)
     return local
-
-
-def _materialize_from_prefix(model, module, prefix: str, files: list, dev: str, target_id: str,
-                             tag: str):
-    """Load `module`'s weights from the safetensors keys under `prefix` (stripped), give any
-    leftover computed meta buffers real storage, and move it to `dev`. Returns the count."""
-    from safetensors import safe_open
-    sd = {}
-    for fn in files:
-        with safe_open(fn, framework="pt") as fh:
-            for k in fh.keys():
-                if k.startswith(prefix):
-                    sd[k[len(prefix):]] = fh.get_tensor(k)
-    if not sd:
-        raise RuntimeError(f"no '{prefix}*' weights found for {tag}")
-    module.load_state_dict(sd, strict=False, assign=True)
-    mat = _materialize_meta_tensors(module, dev)
-    _SPEECH_MAT.setdefault(target_id, {})[tag] = mat
-    module.to(dev)
-    return len(sd), mat
 
 
 SPEECH_DEVICE = os.environ.get("INFINITEMODEL_SPEECH_DEVICE", "cpu").strip().lower()

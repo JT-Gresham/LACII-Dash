@@ -32,6 +32,9 @@ complete (`_diffusers_complete`), so a half-pulled pipeline can't be served.
 
 **Worker dep:** the serving worker's venv needs `pip install diffusers` — plus `accelerate` for
 the offload mode. (Controller boxes need neither unless they also host the serving worker.)
+`can_t2i` *is* the `diffusers` find_spec probe (`worker_hw.py:495`), so installing it on a node is
+exactly what puts that node into the placement pool — the controller's own box has no privilege
+here.
 
 ## The two serve modes
 
@@ -108,7 +111,10 @@ The dashboard's model-detail modal has a **Generate** panel with the same knobs.
 
 ## Limitations (v1)
 
-- One co-located GPU node — the DiT is not distributed across the fleet.
+- One GPU node — the DiT is not distributed across the fleet. That node does **not** have to be
+  the controller's: `#media-anywhere` (5c2613a) made a remote node advertising `can_t2i` + the
+  `mediab64` wire cap a first-class candidate (`engine_load.py:1916`), so "one node" is the
+  limitation, not "one *local* node".
 - `response_format` URL hosting is not implemented (`b64_json` only).
 - Validated on the Qwen-Image pipeline layout; other diffusers pipelines may need adapter work.
 - No int4 shard cache for the DiT yet — a GPU-resident int4 load re-quantizes at load time

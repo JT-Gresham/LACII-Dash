@@ -228,13 +228,22 @@ surface, and the dashboard.
   per-sequence-length MIOpen kernel-select on each new input length (uncached across restarts, like
   Whisper's conv encoder). For an 82M model the Strix Halo **CPU** was previously measured *faster*
   and steadier (~0.5× realtime, no per-shape JIT), so CPU remains a sensible/likely-preferable
-  device on this arch. `_load_tts_locked` currently defaults to the co-located GPU and only
-  auto-falls-back to CPU on a HIP compile error — there is no CPU-force lever for tts yet (unlike
-  stt's `INFINITEMODEL_STT_CPU=1`).
+  device on this arch. `_load_tts_locked` still prefers a GPU-capable node and only auto-falls-back
+  to CPU on a HIP compile error — there is no CPU-force lever for tts yet (unlike stt's
+  `INFINITEMODEL_STT_CPU=1`). Note that node is no longer necessarily the co-located one:
+  `#media-anywhere` (5c2613a) widened the candidate set to every `can_tts` + `mediab64` node
+  (`engine_load.py:2399`), so on a mixed fleet a Kokoro load may land on a CUDA box and never meet
+  this gfx1151 caveat at all — pin with `?node=<hostname>` if you specifically want it here.
 - **CUDA-graph decode is broken on TheRock rocm7.13** — capture/replay run but replay computes
   wrong logits; the first-decode self-check auto-disables it (serving stays eager and correct).
-  Leave `INFINITEMODEL_CUDA_GRAPH` unset on ROCm; details in
-  [ACCELERATION.md](ACCELERATION.md).
+  You no longer have to remember to leave `INFINITEMODEL_CUDA_GRAPH` unset: `db47ae1` added an
+  explicit `not torch.version.hip` term to `_graph_enabled` (`shard_forward.py:985`), because ROCm
+  reports `device.type == "cuda"` and so the gate's device check alone did **not** exclude HIP —
+  and a HIP graph can return a plausible-but-wrong int4 result the self-check need not catch. The
+  var is now **inert on ROCm**: set it or don't, no graph is ever captured. The corollary matters
+  if you want to retest on a newer TheRock/HIP — you must lift that guard *in addition to* setting
+  the var, or the flag will silently do nothing and you'll misread the absence of any `[cudagraph]`
+  log line as the model being ineligible. Details in [ACCELERATION.md](ACCELERATION.md).
 - `/opt/amdgpu/share/libdrm/amdgpu.ids: No such file or directory` printed by ROCr is
   **cosmetic** (device-name lookup table); ignore it.
 - Add the user to **`render`** (for `/dev/kfd` + `/dev/dri/renderD*`) and **`video`**;

@@ -687,12 +687,43 @@ class _ReasonGate:
         return piece
 
 
+# Every piece of markup that changes how the raw stream is segmented. A boundary is only safe
+# to declare "settled" once none of these can start inside it, straddle it, or be completed by
+# whatever the model emits next.
+_TAGS = _TOOL_OPENERS + ("<think>", "</think>")
+_TAG_EDGE = max(len(t) for t in _TAGS) - 1     # longest partial tag that can straddle a boundary
+
+
+def _hold_len(s: str) -> int:
+    """Trailing chars of s that might be the START of any tag, so must not be emitted yet."""
+    # Every tag begins with '<' and none is longer than _TAG_EDGE+1, so a partial tag must put a
+    # '<' inside the last _TAG_EDGE chars. Checking that first skips six suffix scans on the token
+    # that carries ordinary prose, which is nearly every token: this guard is most of the win.
+    if "<" not in s[-_TAG_EDGE:]:
+        return 0
+    return max((_partial_suffix_len(s, t) for t in _TAGS), default=0)
+
+
+def _first_tag(s: str):
+    """(index, tag) of the earliest tag occurrence in s, or (-1, "") when s is markup-free."""
+    best, which = -1, ""
+    for t in _TAGS:
+        i = s.find(t)
+        if i != -1 and (best == -1 or i < best):
+            best, which = i, t
+    return best, which
+
+
 def _segment_tools(raw: str, starts_in_think: bool = False):
     """Prefix-stable split of streamed raw text into (visible_plain, completed_tools).
     Reasoning is stripped and tool markup held back until complete, so neither leaks to
     the client as text. `starts_in_think` (the template opened <think> in the prompt, so
     the model begins mid-thought) holds EVERYTHING back until the closing </think>.
-    Visible plain only ever grows; tools are every COMPLETE call after the first opener."""
+    Visible plain only ever grows; tools are every COMPLETE call after the first opener.
+
+    This is the whole-string form, still used by the Anthropic SSE streamer. _ToolGate below
+    is its incremental twin and MUST stay behaviourally identical to it — scratch_segment_tools_test.py
+    is the equivalence proof, so run it after touching either one."""
     s = raw
     if starts_in_think:                     # began inside reasoning -> hold until it closes
         c = s.find("</think>")
@@ -711,6 +742,143 @@ def _segment_tools(raw: str, starts_in_think: bool = False):
         return s[:len(s) - hold], []
     cut = min(hits)                         # stable: an opener's position doesn't move
     return s[:cut], _parse_tool_calls(s[cut:])
+
+
+class _ToolGate:
+    """Incremental form of _segment_tools for the tool-aware streamers.
+
+    _segment_tools is a pure function of the WHOLE generation so far, and the OpenAI/Ollama tool
+    streamers called it once per token: a regex sub, an rfind and six find/partial-suffix scans
+    over every character emitted so far, again for the next token, and again for the one after —
+    O(N^2) in the answer length. That is only reachable when the request sent tools, i.e. exactly
+    the coding-agent path, which is also where answers are longest. This class produces the same
+    segmentation while only ever looking at the tail that can still change.
+
+    WHY A TAIL IS ENOUGH. Text is *settled* once nothing the model appends can rewrite it: it
+    holds no <think>/</think> and no tool opener, and no tag can start inside it and finish later
+    (guaranteed by only ever settling up to `len(x) - _hold_len(x)` — if a longer partial tag
+    reached further back, those chars would not have been settled). Under that condition no
+    <think>…</think> match, no truncation point and no opener can fall in the settled part, so
+    segment(whole) == settled + segment(tail) for every future extension. Complete <think>…</think>
+    pairs are folded away as they close — the same first-opener/first-closer pairing re.sub does —
+    so a model that opens its own reasoning block does not pin the boundary at character 0. The
+    fold is refused when the text in front of the pair ends in something that merely LOOKS like the
+    start of a tag, because splicing it onto what follows the pair could manufacture markup the
+    model never emitted; that costs a re-scan, never correctness.
+
+    feed() returns the DELTA to send, not the whole visible string. The high-water-mark logic
+    ("emit only what is past the furthest we have already emitted") used to live in each streamer
+    and is folded in here, so the emitted byte stream is unchanged even in the pathological case
+    where a nested <think> makes the visible text SHRINK. Doing it any other way would reintroduce
+    an O(N) slice per token and undo the point of the exercise. `.plain` reconstructs what
+    _segment_tools would have returned; it exists for the equivalence test and for debugging.
+
+    ONE THING IS DELIBERATELY NOT IDENTICAL, and only in `.plain`, never in the emitted bytes.
+    _segment_tools' "visible plain only ever grows" is not actually true: on "x<<think>abc" it
+    returns "x<" at "x<<" — streaming that "<" — and then RETRACTS to "x" once the <think>
+    completes and truncation re-exposes the "<" as a partial tag. Text already settled here cannot
+    be taken back, which is the honest behaviour: the byte was sent. The fuzz in
+    scratch_segment_tools_test.py hits this 341 times and asserts the client-visible stream is
+    identical through it.
+
+    Memory drops too: the streamers no longer accumulate the raw generation, and what is kept here
+    is the visible text only — reasoning and tool markup are dropped as they settle."""
+
+    __slots__ = ("_wait", "_hold", "_buf", "_parts", "_edge", "_pre_len",
+                 "_pending", "_tail", "_emitted")
+
+    def __init__(self, starts_in_think: bool = False):
+        self._wait = bool(starts_in_think)   # holding everything until the prompt's <think> closes
+        self._hold = ""                      # raw seen while waiting for that </think>
+        self._buf = ""                       # unsettled tail: every char that can still change
+        self._parts: list = []               # settled visible text, in arrival order
+        self._edge = ""                      # last _TAG_EDGE chars of the settled text
+        self._pre_len = 0                    # total length of the settled visible text
+        self._pending = ""                   # settled this feed, not yet handed to the caller
+        self._tail = ""                      # visible part of _buf as of the last feed
+        self._emitted = 0                    # high-water mark of visible text handed out
+
+    @property
+    def plain(self) -> str:
+        """The full visible text _segment_tools would return right now. O(N) — tests/diagnostics."""
+        return "".join(self._parts) + self._tail
+
+    def feed(self, piece: str):
+        """Absorb the next raw piece; return (new_visible_text, completed_tool_calls)."""
+        if self._wait:
+            # A </think> split across two pieces is missed by searching only the new piece, and
+            # re-searching the whole hold every time is the very cost being removed: restart the
+            # search len("</think>")-1 chars back from the old end instead.
+            start = max(0, len(self._hold) - 7)
+            self._hold += piece
+            c = self._hold.find("</think>", start)
+            if c == -1:
+                return "", []
+            self._buf, self._hold, self._wait = self._hold[c + 8:], "", False
+        else:
+            self._buf += piece
+        self._settle()
+        return self._emit()
+
+    def _edge_of(self, s: str) -> str:
+        """Last _TAG_EDGE chars of (settled + s) — the only window a partial tag can occupy."""
+        return s[-_TAG_EDGE:] if len(s) >= _TAG_EDGE else (self._edge + s)[-_TAG_EDGE:]
+
+    def _push(self, n: int) -> None:
+        """Move n chars off the front of the unsettled tail into the settled visible text."""
+        if n <= 0:
+            return
+        seg, self._buf = self._buf[:n], self._buf[n:]
+        self._parts.append(seg)
+        self._pending += seg
+        self._pre_len += n
+        self._edge = (self._edge + seg)[-_TAG_EDGE:]
+
+    def _settle(self) -> None:
+        """Advance the settled boundary as far right as it provably goes."""
+        while True:
+            b = self._buf
+            i, tag = _first_tag(b)
+            if i == -1:                      # nothing but plain text in flight
+                self._push(len(b) - _hold_len(self._edge_of(b)))
+                return
+            h = _hold_len(self._edge_of(b[max(0, i - _TAG_EDGE):i]))
+            j = b.find("</think>", i + 7) if tag == "<think>" else -1
+            if j == -1 or h:
+                # A live boundary the core has to re-examine on every token: an unclosed <think>,
+                # a stray closer, or a tool opener (h != 0 = the refused fold described above).
+                self._push(i - h)
+                return
+            self._push(i)                    # text in front of the pair is plain and settled
+            self._buf = self._buf[j + 8 - i:]   # the pair itself: exactly what re.sub would delete
+
+    def _emit(self):
+        """_segment_tools' body, run over the unsettled tail only, then diffed against the mark."""
+        if not self._buf:
+            # _settle drained the tail, which is what happens on a token of ordinary prose: there
+            # is provably no markup left to look for, so skip the regex sub and the five scans.
+            self._tail, tools = "", []
+        else:
+            s = _THINK_RE.sub("", self._buf)
+            ti = s.rfind("<think>")
+            if ti != -1 and "</think>" not in s[ti:]:
+                s = s[:ti]
+            hits = [s.find(o) for o in _TOOL_OPENERS]
+            hits = [k for k in hits if k != -1]
+            if hits:
+                self._tail, tools = s[:min(hits)], _parse_tool_calls(s[min(hits):])
+            else:
+                # _hold_len sees the settled edge too, so a partial tag straddling the boundary is
+                # caught; it can never reach further back than the tail, because a straddle that
+                # long would have kept those chars unsettled in the first place.
+                self._tail, tools = s[:len(s) - _hold_len(self._edge_of(s))], []
+        base = self._pre_len - len(self._pending)   # index in the visible text of _pending[0]
+        out = (self._pending + self._tail)[self._emitted - base:]
+        self._pending = ""
+        if not out:                          # visible text hasn't passed the high-water mark
+            return "", tools
+        self._emitted = self._pre_len + len(self._tail)
+        return out, tools
 
 
 def _estimate_tokens(chat: list) -> int:
