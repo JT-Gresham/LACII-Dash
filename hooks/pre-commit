@@ -16,6 +16,47 @@
 
 . "$(dirname "$0")/_secret-patterns.sh"
 
+# ---------------------------------------------------------------- truncation tripwire ----------
+# This repo lives inside a Nextcloud-synced directory. The sync client can write a PARTIAL file,
+# leaving a source file cut mid-line at a fraction of its length. It has happened twice:
+# dashboard_html.py (2249 -> 114 lines) and then five files at once — engine_gen.py 1891 -> 151,
+# multimodal.py 1285 -> 147, routes_lifecycle.py 842 -> 132, worker_net.py 505 -> 125.
+# Excluding .git from the sync (already done) protects the REPO but not the working files.
+#
+# Committing one is the disaster case, not merely untidy: most of these are in server.py's
+# EXTRA_UPDATE_FILES, so a truncated commit self-updates to every controller and worker in the
+# fleet. multimodal.py in that state does not even import — the controller would fail to start.
+#
+# Signature is unmistakable and cheap to test: the file shrank a lot AND the diff adds nothing.
+# A real refactor that removes half a file essentially always adds something (an import, a call,
+# a shorter replacement). Deletions (git rm) are exempt — --diff-filter=M only sees modifications.
+trunc=""
+for f in $(git diff --cached --name-only --diff-filter=M); do
+  old=$(git cat-file -s "$(git rev-parse HEAD:"$f" 2>/dev/null)" 2>/dev/null) || continue
+  new=$(git cat-file -s "$(git rev-parse ":$f" 2>/dev/null)" 2>/dev/null) || continue
+  [ -z "$old" ] || [ -z "$new" ] && continue
+  # shrank to under half?
+  [ "$((new * 2))" -lt "$old" ] || continue
+  # ...and the diff adds NOTHING at all?
+  if [ "$(git diff --cached --numstat -- "$f" | awk '{print $1}')" = "0" ]; then
+    trunc="$trunc  $f  ($old -> $new bytes, no lines added)
+"
+  fi
+done
+if [ -n "$trunc" ]; then
+  echo "pre-commit ABORTED: file(s) look TRUNCATED, not edited —" >&2
+  printf '%s' "$trunc" >&2
+  echo "" >&2
+  echo "Each shrank by more than half with ZERO lines added. That is the Nextcloud partial-write" >&2
+  echo "signature this repo has hit twice, not a refactor. Most of these files are in" >&2
+  echo "EXTRA_UPDATE_FILES, so committing one deploys it to the whole fleet." >&2
+  echo "" >&2
+  echo "Check first:  wc -l <file>  vs  git show HEAD:<file> | wc -l" >&2
+  echo "Restore with: git restore --source=HEAD -- <file>" >&2
+  echo "If the deletion really is intentional: git commit --no-verify" >&2
+  exit 1
+fi
+
 hit=0
 # Added lines only, staged content only. --diff-filter=d skips deletions (removing a secret is
 # exactly what we want to encourage, and must never itself be blocked).
