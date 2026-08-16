@@ -99,7 +99,7 @@ dashboard.
   cache — the hybrid cache that makes this work is documented in
   [docs/KIMI-LINEAR.md](docs/KIMI-LINEAR.md). ⚠ `#prefix-kv`, `#pipefill`, spec-decode and
   `kv_slots>1` stay gated OFF for linear-attention archs: recurrent state cannot be rewound.
-  It also needs **`fla-core` pinned to 0.4.0`** installed on every box that builds the arch
+  It also needs **`fla-core` pinned to 0.4.0** installed on every box that builds the arch
   (controller *and* workers) plus two in-repo compat fixes. Several of its failure modes report the
   wrong cause — a missing import surfaces as *"no room for the new model"* — so read
   **[docs/KIMI-LINEAR.md](docs/KIMI-LINEAR.md)** before attempting it.

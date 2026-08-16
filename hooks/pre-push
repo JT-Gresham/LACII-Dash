@@ -19,27 +19,10 @@ case "$remote_url" in
   *) exit 0 ;;                      # not the public mirror — nothing to enforce
 esac
 
-# 1. Forge tokens. The glpat- rule also mechanically enforces "never push the android branch
-#    (old tokened history) to GitHub as-is".
-pat='(ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,})'
-
-# 2. Cleartext passwords, by SHAPE rather than by value. The literals are deliberately NOT written
-#    here: this file is itself pushed to the public mirror, so hardcoding the fleet's SSH passwords
-#    to detect them would publish the very thing it is meant to stop.
-#    The inline `-p<literal>` form of sshpass is the marker that actually occurs in this project's
-#    notes and runbooks. A shell variable ($PW, ${PW}) is fine and is not matched.
-#    NOTE: this comment deliberately does not spell that invocation out verbatim — an earlier draft
-#    did, and the hook then matched ITSELF and blocked every push. Tested, not assumed.
-pat="$pat|sshpass[[:space:]]+-p[[:space:]]*[\"']?[^\$\"'[:space:]]{4,}"
-
-# 3. Site-specific literals, kept OUT of the repo: one extended-regex per line in an untracked
-#    .git/secret-patterns (blank lines and #-comments ignored). Optional — absent is fine.
-if [ -r "$(git rev-parse --git-dir)/secret-patterns" ]; then
-  while IFS= read -r line; do
-    case "$line" in ''|'#'*) continue ;; esac
-    pat="$pat|$line"
-  done < "$(git rev-parse --git-dir)/secret-patterns"
-fi
+# Patterns come from the SHARED definition so this hook and pre-commit cannot drift — two
+# hand-maintained lists diverge, and the one that diverges is the one that lets a secret past.
+. "$(dirname "$0")/_secret-patterns.sh"
+pat="$SECRET_PAT"
 
 hit=0
 while read -r local_ref local_sha remote_ref remote_sha; do
