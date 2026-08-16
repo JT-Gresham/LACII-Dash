@@ -127,10 +127,11 @@ def register(app):
         #   spread     (F, F) FORCE a stage on every capable node (incl. tiny ones)
         #   proportional (F, F) layers across EVERY capable node PROPORTIONAL to its capacity
         #                 (#78: big int4 MoE — MiniMax-M2 — too big for the GPU-first subset)
-        # `quant`: 'none' (bf16), 'int8' (~1/2), 'int4' (group-wise ~4.25-bit, ~1/4 — for
-        # 200B+ MoEs that won't fit at int8), or 'int2' (#int2: group-wise ~2.5-bit, ~1/6 —
-        # a CAPACITY tier for dense models that won't fit at int4; visible quality loss; MoE
-        # auto-downgrades to int4). `tp` (M4): tensor-parallel group
+        # `quant`: 'none' (bf16), 'int8' (~1/2; #moe-int8: fused MoE routed experts ARE packed —
+        # memory + quality, but no grouped int8 MoE kernel, so a MoE decodes eagerly), 'int4'
+        # (group-wise ~4.25-bit, ~1/4 — for 200B+ MoEs that won't fit at int8), or 'int2' (#int2:
+        # group-wise ~2.5-bit, ~1/6 — a CAPACITY tier for DENSE models that won't fit at int4;
+        # visible quality loss; MoE auto-downgrades to int4). `tp` (M4): tensor-parallel group
         # size — split every layer across `tp` GPU nodes (rank 0 drives the group over the
         # all-reduce mesh). tp>1 overrides mode. tp must divide num_key_value_heads.
         # Legacy: if mode is omitted but consolidate=false is passed, honor it.
@@ -225,16 +226,36 @@ def register(app):
             cons, pv = False, True
         try:
             friendly = resolve_model_name(model)
-            # #2: int8 on a MoE silently keeps the fused-3D routed experts in bf16 (the worker int8
-            # path only quantizes 2D nn.Linears; there is no int8 3D-expert quantizer — same reason
-            # /compile_shards + /compile_dist reject int8 MoE). That yields a ~bf16 footprint -> OOM /
-            # CPU-spill. Auto-DOWNGRADE to int4 (which DOES pack experts) so the user gets a real memory
-            # reduction. Reuse the controller's existing MoE detector (weight-map -> _has_moe_experts).
-            # Best-effort: if we can't introspect the model, fall through and honor int8 as requested.
+            # #2 / #moe-int8: a tier with no 3D routed-expert packer silently keeps the fused-3D
+            # experts — ~90% of a big MoE's parameters — in bf16, which is a ~bf16 footprint wearing
+            # a quantized label: OOM or CPU-spill instead of the memory reduction that was asked
+            # for. Such a tier is auto-DOWNGRADED to int4, which does pack experts.
+            #
+            # int8 NO LONGER QUALIFIES. worker_quant now has the int8 3D family (Packed8Tensor3D /
+            # _pack8_3d), and `_quantize_int8_` packs fused experts itself, so both cold-load call
+            # sites (client.py Shard.__init__, shard_build's _quant_after) pack them without a
+            # call-site change. int8 is the best-quality tier that is still fast (the w8a16 kernel),
+            # so honoring the request is the whole point — do not "helpfully" re-add int8 here.
+            # Two things stay true and are deliberately NOT papered over:
+            #   * There is no GROUPED int8 MoE kernel (_w4a16_moe_op is int4-only), so an int8 MoE
+            #     decodes through the eager per-expert loop. It buys memory + quality, not speed.
+            #   * /compile_shards still rejects int8 MoE, so there is no int8 shard cache for a MoE
+            #     and every int8 MoE load is a cold quantize. `_precompile_int4` below already
+            #     no-ops for anything but int4, so nothing to gate here.
+            #
+            # int2 DOES still qualify, and not merely because the packer is missing: int2 is the
+            # GPTQ-CALIBRATED tier by policy (shard_compile routes int2 to gptq_pack; plain RTN at
+            # 2 bits is token salad, which is why the v1 RTN caches were invalidated by a packer_hash
+            # bump). A round-to-nearest 3D int2 expert packer would be the WRONG artifact — it would
+            # load, checksum, and generate garbage. gptq_pack itself refuses MoE ("int2 GPTQ compile
+            # supports DENSE models only"), because its sequential per-layer Hessian is built from
+            # dense activations and a routed expert only ever sees the tokens routed to it.
+            #
+            # gpt-oss at int8 also still downgrades: its experts are IN-major and int4 handles them
+            # by transpose-packing plus a dedicated fused forward that only exists for w4a16.
+            # _quantize_experts8_ REFUSES them (loudly, at the worker) — catching it here turns a
+            # mid-load failure with partial shards placed into an instant tier downgrade.
             if quant in ("int8", "int2"):
-                # #int2: same shape of problem as int8-on-MoE — the int2 walker only quantizes 2D
-                # nn.Linears (no 2-bit 3D-expert packer/kernel), so a MoE at int2 would keep its
-                # routed experts (the bulk of the model) bf16. int4 DOES pack experts — downgrade.
                 try:
                     import shards as _sh
                     _tgt = MODELS[friendly][0] if friendly in MODELS else friendly
@@ -242,10 +263,27 @@ def register(app):
                     if _mdir:
                         _wm = await asyncio.to_thread(_sh._weight_map, _mdir)
                         if await asyncio.to_thread(_sh._has_moe_experts, _wm):
-                            log_activity(f"{_ollama_name(friendly)}: {quant} on a MoE keeps experts bf16 "
-                                         f"(no {quant} 3D-expert quantizer) — DOWNGRADING to int4 for a "
-                                         "real memory reduction")
-                            quant = "int4"
+                            # gpt-oss detector: `...experts.gate_up_proj_bias` is the per-expert bias
+                            # that only the gpt-oss expert block has — the same signal
+                            # worker_quant._is_gptoss_experts keys on, read off the weight map.
+                            _gptoss = any(s.endswith("gate_up_proj_bias") for s in _wm)
+                            _why = ("int2 is the GPTQ-CALIBRATED tier and gptq_pack is dense-only; "
+                                    "an RTN 3D expert packer would load and emit garbage"
+                                    if quant == "int2" else
+                                    "gpt-oss experts are IN-major — the transpose-pack + fused "
+                                    "forward that consume them exist only for w4a16")
+                            if quant == "int2" or _gptoss:
+                                log_activity(f"{_ollama_name(friendly)}: {quant} on this MoE — "
+                                             f"DOWNGRADING to int4 ({_why})")
+                                quant = "int4"
+                            else:
+                                # Honored, with the caveat recorded: an operator who later asks why
+                                # this MoE decodes slower than the same model at int4 should find
+                                # the answer here rather than re-deriving it.
+                                log_activity(f"{_ollama_name(friendly)}: int8 MoE — routed experts "
+                                             "ARE packed (#moe-int8), but there is no grouped int8 "
+                                             "MoE kernel and no int8 shard cache for a MoE: expect "
+                                             "eager per-expert decode and a cold quantize")
                 except Exception as _moe_exc:
                     log_activity(f"{_ollama_name(friendly)}: MoE check for {quant} downgrade failed "
                                  f"({_moe_exc}) — honoring {quant} as requested")

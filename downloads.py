@@ -109,16 +109,51 @@ _GGUF_QUANT_PREF = (
 
 
 def _pick_gguf_quant(gguf_files):
-    """Choose the best SINGLE-FILE quant to normalize from a repo's .gguf filenames. Skips split
-    (NNNNN-of-NNNNN) parts (the converter rejects them) and prefers a medium K-quant — the best
-    size/quality for a source we re-quantize to int4 anyway. Raw float dumps (*f16/*f32/*bf16.gguf)
-    are a last resort. Returns the filename, or None if ONLY split parts exist."""
-    import re as _re
-    split = _re.compile(r"-\d{5}-of-\d{5}\.gguf$", _re.I)
+    """Choose the best quant to normalize from a repo's .gguf filenames — a SINGLE-FILE quant OR a
+    COMPLETE split (NNNNN-of-NNNNN) set, represented by its part 1. Prefers a medium K-quant — the
+    best size/quality for a source we re-quantize to int4 anyway. Raw float dumps
+    (*f16/*f32/*bf16.gguf) are a last resort. Returns ``(pick, error)``: the filename to register,
+    or ``(None, why)``.
+
+    #gguf-split: split sets used to be dropped on the floor here and the repo then refused
+    outright — but the GGUF-only models actually worth ingesting are exactly the big split ones,
+    so they are now first-class candidates. A set qualifies ONLY when every part 1..N is present
+    in the repo listing. A gap must fail LOUD *here*, at add time, with the repo listing in hand:
+    the converter downloads parts by synthesized name, so a set missing part 3 of 5 would either
+    404 deep inside a multi-hour pull or — if a reader tolerated it — dequantize a model with whole
+    layers absent, which saves, passes its own checksum, and generates garbage.
+
+    A single file WINS ties against a split set of the same quant rank: one file is the path that
+    has always worked, needs no sibling resolution, and costs the converter nothing extra."""
+    from model_store import gguf_split_info
     base = lambda f: f.rsplit("/", 1)[-1].lower()
-    single = [f for f in gguf_files if f.lower().endswith(".gguf") and not split.search(f.lower())]
-    if not single:
-        return None
+    singles, sets = [], {}
+    for f in gguf_files:
+        if not f.lower().endswith(".gguf"):
+            continue
+        info = gguf_split_info(f)
+        if info is None:
+            singles.append(f)                        # incl. names whose series we can't map (see helper)
+        else:
+            b, idx, tot = info
+            sets.setdefault((b, tot), {})[idx] = f
+    complete, incomplete = [], []
+    for (b, tot), parts in sorted(sets.items()):
+        if set(parts) == set(range(1, tot + 1)):
+            complete.append(parts[1])                # register part 1; the rest derive from its name
+        else:
+            incomplete.append((b, tot, [i for i in range(1, tot + 1) if i not in parts]))
+    cands = singles + complete
+    if not cands:
+        if incomplete:
+            b, tot, missing = incomplete[0]
+            shown = ", ".join(f"{i:05d}" for i in missing[:6]) + (" …" if len(missing) > 6 else "")
+            return None, (f"{b}: split GGUF set is INCOMPLETE — {len(missing)} of {tot} parts are "
+                          f"missing from the repo (part {shown}). Converting a partial set would "
+                          f"produce a model with missing layers, so it is refused. Re-check the "
+                          f"repo, or name a different quant in the GGUF field.")
+        return None, None
+    single_set = set(singles)
     is_float = lambda f: any(t in base(f) for t in ("f16", "f32", "bf16"))
 
     def _score(f):
@@ -127,24 +162,57 @@ def _pick_gguf_quant(gguf_files):
             if q in b:
                 return i
         return len(_GGUF_QUANT_PREF)                 # unknown quant -> after all known, before floats
-    ranked = sorted((f for f in single if not is_float(f)), key=_score)
-    return ranked[0] if ranked else single[0]        # only float dumps -> still translatable
+    # (score, single-before-split, name) — the last term only makes the choice deterministic when a
+    # repo ships two same-rank candidates, so the same repo always resolves to the same file.
+    _key = lambda f: (_score(f), 0 if f in single_set else 1, f)
+    ranked = sorted((f for f in cands if not is_float(f)), key=_key)
+    if ranked:
+        return ranked[0], None
+    return sorted(cands, key=_key)[0], None          # only float dumps -> still translatable
 
 
 def _resolve_download_source(hf, gguf_file=""):
     """#dl-autoresolve: decide the ACTUAL download source + friendly name for a raw HF id so a bare
-    `org/Model` just works. NETWORK (HfApi list) — call via asyncio.to_thread. An explicit gguf_file
-    is honored verbatim (power-user override, no probe). Never raises: a list failure (gated / typo /
-    offline) leaves the id untouched so the download path surfaces the real error. Returns
+    `org/Model` just works. NETWORK (HfApi list) — call via asyncio.to_thread. An explicit
+    SINGLE-FILE gguf_file is honored verbatim (power-user override, no probe); an explicit SPLIT
+    part is still listed and checked, because "honour it verbatim" there means converting one part
+    of N (#gguf-split). Never raises: a list failure (gated / typo / offline) leaves the id
+    untouched so the download path surfaces the real error. Returns
     {"target", "gguf_file", "friendly_hint", "note", "error"}."""
     import re as _re
     from huggingface_hub import HfApi
+    from model_store import gguf_part_names, gguf_split_info
     tok = HF_TOKEN or None
     api = HfApi()
     gf = (gguf_file or "").strip()
     if gf:
-        return {"target": hf, "gguf_file": gf, "friendly_hint": "",
-                "note": f"explicit GGUF file {gf}", "error": None}
+        _info = gguf_split_info(gf)
+        if not _info:
+            return {"target": hf, "gguf_file": gf, "friendly_hint": "",
+                    "note": f"explicit GGUF file {gf}", "error": None}
+        # #gguf-split: an EXPLICITLY named part gets the same completeness check as an auto-picked
+        # set, and is normalized to part 1 (what the converter opens). Without this, hand-typing
+        # "...-00003-of-00005.gguf" would register a single middle part and convert 1/5 of a model.
+        _want = gguf_part_names(gf)
+        _first, _tot = _want[0], len(_want)
+        try:
+            _have = set(api.list_repo_files(hf, token=tok))
+        except Exception:
+            # Same contract as the rest of this function: a listing failure never raises and never
+            # blocks — honour the override and let the download path surface the real error.
+            return {"target": hf, "gguf_file": _first, "friendly_hint": "",
+                    "note": (f"explicit split GGUF {_first} (+{_tot - 1} parts) — repo listing "
+                             "unavailable, completeness NOT verified"), "error": None}
+        _missing = [p for p in _want if p not in _have]
+        if _missing:
+            return {"target": hf, "gguf_file": "", "friendly_hint": "", "note": "",
+                    "error": (f"{hf}: split GGUF set for {_first} is INCOMPLETE — {len(_missing)} "
+                              f"of {_tot} parts are not in the repo ({_missing[0]}"
+                              + (" …" if len(_missing) > 1 else "") + "). Refusing: converting a "
+                              "partial set would produce a model with missing layers.")}
+        return {"target": hf, "gguf_file": _first, "friendly_hint": "",
+                "note": f"explicit split GGUF {_first} (+{_tot - 1} parts, all present)",
+                "error": None}
     try:
         files = api.list_repo_files(hf, token=tok)
     except Exception:
@@ -165,15 +233,17 @@ def _resolve_download_source(hf, gguf_file=""):
                         "error": None}
         except Exception:
             pass                                     # no twin -> fall through to GGUF translate
-    # 2) no twin -> auto-translate a single-file quant to safetensors (the existing converter).
-    pick = _pick_gguf_quant(ggufs)
+    # 2) no twin -> auto-translate to safetensors (the existing converter). A COMPLETE split set is
+    #    a valid pick now (#gguf-split) and comes back as its part 1.
+    pick, why = _pick_gguf_quant(ggufs)
     if not pick:
         return {"target": hf, "gguf_file": "", "friendly_hint": "", "note": "",
-                "error": (f"{hf} ships only split (NNNNN-of-NNNNN) GGUF parts — name one single-file "
-                          "quant in the GGUF field; split GGUF isn't supported")}
+                "error": (why or f"{hf} lists .gguf files but none is usable as a conversion source")}
     clean = _re.sub(r"-gguf$", "", _friendly_from_hf(hf), flags=_re.I)
+    _n = len(gguf_part_names(pick))
+    _sel = pick if _n == 1 else f"{pick} (+{_n - 1} parts, split set)"
     return {"target": hf, "gguf_file": pick, "friendly_hint": clean,
-            "note": f"{hf} is GGUF-only — auto-selected {pick} to normalize to safetensors",
+            "note": f"{hf} is GGUF-only — auto-selected {_sel} to normalize to safetensors",
             "error": None}
 
 
@@ -279,7 +349,12 @@ def register(app):
                 # in a SUBPROCESS (download + dequant + save), then it's an ordinary model. Pause/stop
                 # don't apply (it's a one-shot subprocess), so skip the interruptible pull entirely.
                 if target in GGUF_FILES:
-                    log_activity(f"download {friendly}: GGUF -> safetensors conversion (subprocess)")
+                    # #gguf-split: name the part count so a multi-hour multi-part pull is legible in
+                    # the activity log (one "conversion" line for a 5-part 40 GB set was opaque).
+                    from model_store import gguf_part_names as _gpn
+                    _np = len(_gpn(GGUF_FILES[target]))
+                    log_activity(f"download {friendly}: GGUF -> safetensors conversion (subprocess"
+                                 + (f", {_np}-part split set" if _np > 1 else "") + ")")
                     await asyncio.to_thread(_controller_model_dir, target)   # triggers convert_gguf_to_model_dir
                     if DOWNLOAD_EPOCH.get(friendly) != epoch:
                         return
@@ -497,11 +572,14 @@ def register(app):
         gf_in = (gguf_file or "").strip()
         if gf_in and not gf_in.lower().endswith(".gguf"):
             return JSONResponse({"ok": False,
-                                 "error": "gguf_file must be a single .gguf filename in the repo"},
+                                 "error": ("gguf_file must be a .gguf filename in the repo "
+                                           "(any part of a split NNNNN-of-NNNNN set is fine — it "
+                                           "is normalized to part 1 and the set is verified)")},
                                 status_code=400)
         # #dl-autoresolve: probe the repo so a bare `org/Model` just works. A GGUF-only repo
-        # redirects to its safetensors twin (or auto-picks a single-file quant to normalize), and the
-        # friendly name is derived from the RESOLVED target. An explicit gguf_file bypasses the probe.
+        # redirects to its safetensors twin (or auto-picks a quant — single-file or a complete
+        # split set — to normalize), and the friendly name is derived from the RESOLVED target. An
+        # explicit gguf_file skips the source probe (but a split part is still verified complete).
         res = await asyncio.to_thread(_resolve_download_source, hf, gf_in)
         if res.get("error"):
             return JSONResponse({"ok": False, "error": res["error"]}, status_code=400)

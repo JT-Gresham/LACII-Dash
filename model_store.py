@@ -90,13 +90,63 @@ def set_gguf_provider(fn) -> None:
     _GGUF_FN = fn
 
 
+# --- #gguf-split: SPLIT (multi-part) GGUF sets ------------------------------------------------
+# llama.cpp's `gguf-split` writes N files named "<base>-00001-of-0000N.gguf" .. "<base>-0000N-of-
+# 0000N.gguf" (llama_split_path: "%s-%05d-of-%05d.gguf" — the 5-digit width is the convention, and
+# it is what the repo has always matched on). Both the part index AND the total are encoded in the
+# NAME, so the complete set is derivable from any one part with no repo listing and no network.
+#
+# ⚠ The parts are NOT a byte-split of one GGUF. Each part carries its own GGUF header, and only
+# part 1 holds the full KV metadata (architecture, hyper-parameters, tokenizer); parts 2..N carry
+# a stub header plus their share of the tensors. `cat`-ing them yields a file that OPENS (part 1's
+# header is at offset 0) and is garbage — never join them bytewise. The set is fed to the reader
+# as part 1 with its siblings physically beside it in the same directory.
+#
+# The registry value (server.GGUF_FILES[target], persisted as a JSON string) stays a SINGLE
+# filename — part 1 — so nothing downstream or on disk changes shape; the rest of the set is
+# re-derived from it here. That is also what llama.cpp itself takes on the command line.
+_GGUF_SPLIT_RE = re.compile(r"^(?P<base>.+)-(?P<idx>\d{5})-of-(?P<tot>\d{5})\.(?P<ext>gguf)$", re.I)
+
+
+def gguf_split_info(fn: str):
+    """(base, index, total) for a split-GGUF part filename, else None. PURE (no IO, no network).
+
+    Rejects an out-of-range series (``-00000-of-00003``, ``-00004-of-00003``) rather than
+    "interpreting" it: a name we cannot map onto a 1..N series is a name whose layout we do not
+    know, and guessing here would silently fetch the wrong set of tensors."""
+    m = _GGUF_SPLIT_RE.match((fn or "").strip())
+    if not m:
+        return None
+    idx, tot = int(m.group("idx")), int(m.group("tot"))
+    if tot < 1 or not (1 <= idx <= tot):
+        return None
+    return m.group("base"), idx, tot
+
+
+def gguf_part_names(part: str) -> list:
+    """The FULL ordered part list (1..N) for a split GGUF, derived from ANY one part's name.
+    A non-split (single-file) name returns ``[part]`` unchanged, so callers can treat both the
+    same way. The extension's CASE is preserved from the input — a repo that ships ``.GGUF``
+    would 404 on a synthesized lowercase name."""
+    info = gguf_split_info(part)
+    if not info:
+        return [part]
+    base, _idx, tot = info
+    ext = _GGUF_SPLIT_RE.match(part.strip()).group("ext")
+    return [f"{base}-{i:05d}-of-{tot:05d}.{ext}" for i in range(1, tot + 1)]
+
+
 def convert_gguf_to_model_dir(repo_id: str, gguf_file: str, model_id: str) -> str:
     """Normalize a GGUF model to a standard safetensors checkpoint under models/<name>/, ONCE.
     Idempotent: returns the existing dir if already converted. The heavy from_pretrained (which
     fully materializes the model in RAM) runs in a SUBPROCESS (gguf_convert.py) so it can OOM
     without taking down the controller box it co-hosts (the #never-full-load-on-controller lesson).
     After this, the model is an ordinary safetensors model — streamed, int4/int8-cached, and run
-    on the pipeline with no GGUF awareness anywhere downstream."""
+    on the pipeline with no GGUF awareness anywhere downstream.
+
+    #gguf-split: ``gguf_file`` may be part 1 of a SPLIT set ("...-00001-of-0000N.gguf"). The
+    subprocess re-derives and fetches all N parts from that one name (gguf_part_names); nothing
+    about this function's signature or the persisted registry value changes."""
     local = os.path.join(MODELS_DIR, _safe_name(model_id))
     if _dir_has_model(local):
         return local
@@ -108,7 +158,9 @@ def convert_gguf_to_model_dir(repo_id: str, gguf_file: str, model_id: str) -> st
     if _tok:
         env["HF_TOKEN"] = _tok          # pass via env, never argv (process listings leak args)
     os.makedirs(local, exist_ok=True)
-    print(f"[model] GGUF -> safetensors: {repo_id} :: {gguf_file} (subprocess)", flush=True)
+    _nparts = len(gguf_part_names(gguf_file))
+    _what = gguf_file if _nparts == 1 else f"{gguf_file} (+{_nparts - 1} more parts)"
+    print(f"[model] GGUF -> safetensors: {repo_id} :: {_what} (subprocess)", flush=True)
     proc = subprocess.run([sys.executable, script, repo_id, gguf_file, local],
                           env=env, capture_output=True, text=True)
     if proc.returncode != 0:
@@ -917,10 +969,22 @@ def _hf_total_bytes(repo_id: str) -> int:
         _no_st = not any((s.rfilename or "").endswith(".safetensors") for s in sib)
         if _no_st:
             _ext += [".pth", ".pt"]
+        # #gguf-split: a GGUF-sourced repo has NO safetensors, so the denominator above was just
+        # its .json files — the download bar then read as a wild over-100%. Count the .gguf we will
+        # ACTUALLY fetch, which is exactly the chosen quant's part set (_GGUF_FN gives part 1).
+        # NOT every .gguf in the repo: these repos ship 5-15 quants of the same model, so a blanket
+        # sum overstates the denominator by ~an order of magnitude and the bar would crawl to ~10%
+        # and stop. Best-effort — an unregistered/unknown target just keeps the old behaviour.
+        _gguf_want: set = set()
+        with contextlib.suppress(Exception):
+            _g1 = _GGUF_FN(repo_id)
+            if _g1:
+                _gguf_want = set(gguf_part_names(_g1))
 
         def _keep(fn):                            # #t2music: only the HF weight .bin, not the dups
             fn = fn or ""
             return (fn.endswith(tuple(_ext))
+                    or fn in _gguf_want
                     or (_no_st and fn.endswith(".bin")
                         and fn.rsplit("/", 1)[-1].startswith(("pytorch_model", "model"))))
         return sum(int(s.size or 0) for s in sib if _keep(s.rfilename))

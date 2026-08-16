@@ -1,12 +1,19 @@
 """worker_quant.py: the worker's quantization/kernel family (m4c189 code-split, Inc 10).
 
-RELOCATED VERBATIM from client.py — every def/class body below this header is BYTE-IDENTICAL
-to its client.py original; only this header is new. The span: the guarded module-level
-triton/tl import + the #triton-race Autotuner serialization patch + _FUSED_INT4, the CPU
-fp32-GEMM family (flags + tune_cpu_threads + _accelerate_cpu_linears), the int8/int4 quant
-cores (QuantLinear/QuantLinear4), the w4a16 triton kernels, the int4 packers (Packed4Tensor3D,
-_pack4_expert/_pack4_3d), fused-MoE + gpt-oss installs, the MoE offload bridge, the
-per-expert/streamed builds, the meta-expert detectors, and _assign_meta_from_sd.
+RELOCATED VERBATIM from client.py — every def/class body below this header was BYTE-IDENTICAL
+to its client.py original at the split; only this header was new. The span: the guarded
+module-level triton/tl import + the #triton-race Autotuner serialization patch + _FUSED_INT4,
+the CPU fp32-GEMM family (flags + tune_cpu_threads + _accelerate_cpu_linears), the int8/int4
+quant cores (QuantLinear/QuantLinear4), the w4a16 triton kernels, the int4 packers
+(Packed4Tensor3D, _pack4_expert/_pack4_3d), fused-MoE + gpt-oss installs, the MoE offload
+bridge, the per-expert/streamed builds, the meta-expert detectors, and _assign_meta_from_sd.
+
+DIVERGED SINCE (#moe-int8): the int8 tier grew a fused-3D routed-expert family of its own —
+Packed8Tensor3D / _pack8_expert / _pack8_3d / _quantize_experts8_ / _w8a16_expert_cls, mirroring
+the int4 3D family. `_quantize_linear`'s quant math moved into `_pack8_expert` (unchanged
+arithmetic, one owner), and `_quantize_int8_` is now a wrapper that walks Linears AND packs fused
+experts. That last part is why neither client.py nor shard_build.py needed a call-site change to
+gain int8 MoE support.
 
 SELF-CONTAINED LEAF (shard_compile.py precedent): deliberately NOT in client.py's state.bind()
 list — this module is the CANONICAL HOME of the quant flag family (_CPU_FP32_GEMM,
@@ -501,24 +508,61 @@ def _quant_linear_cls():
     return _QUANT_LINEAR
 
 
+def _pack8_expert(W2d):
+    """Per-output-channel SYMMETRIC int8 quant of ONE 2D weight [out, in] -> (qweight int8
+    [out, in], scale [out, 1]). No zero point, no group: the scale is one value per output ROW.
+
+    THE SINGLE SOURCE of the int8 quant math (#moe-int8). `_quantize_linear` (2D nn.Linear) and
+    `_pack8_3d` (fused 3D MoE experts) both call THIS, so a 3D expert stack is bit-identical to
+    the 2D packer applied per expert slice BY CONSTRUCTION, not by two copies of the arithmetic
+    happening to agree. That property is load-bearing: it is what makes "pack expert e out of a
+    3D stack" and "pack expert e as its own Linear" produce the same bytes, which is what any
+    future streamed / cached int8-expert path has to inherit.
+
+    Deliberately NOT .float() first: the original stays in W's own dtype (bf16 amax, bf16
+    divide), and shard_compile.pack_linear_int8 mirrors it exactly. Adding a float() here would
+    silently invalidate every existing int8 shard cache. Change this, shard_compile's twin, and
+    nothing else — or a cached int8 shard stops matching a cold load."""
+    import torch
+    scale = (W2d.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-8)
+    qW = (W2d / scale).round().clamp(-127, 127).to(torch.int8).contiguous()
+    return qW, scale.to(W2d.dtype)
+
+
 def _quantize_linear(lin):
     """nn.Linear -> int8 weight-only QuantLinear (per-output-channel scale)."""
-    import torch
     QL = _quant_linear_cls()
-    W = lin.weight.data
-    scale = (W.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-8)
-    qW = (W / scale).round().clamp(-127, 127).to(torch.int8).contiguous()
-    return QL(qW, scale.to(W.dtype), lin.bias)
+    qW, scale = _pack8_expert(lin.weight.data)
+    return QL(qW, scale, lin.bias)
 
 
 def _quantize_int8_(module) -> None:
+    """int8-quantize a decoder layer: every nn.Linear (attention / router gate / shared experts /
+    dense MLP) AND the fused 3D routed-expert Parameters a MoE keeps outside nn.Linear.
+
+    The expert sweep is folded in HERE rather than exposed as a separate call the way int4 does it
+    (client.py / shard_build.py call `_quantize_experts4_` explicitly). int4 needs the split
+    because it has STREAMED expert variants that must run before/after the Linear walk in a
+    specific order; int8 has no streamed variant (shard_build gates `stream_experts` to int4), so
+    both int8 call sites hand us a layer whose experts are fully resident. Folding it in means
+    neither caller had to change to gain expert packing — and, more to the point, neither caller
+    can FORGET to, which is exactly how "int8 on a MoE silently leaves 90% of the model in bf16"
+    shipped in the first place.
+
+    Linears first, then experts — same order as the int4 call sites, and it keeps the walk from
+    recursing into the freshly-installed Packed8Tensor3D submodule for nothing."""
+    _quantize_int8_linears_(module)
+    _quantize_experts8_(module)
+
+
+def _quantize_int8_linears_(module) -> None:
     """Recursively replace every nn.Linear under `module` with a QuantLinear."""
     from torch import nn
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
             setattr(module, name, _quantize_linear(child))
         else:
-            _quantize_int8_(child)
+            _quantize_int8_linears_(child)
 
 
 # ---------------------------------------------------------------------------
@@ -2252,8 +2296,9 @@ def _install_gptoss_fused_forward(experts_mod) -> None:
 # (attention) + norms are small, used EVERY token, and latency-critical. Today placement is
 # whole-layer (a spilled MoE layer drags its hot attention to CPU with the experts). With this on,
 # a split layer keeps attention+norms on GPU and leaves the MoE block (router+experts+shared) on
-# CPU. Gated to int4 (Packed4Tensor3D) experts only — those are always heap (no mmap), so unload
-# reclaim is unaffected; bf16 experts (mmap Parameters) are left to the whole-layer path.
+# CPU. Gated to QUANTIZED experts only (int4 Packed4Tensor3D / int8 Packed8Tensor3D / per-expert
+# QuantLinear4) — those are always heap (no mmap), so unload reclaim is unaffected; bf16 experts
+# (mmap Parameters) are left to the whole-layer path.
 _MOE_BRIDGE = None
 
 
@@ -2301,15 +2346,23 @@ def _find_moe_block(layer):
     a DENSE layer (its MLP has no experts) so a dense layer is never wrapped. The block is the whole
     sparse-MoE module (router gate + routed experts + any shared expert); wrapping it sends all of
     those to CPU and keeps only the token-mixer + norms on GPU. Splittability by quant (experts must
-    be heap, not mmap) is gated by the caller (int4/int8 only)."""
-    PT = _packed4_3d_cls()
+    be heap, not mmap) is gated by the caller (int4/int8 only).
+
+    #moe-int8: Packed8Tensor3D counts too. Its callers ALREADY allow quant int8 (shard_build's
+    `moe_off = ... self.quant in ("int4","int8")`), but before int8 grew a 3D expert holder the
+    only int8 MoE shape was per-expert QuantLinears — so the isinstance list never named it, and
+    an int8 fused-MoE layer whose block lacks a plain `experts` attribute would have fallen
+    through to (None, None) and silently lost #moe-offload. Neither holder has `.dim()`, so the
+    raw-3D-Parameter fallback does not cover them."""
+    PT4 = _packed4_3d_cls()
+    PT8 = _packed8_3d_cls()
     for name, child in layer.named_children():
         if getattr(child, "experts", None) is not None:
             return name, child
         for sub in child.modules():
             for attr in ("gate_up_proj", "down_proj"):
                 a = getattr(sub, attr, None)
-                if isinstance(a, PT) or (a is not None and hasattr(a, "dim") and a.dim() == 3):
+                if isinstance(a, (PT4, PT8)) or (a is not None and hasattr(a, "dim") and a.dim() == 3):
                     return name, child
     return None, None
 
@@ -2602,6 +2655,299 @@ def _quantize_experts4_streamed_nonfused(module, layer_idx: int, fetch_experts, 
             e += k
         print(f"[load] L{layer_idx}: streamed {E} non-fused experts "
               f"({'/'.join(proj_names)}, per-expert int4, chunk {chunk})")
+
+
+# --- int8 for FUSED MoE experts (3D gate_up_proj/down_proj nn.Parameters) — #moe-int8 ----------
+# The int4 3D family above, cloned down to the int8 tier. Until this landed, int8 was the ONLY
+# thing a MoE could not have: `_quantize_int8_` walked nn.Linear and nothing else, so a MoE at
+# int8 kept its routed experts — ~90% of the parameters — in bf16. That is a ~bf16 footprint
+# wearing an int8 label, which is why /load DOWNGRADED int8-on-MoE to int4 rather than serve it.
+# With the w8a16 kernel making int8 the best-quality tier that is still fast, that downgrade was
+# locking the whole MoE fleet out of the tier it should prefer.
+#
+# int8 is SIMPLER than int4 here, and every simplification is a place a bug cannot live:
+#   * per-output-ROW symmetric scale, no zero point, no group -> no group padding, no in_pad,
+#     no nibble packing, and the per-expert pack is EXACTLY the 2D packer (`_pack8_expert`).
+#   * one byte per weight -> `qweight[e]` is already the natural [out, in] matrix, so the eager
+#     MoE host path is a single broadcast multiply, not an unpack-restack-dequant chain.
+#
+# WHAT THIS DOES NOT GET YOU (say it here so nobody assumes it): there is NO fused GROUPED int8
+# MoE kernel. `_w4a16_moe_op` / `_install_fused_moe_forward` speak int4 only and self-gate on
+# `isinstance(gu, Packed4Tensor3D)`, so they stay inert on int8 experts — an int8 MoE decodes
+# through the EAGER per-expert host loop. What this tier does win is (a) the memory, which is the
+# entire reason the downgrade existed, and (b) on ROCm, the per-expert w8a16 GEMV below, which
+# removes the per-token bf16 rematerialization of each routed expert's weight. The 8.8x dense
+# decode number (2.83 -> 25.00 tok/s, gfx1151) is a DENSE 2D measurement and says nothing about
+# MoE decode; nothing here has been measured on a MoE.
+
+_PACKED8_3D = None
+_W8A16_EXPERT = None
+
+
+def _w8a16_experts_ok(dev) -> bool:
+    """Should Packed8Tensor3D hand the MoE host a w8a16 tensor subclass instead of a bf16 weight?
+
+    ROCm only by default, and that asymmetry is a measurement, not an oversight: on a discrete
+    NVIDIA card cuBLAS bf16 is fast enough that dequant-once-then-GEMM beats reading int8 inside
+    the GEMM (torch's own `_weight_int8pack_mm` measured 2-5x SLOWER than bf16 F.linear on CUDA —
+    see QuantLinear.prepare_fused, which gates on a bench for exactly this reason). The int8
+    eager dequant is also far cheaper than int4's, so the kernel has less to beat here than it
+    does on the dense path. IM_W8A16_EXPERTS=1 enables it on CUDA for whoever wants to MEASURE
+    it; =0 turns it off everywhere. Never on CPU (no triton)."""
+    import os
+    import torch
+    v = os.environ.get("IM_W8A16_EXPERTS", "")
+    if v == "0" or not _FUSED_W8A16:
+        return False
+    if dev.type != "cuda":            # torch reports ROCm as 'cuda' too; CPU has no kernel
+        return False
+    if getattr(torch.version, "hip", None):
+        return True
+    return v == "1"
+
+
+def _w8a16_expert_cls():
+    """torch.Tensor subclass for ONE MoE expert's int8 weight — the int8 twin of
+    `_w4a16_expert_cls`. `Packed8Tensor3D.__getitem__` returns this instead of a dequantized bf16
+    weight: it intercepts F.linear(activation, this) via __torch_function__ and routes to the
+    Triton w8a16 kernel (reads int8 directly, no per-token full-weight bf16 rematerialization),
+    and materializes to the scale dtype for ANY other op so nothing breaks. None if triton is
+    unavailable. Thread-safe lazy build under the SHARED _W8A16_BUILD_LOCK (an RLock, because
+    _w8a16_triton_op re-enters it from inside this builder) — #triton-race."""
+    global _W8A16_EXPERT
+    if _W8A16_EXPERT is not None:
+        return _W8A16_EXPERT
+    with _W8A16_BUILD_LOCK:
+        if _W8A16_EXPERT is not None:      # a racer built it while we waited
+            return _W8A16_EXPERT
+        return _w8a16_expert_cls_locked()
+
+
+def _w8a16_expert_cls_locked():
+    global _W8A16_EXPERT
+    op = _w8a16_triton_op()
+    if op is None:
+        return None
+    try:
+        import torch
+        import torch.nn.functional as F
+
+        class _W8A16Weight(torch.Tensor):
+            @staticmethod
+            def __new__(cls, packed, scale):
+                out, in_f = packed.shape
+                t = torch.Tensor._make_wrapper_subclass(
+                    cls, (out, in_f), dtype=scale.dtype,
+                    device=packed.device, requires_grad=False)
+                t._packed = packed          # int8 [out, in]
+                t._scale = scale            # dtype [out, 1]
+                return t
+
+            def _materialize(self):
+                # The same expression Packed8Tensor3D.__getitem__ returns on the non-kernel path,
+                # so the self-check below compares the kernel against the EXACT tensor the eager
+                # host would otherwise have been handed — not against a second reference.
+                return (self._packed.to(self._scale.dtype) * self._scale).contiguous()
+
+            @classmethod
+            def __torch_function__(cls, func, types, args=(), kwargs=None):
+                kwargs = kwargs or {}
+                if func is F.linear or getattr(func, "__name__", "") == "linear":
+                    inp = args[0]
+                    w = args[1] if len(args) > 1 else kwargs.get("weight")
+                    bias = args[2] if len(args) > 2 else kwargs.get("bias")
+                    # bf16 activations ONLY. The kernel accumulates in fp32 and emits bf16; an
+                    # fp32 or fp16 activation would be silently down/up-converted, a precision
+                    # change the eager dequant path does not make. Same gate QuantLinear.forward
+                    # applies to the dense w8a16 path — do not relax it for the MoE path alone.
+                    if isinstance(w, cls) and getattr(inp, "dtype", None) is torch.bfloat16:
+                        y = op(inp, w._packed, w._scale)
+                        if inp.dim() > 2:
+                            y = y.reshape(*inp.shape[:-1], y.shape[-1])
+                        return y if bias is None else y + bias.to(y.dtype)
+                mat = [a._materialize() if isinstance(a, cls) else a for a in args]
+                mkw = {k: (v._materialize() if isinstance(v, cls) else v) for k, v in kwargs.items()}
+                return func(*mat, **mkw)
+
+            @classmethod
+            def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+                # Required by _make_wrapper_subclass. The fast path is handled in
+                # __torch_function__ (F.linear); anything that reaches the aten dispatcher with a
+                # wrapper operand just materializes and re-runs — correctness over speed.
+                kwargs = kwargs or {}
+                mat = [a._materialize() if isinstance(a, cls) else a for a in args]
+                mkw = {k: (v._materialize() if isinstance(v, cls) else v) for k, v in kwargs.items()}
+                return func(*mat, **mkw)
+
+        _W8A16_EXPERT = _W8A16Weight
+    except Exception as exc:
+        _builtins.print(f"[int8] triton w8a16 expert subclass unavailable ({exc!r})", flush=True)
+        _W8A16_EXPERT = None
+    return _W8A16_EXPERT
+
+
+def _packed8_3d_cls():
+    global _PACKED8_3D
+    if _PACKED8_3D is None:
+        import torch
+        from torch import nn
+
+        class Packed8Tensor3D(nn.Module):
+            """Holder for ALL of one MoE projection's experts at int8: the int8 twin of
+            Packed4Tensor3D. Replaces a 3D nn.Parameter [E, out, in] so the eager routed forward
+            (`self.gate_up_proj[expert_idx]`) keeps working while only the INDEXED expert is ever
+            materialized in the activation dtype.
+
+            No `group_size` and no `in_pad`: the int8 scale is per output ROW, so `qweight` is the
+            weight matrix at its natural shape and `in_features == qweight.shape[2]` always. It is
+            kept as an attribute anyway so consumers that introspect a 3D expert holder
+            (_find_moe_block, footprint census) read the same field name on both tiers.
+
+            No `prepare_fused`: the #dram-dealias row padding exists for the int4/int2 GEMVs and
+            was NEVER measured for int8 (the dense int8 tier ships without it). Inventing a pad
+            here would be a guess dressed as an optimization."""
+
+            def __init__(self, qweight, scale, in_features):
+                super().__init__()
+                self.register_buffer("qweight", qweight)   # int8 [E, out, in]
+                self.register_buffer("scale", scale)        # dtype [E, out, 1]
+                self.in_features = in_features
+                self._expert_triton = None                  # ROCm: lazily enabled in __getitem__
+
+            def __getitem__(self, e):
+                # Returns ONE expert's weight for the eager MoE host forward, which then does
+                # F.linear(bf16_activation, this). bf16 (scale dtype), not fp32: the host contract
+                # requires the returned weight match the activation dtype — see the identical
+                # note on Packed4Tensor3D.__getitem__.
+                e = int(e)
+                # ROCm fast path: hand the host a tensor subclass whose F.linear routes into the
+                # Triton w8a16 kernel instead of rematerializing this expert's full bf16 weight
+                # every token. One-time self-check vs the bf16 dequant it replaces; ANY mismatch,
+                # non-ROCm device, or missing triton -> the trusted dequant path.
+                if self._expert_triton is None:
+                    self._expert_triton = False
+                    with contextlib.suppress(Exception):
+                        # bf16-only: the kernel emits bf16, so an fp16 holder would have its
+                        # output dtype silently changed under the host.
+                        if (_w8a16_experts_ok(self.qweight.device)
+                                and self.scale.dtype is torch.bfloat16):
+                            wc = _w8a16_expert_cls()
+                            if wc is not None:
+                                import torch.nn.functional as _F
+                                w0 = wc(self.qweight[0], self.scale[0])
+                                wref = w0._materialize()
+                                rel = 0.0
+                                bad_m = 0
+                                # M=1 AND M=8 because the two are DIFFERENT kernels (split-K
+                                # atomic GEMV vs tl.dot GEMM) and only the GEMV has the
+                                # reset_to_zero hazard. At MoE decode every routed expert GEMM is
+                                # M=1, so an M=8-only check would leave the entire decode path
+                                # unverified — the exact hole the int4 twin's comment records.
+                                for _M in (1, 8):
+                                    xt = torch.randn(_M, self.in_features,
+                                                     device=self.qweight.device,
+                                                     dtype=torch.bfloat16)
+                                    yn = _F.linear(xt, wref).float()
+                                    yf = _F.linear(xt, w0).float()
+                                    rel = ((yf - yn).abs().mean()
+                                           / (yn.abs().mean() + 1e-6)).item()
+                                    if not (rel < 0.05):
+                                        bad_m = _M
+                                        break
+                                del wref
+                                if not bad_m:
+                                    self._expert_triton = True
+                                    _builtins.print(f"[int8] triton w8a16 experts active "
+                                                    f"(rel={rel:.4f})", flush=True)
+                                else:
+                                    _builtins.print(f"[int8] triton w8a16 experts self-check "
+                                                    f"rel={rel:.3f} at M={bad_m} -> bf16 dequant",
+                                                    flush=True)
+                if self._expert_triton:
+                    return _w8a16_expert_cls()(self.qweight[e], self.scale[e])
+                # [out, in] int8 * [out, 1] scale -> broadcast over the input axis. That IS the
+                # dequant; there is no unpack step at 8 bits.
+                return (self.qweight[e].to(self.scale.dtype) * self.scale[e]).contiguous()
+
+        _PACKED8_3D = Packed8Tensor3D
+    return _PACKED8_3D
+
+
+def _pack8_3d(W3):
+    """Quantize a fused expert tensor [E, out, in] to a Packed8Tensor3D, ONE EXPERT AT A TIME.
+
+    Per-expert for the same reason as `_pack4_3d` (#61): a whole-tensor pack holds the source AND
+    a full-size intermediate at once, which OOM-killed memory-tight nodes during "building shard"
+    on a 256-expert MiniMax layer. Here it is also the CORRECTNESS statement — `_pack8_expert` is
+    the 2D packer, so this loop makes the 3D result equal the 2D packer applied per expert slice
+    by construction. Per-expert == whole-tensor exactly, because the scale is per output ROW and
+    a row never crosses an expert boundary (unlike a group-wise scheme, where the claim would
+    depend on the group grid lining up)."""
+    import torch
+    PT = _packed8_3d_cls()
+    E, out, in_f = W3.shape
+    dt = W3.dtype
+    qpacked = torch.empty((E, out, in_f), dtype=torch.int8)
+    scale = torch.empty((E, out, 1), dtype=dt)
+    for e in range(E):
+        qw, sc = _pack8_expert(W3[e])          # one expert (mmap slice on Linux)
+        qpacked[e] = qw                         # int8 -> int8, same dtype: an exact copy
+        scale[e] = sc                           # dt -> dt, same dtype: an exact copy
+        del qw, sc
+    return PT(qpacked, scale, in_f)
+
+
+def _quantize_experts8_(module) -> None:
+    """Replace fused MoE expert tensors (3D gate_up_proj/down_proj nn.Parameters) with int8
+    Packed8Tensor3D. The int8 twin of `_quantize_experts4_`; nn.Linear (attention, router gate,
+    shared experts, per-expert MoE arches like Mixtral) is handled by `_quantize_int8_linears_`,
+    and this catches ONLY the raw 3D expert Parameters that walk misses. No-op on a dense layer.
+
+    Two REFUSALS rather than a wrong answer:
+
+    * gpt-oss. Its experts are IN-major [E, hidden, 2*inter] applied as `x @ W`, with interleaved
+      clamped SwiGLU and per-expert biases. int4 handles it by TRANSPOSE-packing and installing a
+      dedicated fused forward (`_install_gptoss_fused_forward`) — that forward is written against
+      `_w4a16_moe_op` and there is no int8 equivalent, and the eager in-major host path cannot
+      consume a transposed weight. Packing it at int8 would produce a model that loads and emits
+      garbage. Load gpt-oss at int4 (or bf16).
+    * meta experts. A meta 3D Parameter means the layer blob was built with skip_experts and the
+      experts are meant to be STREAMED — an int4-only path (shard_build gates `stream_experts` to
+      int4). Quantizing a meta tensor would silently produce zeros, so refuse instead."""
+    from torch import nn
+    targets = []
+    for sub in module.modules():
+        is_go = _is_gptoss_experts(sub)
+        for attr in ("gate_up_proj", "down_proj"):
+            p = sub._parameters.get(attr)
+            if isinstance(p, nn.Parameter) and p.dim() == 3:
+                targets.append((sub, attr, is_go))
+    if not targets:
+        return                                   # dense layer / per-expert MoE: nothing fused here
+    if any(is_go for _s, _a, is_go in targets):
+        raise RuntimeError("gpt-oss fused experts have no int8 path (IN-major transpose-packed "
+                           "weights need the fused w4a16 MoE forward) — load gpt-oss at int4")
+    for sub, attr, _is_go in targets:
+        p = getattr(sub, attr)
+        if getattr(p, "is_meta", False):
+            raise RuntimeError(f"int8 MoE: {type(sub).__name__}.{attr} is META — per-expert "
+                               "expert streaming is int4-only; load this model at int4")
+        delattr(sub, attr)                       # drop the bf16 Parameter
+        setattr(sub, attr, _pack8_3d(p.data))    # install the int8 holder (submodule)
+    # Force the EAGER experts forward, exactly as the int4 path does: transformers 5.x dispatches
+    # via config._experts_implementation, and only "eager" indexes self.gate_up_proj[idx] per
+    # routed expert (which the per-expert holder supports). grouped_mm/batched_mm/deepgemm take
+    # the WHOLE 3D weight tensor and would break on the holder.
+    seen = set()
+    for sub, _attr, _is_go in targets:
+        cfg = getattr(sub, "config", None)
+        if cfg is not None and hasattr(cfg, "_experts_implementation") and id(cfg) not in seen:
+            cfg._experts_implementation = "eager"
+            seen.add(id(cfg))
+    # NO `_install_fused_moe_forward` here, unlike the int4 twin: that installs the GROUPED
+    # `_w4a16_moe_op` launch and self-gates on isinstance(gu, Packed4Tensor3D), so it would be a
+    # silent no-op anyway. There is no grouped int8 MoE kernel — int8 experts decode through the
+    # eager per-expert loop (with the per-expert w8a16 GEMV on ROCm, see Packed8Tensor3D).
 
 
 def _layer_has_meta_experts(lyr) -> bool:

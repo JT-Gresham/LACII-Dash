@@ -910,7 +910,10 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
     _plan_weight_stream's tensor selection + output naming (plain 'model.*', tied lm_head alias), but
     reads+materializes (the row slice is non-contiguous so byte-range copy is impossible). Output keys
     and per-tensor SHAPES match exactly what the worker's reduced-dim TP structure expects, so a plain
-    load_state_dict(assign=True) installs them. Returns the serialized safetensors bytes."""
+    load_state_dict(assign=True) installs them. Quantized sources (fp8 F8_E4M3, nvfp4 packed FP4) are
+    DEQUANTIZED to bf16 first and only then sliced, so the TP split is done once, on plain bf16, by
+    code that never learns which quantization the checkpoint used. Returns the serialized
+    safetensors bytes."""
     import torch                                  # noqa: F401 (used via save below)
     from safetensors.torch import save as st_save
     geo = _tp_geo_for_rank(model_dir, tp_rank, tp_size, weights)   # per-rank slice (het or uniform)
@@ -918,10 +921,29 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
     wm = _weight_map(model_dir)
     prefix = _text_prefix(wm)
     fp8_block = _fp8_block_size(model_dir)   # fold fp8 weight_scale_inv -> bf16 before TP slicing
-    if _nvfp4_group_size(model_dir) is not None:
-        raise NotImplementedError(
-            "nvfp4 checkpoints are not supported in tensor-parallel mode yet — load nvfp4 in "
-            "pipeline/proportional mode (the dequant-then-TP-slice path is a follow-up)")
+    # nvfp4 rides the SAME dequant-then-slice route as fp8, and deliberately shares the slicing code
+    # rather than re-deriving it: the packed weight is expanded to bf16 [out_features, in_features]
+    # FIRST, then handed to the very same _tp_kind_and_slice/_tp_slice_tensor the fp8 and plain-bf16
+    # tensors go through. That is the whole safety argument — a per-quant-format slicing rule is
+    # exactly how you end up with a model that loads, checksums fine, and generates garbage, so
+    # there is no nvfp4-specific notion of "which axis" anywhere below.
+    nvfp4_group = _nvfp4_group_size(model_dir)
+    if nvfp4_group is not None:
+        # LOUD REFUSAL, not a fallback. If the checkpoint quantized the LM head, its weight lives at
+        # 'lm_head.weight_packed' and 'lm_head.weight' is ABSENT — at which point _is_tied()'s
+        # "no head tensor exists -> necessarily tied" probe concludes the model is tied and we serve
+        # the EMBEDDING matrix as the head. Wrong logits, no exception, no crash: the silent-garbage
+        # failure this whole path is written to avoid. Every nvfp4 checkpoint this fleet has seen
+        # keeps lm_head in compressed-tensors' `ignore` list (bf16), so refusing costs nothing real
+        # and guessing costs correctness. NOTE: the pipeline path (_plan_weight_stream) has the same
+        # blind spot and is NOT fixed here — see the follow-up.
+        _hk = _head_key(wm, prefix)
+        if _hk.endswith(".weight") and _hk not in wm and (_hk[: -len(".weight")] + ".weight_packed") in wm:
+            raise NotImplementedError(
+                f"nvfp4 checkpoint quantizes the LM head ('{_hk}_packed' present, '{_hk}' absent): "
+                "_is_tied() would silently mistake that for tied embeddings and serve the embedding "
+                "matrix as the head (wrong logits, no error). Serving a quantized head is "
+                "unimplemented — refusing rather than guessing.")
     names = _selected_names(wm, start, end, has_embed, has_head, tied, prefix)
     out_pairs: list[tuple[str, str]] = []         # (output_name 'model.*', source_name)
     if has_embed:
@@ -940,20 +962,59 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
     by_file: dict[str, list[tuple[str, str]]] = {}
     for out_name, src_name in out_pairs:
         by_file.setdefault(wm[src_name], []).append((out_name, src_name))
+    def _companion(fh, name: str):
+        """A quantized weight's sidecar tensor (fp8 weight_scale_inv; nvfp4 weight_scale /
+        weight_global_scale). Prefer the already-open shard — a weight and its scale normally live
+        together — but follow the weight map, because a big checkpoint can land them in different
+        files. None if the checkpoint does not carry it at all."""
+        if name in fh.keys():
+            return fh.get_tensor(name)
+        if name in wm:
+            with safe_open(wm[name], framework="pt") as sfh:
+                return sfh.get_tensor(name)
+        return None
+
     sd: dict = {}
     for fn, pairs in by_file.items():
         with safe_open(fn, framework="pt") as fh:
             for out_name, src_name in pairs:
-                kind, off, length = _tp_kind_and_slice(out_name, geo)
                 t = fh.get_tensor(src_name)
                 if fp8_block is not None and t.dtype == torch.float8_e4m3fn:   # fp8 -> bf16, then slice
-                    sname = _fp8_scale_name(src_name)
-                    sc = fh.get_tensor(sname) if sname in fh.keys() else None
-                    if sc is None and sname in wm:
-                        with safe_open(wm[sname], framework="pt") as sfh:
-                            sc = sfh.get_tensor(sname)
+                    sc = _companion(fh, _fp8_scale_name(src_name))
                     if sc is not None:
                         t = _dequant_fp8_to_bf16(t, sc, fp8_block)
+                elif nvfp4_group is not None and src_name.endswith(".weight_packed"):
+                    # nvfp4 -> bf16 BEFORE slicing, mirroring _plan_weight_stream's pipeline branch
+                    # exactly (same helper, same logical shape derivation), then rename
+                    # '...weight_packed' -> '...weight' because the worker's TP structure has a
+                    # plain bf16 Linear slot and nothing named '*_packed'. The rename happens BEFORE
+                    # classification below so col/row detection and the '.bias' test see the final
+                    # name. Everything after this line is quant-format-blind.
+                    if t.dtype != torch.uint8 or t.ndim != 2:
+                        # Refuse instead of half-handling it: the packed layout this decoder knows is
+                        # 2D uint8 [out, in//2] (two E2M1 codes per byte). A 3D fused-MoE packed
+                        # tensor or a different dtype would silently unpack to the wrong shape, and
+                        # a wrong-shaped bf16 still slices and still loads.
+                        raise NotImplementedError(
+                            f"nvfp4 '{src_name}': packed weight is {t.dtype} ndim={t.ndim}, but the "
+                            "dequantizer only knows 2D uint8 [out, in//2]. A fused 3D MoE expert "
+                            "tensor (or any other packed layout) is unimplemented on the TP path.")
+                    sc = _companion(fh, _nvfp4_scale_name(src_name))
+                    gs = _companion(fh, _nvfp4_global_scale_name(src_name))
+                    if sc is None or gs is None:
+                        # The fp8 branch above tolerates a missing scale (it just serves the raw
+                        # tensor). nvfp4 must NOT: falling through would emit a U8 '*.weight_packed'
+                        # key the worker has no slot for, i.e. a missing '.weight' + an unexpected
+                        # key on a load_state_dict(assign=True) that does not check.
+                        raise KeyError(
+                            f"nvfp4 '{src_name}' is missing its scale sidecar(s) "
+                            f"(weight_scale={'ok' if sc is not None else 'MISSING'}, "
+                            f"weight_global_scale={'ok' if gs is not None else 'MISSING'}) — "
+                            "cannot dequantize, and serving the packed bytes would be garbage.")
+                    t = _dequant_nvfp4_to_bf16(t, sc, gs, nvfp4_group,
+                                               [int(t.shape[0]), int(t.shape[1]) * 2])
+                    out_name = out_name.replace(".weight_packed", ".weight")
+                kind, off, length = _tp_kind_and_slice(out_name, geo)
                 if kind is None:                  # replicated: embed/norm/head/layernorm/rotary
                     sd[out_name] = t.clone() if out_name == "lm_head.weight" and tied else t
                     continue

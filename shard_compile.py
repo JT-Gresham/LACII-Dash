@@ -94,23 +94,77 @@ def pack_linear_int4(W, group_size: int = INT4_GROUP):
     return qpacked, scale.to(W.dtype), zero.to(W.dtype), in_f
 
 
-def pack_linear_int4_3d(W3, group_size: int = INT4_GROUP):
-    """Group-wise int4 pack of a FUSED 3D MoE expert tensor [E, out, in] -> per-expert STACKED
+def pack_linear_int4_3d(W3, group_size: int = INT4_GROUP, in_major: bool = False):
+    """Group-wise int4 pack of a FUSED 3D MoE expert tensor -> per-expert STACKED
     (qweight uint8 [E, out, in_pad//2], scale [E, out, ng], zero [E, out, ng], in_features, ng).
     Loops the SAME pack_linear_int4 per expert (group quant is independent across experts), so the
     result is BIT-IDENTICAL to the worker's _pack4_3d / _pack4_expert (which use the same per-expert
-    math as _quantize_linear4 — already proven == pack_linear_int4 in m4c81). W3 is bf16/fp16."""
+    math as _quantize_linear4 — already proven == pack_linear_int4 in m4c81). W3 is bf16/fp16.
+
+    LAYOUT. Default is [E, out, in] — F.linear semantics, what every fused MoE we serve stores
+    (Qwen3.6 native-fused; Mixtral/OLMoE after `_fuse_moe_experts`). `in_major=True` is the gpt-oss
+    shape [E, in, out]: gpt-oss applies its experts as `y = x @ W`, so the checkpoint is
+    in_features-major and the w4a16 MoE kernel (which IS F.linear) needs the transpose. That mirrors
+    worker_quant._quantize_experts4_, which packs `p.data.transpose(1, 2).contiguous()` for a
+    gpt-oss block — so `in_major=True` here reproduces the worker's cold path bit for bit, which is
+    the entire contract of the shard cache (a cache that differs from a cold load loads, passes its
+    own sha, and generates garbage).
+
+    The transpose is applied PER EXPERT (`W3[e].t().contiguous()`) rather than once over the whole
+    tensor. Same values by definition (`W3.transpose(1, 2)[e]` IS `W3[e].t()`) and therefore the
+    same bytes out, but the contiguous copy peaks at ONE expert instead of the whole [E, in, out] —
+    the same reason the worker's own `_pack4_3d` packs one expert at a time (#61: a whole-tensor
+    `.float()` spiked ~14 GB on a MiniMax layer and OOM-killed memory-tight nodes).
+
+    NOTE for callers: `in_major=True` is currently reachable only from tests. `pack_unit_tensors`
+    REFUSES in-major experts — see `_in_major_expert_names` for why the serve side, not the packer,
+    is what still blocks a gpt-oss shard cache."""
     import torch
+
+    def _expert(i):
+        # .contiguous() so the per-expert packer sees exactly the memory layout the worker's
+        # `.transpose(1, 2).contiguous()` hands it. The BITS are decided by the values alone
+        # (pack_linear_int4 only reads them), but leaving the layouts identical means the two
+        # paths differ in nothing at all — no room for a stride-dependent surprise.
+        return W3[i].t().contiguous() if in_major else W3[i]
+
     E = int(W3.shape[0])
-    q0, s0, z0, in_f = pack_linear_int4(W3[0], group_size)
+    q0, s0, z0, in_f = pack_linear_int4(_expert(0), group_size)
     qpacked = torch.empty((E,) + tuple(q0.shape), dtype=q0.dtype)
     scale = torch.empty((E,) + tuple(s0.shape), dtype=s0.dtype)
     zero = torch.empty((E,) + tuple(z0.shape), dtype=z0.dtype)
     qpacked[0], scale[0], zero[0] = q0, s0, z0
     for e in range(1, E):
-        qe, se, ze, _ = pack_linear_int4(W3[e], group_size)
+        qe, se, ze, _ = pack_linear_int4(_expert(e), group_size)
         qpacked[e], scale[e], zero[e] = qe, se, ze
     return qpacked, scale, zero, in_f, int(scale.shape[2])
+
+
+def _in_major_expert_names(raw: dict) -> set:
+    """Fused-3D expert tensors in `raw` whose layout is IN-major [E, in, out] instead of the
+    [E, out, in] `pack_linear_int4_3d` packs by default. Packing one of these without the transpose
+    is the single worst failure this file can produce: the cache loads, verifies its own sha256, and
+    generates garbage.
+
+    Detected from the CHECKPOINT SHAPE, not from `quantization_config`. That distinction is the
+    whole point — the guard shipped in 6bfb1f2 keyed on `_mxfp4_quantized(model_dir)` and could
+    NEVER fire, on either directory a gpt-oss model can be in:
+      * the RAW MXFP4 snapshot — its expert weights are named `<name>_blocks` / `<name>_scales`, and
+        `_has_moe_experts` matches only `.gate_up_proj` / `.down_proj` / `.experts.<N>`, so `_moe`
+        was False and the whole MoE block (guard included) was skipped;
+      * the NORMALIZED dir, which is the one `compile_shards` is actually handed — model_store's
+        `convert_mxfp4_to_model_dir` runs `mxfp4_convert.py` at add time, and that converter does
+        `cfg.pop("quantization_config", None)`, so `_mxfp4_quantized` reads False by construction.
+    What survives the conversion is the architecture's own shape: a GptOssExperts block stores a
+    PER-EXPERT bias beside each fused weight (`gate_up_proj_bias` [E, 2I], `down_proj_bias` [E, H]),
+    and mxfp4_convert passes non-`_blocks` tensors through untouched. No other fused-3D MoE we serve
+    (Qwen3.6, fused Mixtral, OLMoE) carries expert biases at all.
+
+    Deliberately a "layout is UNKNOWN here" test rather than a "this is gpt-oss" test: a future
+    fused MoE with per-expert biases lands here too and gets refused instead of packed on a guess.
+    Refusing costs a re-quantize per load; guessing wrong costs silent corruption."""
+    return {n for n, W in raw.items()
+            if W.dim() == 3 and (n + "_bias") in raw}
 
 
 def pack_linear_int8(W):
@@ -141,6 +195,14 @@ def pack_unit_tensors(raw: dict, lin2d, exp3d, skel, quant: str = "int4",
     group_size = _default_group(quant, group_size)   # int2 packs at INT2_GROUP unless overridden
     if skel is not None:
         raw = _fuse_moe_experts(raw, skel)
+    # #gptoss-cache: refuse IN-major fused experts HERE, at the shared packer, not only in
+    # compile_shards. Three other paths reach this function without ever running compile_shards'
+    # guards — /compile_dist's local-fallback pack, /pack_probe's reference pack (both
+    # routes_shards.py) and the worker's remote-pack handler (worker_load.py) — so a refusal that
+    # lived only in compile_shards would still let a distributed compile write the wrong cache.
+    # Computed AFTER the fuse: a per-expert checkpoint fused into 3D has no `_bias` siblings, so it
+    # is correctly not flagged.
+    _in_major = _in_major_expert_names(raw) if quant == "int4" else set()
     out_sd: dict = {}
     mtensors: dict = {}
     for out_name, W in raw.items():
@@ -158,6 +220,27 @@ def pack_unit_tensors(raw: dict, lin2d, exp3d, skel, quant: str = "int4",
             is_layer_lin = W.dim() == 2 and out_name.endswith(".weight") and ".layers." in out_name
         is_int8_head = quant == "int8" and out_name == "lm_head.weight" and W.dim() == 2
         if is_expert3d:
+            if out_name in _in_major:
+                # The PACKER is no longer the blocker: pack_linear_int4_3d(in_major=True) reproduces
+                # the worker's cold path (`.transpose(1, 2).contiguous()` -> _pack4_3d) bit for bit.
+                # The SERVE side is. shard_build._install_cached takes `in_f = int(metap.shape[2])`
+                # off the meta Parameter — for an in-major expert shape[2] is OUT, not in_features
+                # (gpt-oss-20b gate_up_proj is [E, 2880, 5760], so in_f would come out 5760 instead
+                # of 2880) — and it then sets `_experts_implementation = "eager"` without calling
+                # `_install_gptoss_fused_forward`, which gpt-oss has no valid alternative to: once
+                # the weights are transpose-packed the eager in-major `x @ W` host path cannot
+                # consume them (worker_quant.py's own comment says so, and its cold path skips
+                # eager for exactly that reason). It also never checks `_gptoss_fused_ok()`.
+                # So enabling the transpose here alone would just relocate the corruption from the
+                # packer to the installer. Lifting this needs shard_build.py first.
+                raise ValueError(
+                    f"{out_name}: IN-major fused MoE experts (gpt-oss, [E, in, out]) are not "
+                    "shard-cacheable yet — the packer can transpose them correctly, but "
+                    "shard_build._install_cached reads in_features from meta shape[2] (that is OUT "
+                    "for an in-major expert) and installs the eager experts forward, which gpt-oss "
+                    "has no valid version of once weights are transpose-packed. Load gpt-oss at "
+                    "int4 WITHOUT a shard cache (the worker's cold path transposes correctly), or "
+                    "at quant=none for bf16")
             qw, sc, ze, in_f, ng = pack_linear_int4_3d(W, group_size)
             out_sd[out_name + ".qweight"] = qw
             out_sd[out_name + ".scale"] = sc
@@ -280,6 +363,22 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     if quant not in ("int4", "int8", "int2"):
         raise ValueError(f"shard cache supports quant int4|int8|int2 (got {quant!r})")
     group_size = _default_group(quant, group_size)   # int2 caches pack at INT2_GROUP (64)
+    if _mxfp4_quantized(model_dir):
+        # A RAW (un-normalized) MXFP4 snapshot. Its expert weights are not tensors anything here can
+        # read: `<name>_blocks` is uint8 [E, out, G, 16] of packed E2M1 codes and `<name>_scales` is
+        # the E8M0 exponent sidecar, and `_get_bf16` has no MXFP4 branch — `.to(bfloat16)` on packed
+        # bytes caches garbage (the #89 served-raw class of bug). Worse, those names also defeat
+        # `_has_moe_experts` (it matches `.gate_up_proj`/`.down_proj`/`.experts.<N>`, none of which
+        # a `..._blocks` name ends in), so `_moe` would be False and every MoE guard below would be
+        # skipped for the one checkpoint that needs them most. Ahead of the int2 delegate too: the
+        # GPTQ packer reads the same unreadable tensors and has no reason to re-derive this.
+        # Costs nothing in practice — model_store.convert_mxfp4_to_model_dir normalizes gpt-oss to
+        # plain bf16 ONCE at add time (mxfp4_convert.py) and THAT dir is what the /compile_shards
+        # route hands us; this only catches a hand-pointed raw snapshot.
+        raise ValueError("MXFP4 checkpoint (gpt-oss) cannot be shard-compiled in place: its expert "
+                         "weights are packed '_blocks'/'_scales' pairs with no serve-time dequant "
+                         "here. Add the model normally — model_store converts it to bf16 once via "
+                         "mxfp4_convert.py — and compile that directory instead")
     if quant == "int2":
         # #38: int2 is the GPTQ-CALIBRATED tier — plain RTN at 2 bits is token salad on every
         # model tried, so the RTN unit loop below never runs for it. Lazy import (gptq_pack
@@ -328,22 +427,38 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
             if not _q_perexpert:
                 raise ValueError("fused-3D fp8/nvfp4-source MoE shard compile not supported "
                                  "(no 3D serve-dequant path); per-expert quantized MoE is supported")
-        # MXFP4-source MoE (gpt-oss): the ONE case that would produce a silently WRONG cache rather
-        # than fail. gpt-oss stores its fused experts IN-MAJOR — `_dequant_mxfp4_to_bf16` returns
-        # [E, in, out] (its own docstring says so), because gpt-oss applies experts as `y = x @ W`.
-        # `pack_linear_int4_3d` packs W3[e] as a 2D [out, in]. Nothing here reconciles the two, so
-        # every expert would be packed transposed and the w4a16 kernel would read the wrong axis —
-        # producing a cache that loads, verifies its own sha, and generates garbage.
-        # The WORKER does handle it (worker_quant.py transposes to [E, out, in] before packing,
-        # `_install_gptoss_fused_forward`), which is exactly why this went unnoticed: cold loads
-        # are correct and only the cache is wrong. Refuse until the packer transposes too — a
-        # missing cache costs a re-quantize per load, a wrong one costs silent corruption.
-        if _mxfp4_quantized(model_dir) and (_moe_fused or _exp3d):
-            raise ValueError("MXFP4-source fused MoE (gpt-oss) shard compile not supported: its "
-                             "experts are IN-major [E, in, out] and the 3D packer assumes "
-                             "[E, out, in], which would produce a silently transposed cache. "
-                             "Load gpt-oss at int4 without a shard cache (the worker transposes "
-                             "correctly on the cold path), or at quant=none for bf16")
+        # IN-MAJOR fused MoE (gpt-oss): the ONE case that would produce a silently WRONG cache
+        # rather than fail. gpt-oss stores its fused experts [E, in, out] because it applies them as
+        # `y = x @ W`, while `pack_linear_int4_3d` packs each expert as [out, in]; packed the wrong
+        # way round, the w4a16 kernel reads the wrong axis and the cache loads, verifies its own
+        # sha, and generates garbage. The WORKER handles it (worker_quant._quantize_experts4_
+        # transposes before packing, `_install_gptoss_fused_forward`), which is exactly why this
+        # hides: cold loads are correct and only the cache is wrong.
+        #
+        # Detected from the WEIGHT MAP, not from config. 6bfb1f2's version keyed on
+        # `_mxfp4_quantized(model_dir)` and could not fire on the directory this function actually
+        # receives: model_store normalizes gpt-oss to bf16 at add time and mxfp4_convert.py pops
+        # `quantization_config` from the config it writes. Per-expert biases beside a fused 3D
+        # weight are the arch signature that survives that conversion — see
+        # `_in_major_expert_names`, which applies the same test to the in-memory unit so the
+        # distributed pack paths (which never call compile_shards) refuse identically.
+        _in_major = sorted(s for s in wm
+                           if (s.endswith(".gate_up_proj") or s.endswith(".down_proj"))
+                           and (s + "_bias") in wm)
+        if _in_major:
+            # NOT lifted by teaching the packer the layout — `pack_linear_int4_3d(in_major=True)`
+            # already reproduces the worker's cold path bit for bit. What still blocks it is the
+            # SERVE side: shard_build._install_cached derives in_features from meta shape[2] (OUT,
+            # for an in-major expert) and installs the eager experts forward, which a
+            # transpose-packed gpt-oss has no valid version of. See pack_unit_tensors.
+            raise ValueError(f"IN-major fused MoE experts ({len(_in_major)} tensors, e.g. "
+                             f"{_in_major[0]}) are not shard-cacheable yet: gpt-oss stores experts "
+                             "[E, in, out] and the serve-from-cache installer "
+                             "(shard_build._install_cached) reads in_features from meta shape[2] "
+                             "and installs the eager experts forward, neither of which is valid "
+                             "for transpose-packed experts. Load gpt-oss at int4 without a shard "
+                             "cache (the worker transposes correctly on the cold path), or at "
+                             "quant=none for bf16")
         if not _moe_fused and not _exp3d and not _moe_per_expert:
             raise ValueError("per-expert MoE shard compile needs the model skeleton (it failed to "
                              "build — no fused-3D layout to fuse into nor per-expert scope to pack); "
