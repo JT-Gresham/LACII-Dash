@@ -4,7 +4,52 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-14 (latest) — pick which machine runs a media model (server 0.3.17)
+## 2026-08-16 (latest) — backlog batch: O(N²) segmentation, self-update manifest, toolchain probe (server 0.3.18 / client 0.3.25)
+
+The 105-item audit was re-verified against HEAD first: **16 items had already been closed** by the
+preceding commits and **23 were dropped** as refuted or self-defeating, leaving 43 open-code items.
+This is the surviving small/medium work, implemented across seven disjoint file sets in parallel.
+
+### Fixed
+
+- **Streaming tool-segmentation was O(N²)** — `_segment_tools` re-ran over the WHOLE accumulated
+  string every token, on the tools path, i.e. exactly the coding-agent path. Now incremental,
+  exploiting the invariant its own docstring already claimed ("prefix-stable"). Equivalence is
+  tested, not asserted: OLD vs NEW over the same stream at multiple chunk sizes, compared at every
+  step. **9.2× at 500 tokens, 19.4× at 2000, 39.3× at 4000.**
+- **Mixed audio+image on `/v1/messages` silently dropped the images** and returned a 200 computed
+  from partial input — the worst failure shape, since the caller cannot detect, retry or fall back.
+  Now a 400 naming both modalities, refused before any tokenize/render/encode work.
+- `/gpudiag`'s rocm-smi branch labelled a byte count as `used_mib`.
+
+### Added
+
+- **`#cc-probe`** — `has_triton` / `has_cc` per node in `/status`. A worker missing gcc or
+  `Python.h` silently falls back to the naive int4 path (measured 2.08 → 15.4 tok/s, **7.4×**, on
+  gfx1151). It logged locally and surfaced nowhere. Both default TRUE so a pre-feature worker is
+  never slandered, and neither gates `can_infer` nor feeds placement.
+- **`#newmodule-2cycle`** — the self-update fetch list now comes from the FETCHED `server.py`
+  unioned with the running one, so a newly-added module converges in one cycle. Read with
+  `ast.literal_eval`, never exec'd: this runs on CDN bytes *before* the update's own gates have
+  decided we want that copy. Matches `AnnAssign` as well as `Assign` — the real declaration is
+  annotated, and an Assign-only match would have silently always returned `[]`.
+- Dead `_materialize_from_prefix` removed from `media_encode.py`.
+
+### Documentation
+
+Corrected against the source, not from memory: remaining co-location claims in T2I/TTS; the
+CUDA-graph retest advice in ACCELERATION/ROCM (which omitted that `db47ae1` made the env var inert
+on ROCm, so a retest also needs the `shard_forward` guard lifted); and six `docs/nodes/` files
+carrying Windows-era facts, retired hosts and bare `(verify)` placeholders — each either resolved
+with a citation or marked "unverified — needs the box" with the command to run.
+
+### Verified live
+
+Both pools on 0.3.18 / 0.3.25 (14 workers). Tool-calling returns `finish_reason=tool_calls` with
+correct args and no reasoning leak; `has_triton`/`has_cc` visible per node; zero errors in either
+controller's log.
+
+## 2026-08-14 — pick which machine runs a media model (server 0.3.17)
 
 ### Added
 
