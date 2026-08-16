@@ -1257,7 +1257,7 @@ async function applyRt(name){
 // the note says so explicitly rather than leaving it a mysterious omission.
 function t2iLoadDlg(name){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🖼 '+esc(name)+'</h3>'
-    +'<div class="note" style="margin-top:8px">The image pipeline (v1) runs <b>whole on one GPU that shares the controller box</b> — it is not split across the fleet like an LLM, so there is no distributed / tensor-parallel option. Text encoder runs on that box\'s CPU, VAE decodes tiled. Choose how the DiT weights sit on the GPU:</div>'
+    +'<div class="note" style="margin-top:8px">The image pipeline runs <b>whole on one GPU</b> — it is not split across the fleet like an LLM, so there is no distributed / tensor-parallel option. Since <code>#media-anywhere</code> that GPU no longer has to share the controller box: any node advertising <code>can_t2i</code> can run it and returns the PNG over the control link. Text encoder runs on that node\'s CPU, VAE decodes tiled. Choose how the DiT weights sit on the GPU:</div>'
     +'<label style="margin-top:10px">Placement</label>'
     +'<select id="t-place" onchange="_t2iPlaceChg()">'
     +'<option value="auto">Auto — GPU int4, spill to CPU if it won\'t fit (recommended)</option>'
@@ -1269,6 +1269,7 @@ function t2iLoadDlg(name){
     +'<option value="int4">int4 mixed-edge (~13.5 GB — first+last blocks bf16 ≈ bf16 quality)</option>'
     +'<option value="none">bf16 full (~41 GB — needs a big-VRAM / unified-memory card)</option>'
     +'</select></div>'
+    +_mediaNodeSel('can_t2i','Which machine runs it')
     +'<div id="t-note" class="note" style="margin-top:10px"></div>'
     +'<div style="margin-top:14px"><button class="btn sm pri" onclick="loadT2i(\''+esc(name)+'\')">Load 🖼</button> '
     +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
@@ -1289,17 +1290,22 @@ function _t2iPlaceChg(){
 // (GPU-resident holds ~8 GB and long clips can OOM on a 16 GB card).
 function t2aLoadDlg(name){
   $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🎵 '+esc(name)+'</h3>'
-    +'<div class="note" style="margin-top:8px">Loads the ACE-Step music pipeline (DiT + VAE + text encoder, ~8 GB bf16) onto the GPU sharing the controller box. Then open its card to generate music.</div>'
+    +'<div class="note" style="margin-top:8px">Loads the ACE-Step music pipeline (DiT + VAE + text encoder, ~8 GB bf16) onto <b>any</b> GPU node advertising <code>can_t2a</code> — it no longer has to be the box running the controller. Then open its card to generate music.</div>'
     +'<div class="note" style="margin-top:8px"><b>Offloaded (recommended)</b>: components rest in system RAM and the DiT streams to the GPU per render — ~0 GB resident, leaves headroom for long-clip activations, never evicts residents.</div>'
     +'<div class="note" style="margin-top:8px"><b>GPU-resident</b>: the whole pipeline stays on the GPU (~8 GB) — quicker to start each render, but long (multi-minute) clips can OOM on a 16 GB card beside other residents.</div>'
-    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="closeOv();loadT2a(\''+esc(name)+'\',1)">Load 🎵 offloaded</button> '
-    +'<button class="btn sm" onclick="closeOv();loadT2a(\''+esc(name)+'\')">Load 🎵 GPU-resident</button> '
+    +_mediaNodeSel('can_t2a','Which machine runs it')
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="loadT2a(\''+esc(name)+'\',1)">Load 🎵 offloaded</button> '
+    +'<button class="btn sm" onclick="loadT2a(\''+esc(name)+'\')">Load 🎵 GPU-resident</button> '
     +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
   $('#ov').classList.add('show');
 }
 function loadT2a(name,off){
-  toast('loading music pipeline for '+name+(off?' (offloaded — components in RAM)':'')+' — up to a minute…');
-  api('/load?model='+encodeURIComponent(name)+(off?'&t2i_offload=1':''),{method:'POST'})
+  // Read the node picker BEFORE closing the dialog — closeOv() tears the modal out of the DOM, so
+  // #m-node is gone by the time the request is built. (The buttons used to call closeOv() inline.)
+  const nq=_mediaNodeQS(); closeOv();
+  toast('loading music pipeline for '+name+(off?' (offloaded — components in RAM)':'')
+        +(nq?(' on '+decodeURIComponent(nq.slice(6))):'')+' — up to a minute…');
+  api('/load?model='+encodeURIComponent(name)+(off?'&t2i_offload=1':'')+nq,{method:'POST'})
     .then(()=>{toast(name+' ready — open its card to generate');tick();})
     .catch(e=>errDlg('music pipeline load failed',String(e.message||e)));
   tick();
@@ -1312,15 +1318,18 @@ function t2mLoadDlg(name){
     +'<div class="note" style="margin-top:8px">Loads the <b>MusicGen</b> pipeline (text encoder + audio-token transformer + EnCodec decoder) onto a capable GPU — or CPU if that\'s all there is. It\'s autoregressive (~50 audio tokens/sec), so render time scales with clip length.</div>'
     +'<div class="note" style="margin-top:8px"><b>The first render warms the EnCodec decoder once.</b> On an AMD gfx1151 GPU that\'s a one-time MIOpen compile (~a minute); every render after is fast. NVIDIA is fast immediately; CPU runs but is much slower.</div>'
     +'<div class="note" style="margin-top:8px">When it\'s ready, open its card and use the <b>Generate music</b> panel — prompt + duration / guidance / temperature / top-k / seed, with an inline player and a WAV download.</div>'
-    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="closeOv();loadT2music(\''+esc(name)+'\')">Load 🎵</button> '
+    +_mediaNodeSel('can_t2music','Which machine runs it')
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="loadT2music(\''+esc(name)+'\')">Load 🎵</button> '
     +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
   $('#ov').classList.add('show');
 }
 // #t2music-serve: load a MusicGen model (no offload dance — small autoregressive net). The FIRST
 // render also JIT-warms the EnCodec audio decoder once (esp. on ROCm/gfx1151), then renders are fast.
 function loadT2music(name){
-  toast('loading MusicGen '+name+' — the first render also warms the audio decoder (one-time)…');
-  api('/load?model='+encodeURIComponent(name),{method:'POST'})
+  const nq=_mediaNodeQS(); closeOv();   // read the picker before the modal is torn down
+  toast('loading MusicGen '+name+(nq?(' on '+decodeURIComponent(nq.slice(6))):'')
+        +' — the first render also warms the audio decoder (one-time)…');
+  api('/load?model='+encodeURIComponent(name)+nq,{method:'POST'})
     .then(()=>{toast(name+' ready — open its card to generate music');tick();})
     .catch(e=>errDlg('MusicGen load failed',String(e.message||e)));
   tick();
@@ -1345,17 +1354,20 @@ function _t2iFire(name,qs,label){
 function loadT2i(name){
   var place=$('#t-place')?$('#t-place').value:'auto';
   var prec=$('#t-prec')?$('#t-prec').value:'int4';
+  var nq=_mediaNodeQS();          // read the picker BEFORE closeOv() tears the modal out
   closeOv();
-  if(place==='offload'){ _t2iFire(name,'&t2i_offload=1',' (CPU offload — DiT in RAM)'); return; }
-  if(place==='gpu'){ _t2iFire(name,'&quant='+encodeURIComponent(prec),
+  if(place==='offload'){ _t2iFire(name,'&t2i_offload=1'+nq,' (CPU offload — DiT in RAM)'); return; }
+  if(place==='gpu'){ _t2iFire(name,'&quant='+encodeURIComponent(prec)+nq,
       prec==='none'?' (GPU-resident bf16)':' (GPU-resident int4)'); return; }
   toast('loading '+name+' — GPU int4, will spill to CPU offload if it won\'t fit…');
-  api('/load?model='+encodeURIComponent(name)+'&quant=int4',{method:'POST'})
+  api('/load?model='+encodeURIComponent(name)+'&quant=int4'+nq,{method:'POST'})
     .then(()=>{toast(name+' ready on GPU (int4)');tick();})
     .catch(e=>{ var msg=String(e.message||e);
       if(/vram|evict|co-located gpu|no room|nothing/i.test(msg.toLowerCase())){
+        // The auto-spill keeps the SAME node pin — spilling to RAM is a placement-within-node
+        // decision, so silently relocating to a different machine would contradict the pick.
         toast('GPU full — spilling to CPU offload…');
-        api('/load?model='+encodeURIComponent(name)+'&t2i_offload=1',{method:'POST'})
+        api('/load?model='+encodeURIComponent(name)+'&t2i_offload=1'+nq,{method:'POST'})
           .then(()=>{toast(name+' ready (CPU offload — spilled)');tick();})
           .catch(e2=>errDlg('image pipeline load failed',String(e2.message||e2)));
       } else { errDlg('image pipeline load failed',msg); }
@@ -1496,6 +1508,34 @@ async function openHistory(name){
 // layer-pack per worker across the fleet and is far faster — the packed bytes are identical
 // either way (the workers use the same shared packer). int2 is GPTQ-calibrated + sequential
 // (layer L needs layer L-1's quantized output) so it can ONLY build locally.
+// #media-node-pick: the media leaves (t2a/t2i/tts/stt/t2music) each run WHOLE on one node, and
+// since #media-pin the loader honours `node=` for all five — but the dialogs never offered the
+// choice, so placement was always whatever the heuristic picked. Build the option list from the
+// nodes that actually advertise the runtime, so a machine that cannot serve it is never offered.
+// `cap` is the capability flag ('can_t2a', 'can_t2i', 'can_tts', 'can_stt', 'can_t2music').
+function _mediaNodeOpts(cap){
+  const ns=(LAST&&LAST.nodes||[]).filter(n=>n.alive&&n[cap]).slice()
+    .sort((a,b)=>(b.usable_vram_gb||0)-(a.usable_vram_gb||0)
+                 ||String(a.hostname).localeCompare(String(b.hostname)));
+  if(!ns.length)return '';
+  return ns.map(n=>'<option value="'+esc(n.hostname)+'">'+esc(n.hostname)+' — '
+    +(n.has_gpu?(fmt(n.usable_vram_gb)+' GB VRAM'):'CPU only')
+    +(n.vram_used_gb?(' ('+fmt(n.vram_used_gb)+' GB in use)'):'')+'</option>').join('');
+}
+// The <select> itself, plus a note when nothing capable is connected. Default stays "Auto" so the
+// existing behaviour is unchanged for anyone who does not care where it lands.
+function _mediaNodeSel(cap,label){
+  const opts=_mediaNodeOpts(cap);
+  if(!opts)return '<div class="note" style="margin-top:8px">No connected node advertises <code>'
+    +esc(cap)+'</code>, so this cannot be placed anywhere right now.</div>';
+  return '<div style="margin-top:12px"><label>'+esc(label||'Which machine')+'</label>'
+    +'<select id="m-node"><option value="">Auto — let the controller choose</option>'+opts+'</select></div>';
+}
+// Read it back; '' means auto (send no node= at all, preserving the old behaviour exactly).
+function _mediaNodeQS(){
+  const el=$('#m-node'); const v=el?el.value:'';
+  return v?('&node='+encodeURIComponent(v)):'';
+}
 function _compileNodeOpts(){
   const ns=(LAST&&LAST.nodes||[]).filter(n=>n.alive&&n.can_infer).slice()
     .sort((a,b)=>(b.free_mem_gb||0)-(a.free_mem_gb||0));
