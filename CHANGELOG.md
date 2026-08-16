@@ -4,7 +4,44 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-16 (latest) — backlog batch: O(N²) segmentation, self-update manifest, toolchain probe (server 0.3.18 / client 0.3.25)
+## 2026-08-17 (latest) — MoE finally has a tier above int4 (server 0.3.20 / client 0.3.27)
+
+### Added
+
+- **int8 3D routed-expert packer.** Until now **no MoE could use any tier but int4** —
+  `routes_lifecycle` downgraded int8/int2 loudly because no 3D packer existed. With w8a16 making
+  int8 fast (2.83 → 25.00 tok/s on gfx1151), the whole MoE fleet was locked out of the
+  best-quality tier.
+
+  Bit-identity is **structural, not asserted**: `_pack8_expert` is now the single owner of the
+  int8 arithmetic, so "the 3D pack equals the 2D packer per expert" is a tautology. An AST
+  comparison confirms the dense int8 path is byte-for-byte unchanged, so no existing int8 cache
+  is invalidated.
+
+  **Verified live**, not just unit-tested: `qwen3-30b-a3b-instruct` loaded at `quant=int8` on
+  om3nbox — `48x (128, 2048, 768) torch.int8 = 9.00 GB`, i.e. the 128-expert 3D tensors really
+  are int8 — and generates coherently.
+
+  Two hard refusals rather than a wrong answer: gpt-oss experts at int8 (IN-major transpose-packed
+  weights need the fused w4a16 forward) and meta experts (int4-only streaming). gpt-oss at int8
+  previously "worked" by silently leaving experts bf16 while the planner sized it 0.5× — it now
+  fails *before* placement instead of OOMing mid-load.
+
+- **gpt-oss IN-major layout** for `pack_linear_int4_3d`, transposing per expert so the peak is one
+  expert rather than the whole tensor (#61: a whole-tensor `.float()` once spiked ~14 GB). The
+  `pack_unit_tensors` guard deliberately **stays** — the packer is correct now but the serve side
+  still cannot consume such a cache.
+- **NVFP4 tensor-parallel** load (was a bare `NotImplementedError`): ranks bit-identical to the
+  bf16 serve, with three refusals for the cases that cannot be made certainly correct.
+- **Split multi-part GGUF ingestion** — accepted only as a complete contiguous 1..N series; an
+  incomplete set fails loud at download time rather than producing a corrupt conversion.
+
+### Verification note
+
+All four suites were **executed on real torch** (om3nbox / gfx1151), not merely written — the
+controller box has no torch, so the code that produced them could not run them.
+
+## 2026-08-16 — backlog batch: O(N²) segmentation, self-update manifest, toolchain probe (server 0.3.18 / client 0.3.25)
 
 The 105-item audit was re-verified against HEAD first: **16 items had already been closed** by the
 preceding commits and **23 were dropped** as refuted or self-defeating, leaving 43 open-code items.
