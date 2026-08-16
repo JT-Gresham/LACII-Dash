@@ -536,9 +536,49 @@ def _quantize_linear(lin):
     return QL(qW, scale, lin.bias)
 
 
+def _quantize_linears_(module, convert) -> None:
+    """Recursively replace every nn.Linear under `module` with `convert(lin)` — EXCEPT a MoE's
+    router/gate, which EVERY quant tier leaves bf16.
+
+    ONE walk for int8/int4/int2 deliberately. The exclusion used to be written out per tier and
+    the int8 copy simply did not have it: `_quantize_int8_linears_` quantized routers while
+    `_quantize_int4_`/`_quantize_int2_` skipped them, with a comment saying why. That divergence
+    was LATENT only because the /load route downgraded int8-on-MoE to int4 (routes_lifecycle
+    #moe-int8, "a tier with no 3D routed-expert packer"); shipping `_quantize_experts8_` removed
+    that downgrade and made int8 MoE — and the hole — reachable. A per-tier copy of a rule that
+    must never drift IS the bug, so there is now nothing here to keep in sync.
+
+    Quantizing a router corrupts top-k EXPERT SELECTION, and it does not crash: poolside/
+    Laguna-XS-2.1 loaded clean at int4, answered "The capital of France is Paris." once, then
+    looped forever (#bare-linear-router, 4dc57e6). docs/ACCELERATION.md states the bf16 router as
+    an invariant across ALL tiers, and shard_compile._quant_scope — which decides what the shard
+    CACHE packs, tier-agnostically — already excluded it, so int8's cold load was also diverging
+    from its own cache scope.
+
+    Two exclusion shapes, both load-bearing:
+      * leaf NAME in _ROUTER_LEAF_NAMES — a router that is a bare nn.Linear with no *Router/*Gate
+        ancestor to block recursion on (Laguna `model.layers.N.mlp.gate`).
+      * child CLASS ending Router/Gate — skip the whole subtree (gemma4's Gemma4TextRouter
+        exposes `proj` as a plain nn.Linear).
+    The lm_head is NOT in scope: callers hand this a decoder layer, and int8's head quant (which
+    int4/int2 deliberately skip) is a separate explicit call at the call sites (client.py Shard,
+    shard_build's kind == "head")."""
+    from torch import nn
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            if name in _ROUTER_LEAF_NAMES:
+                continue   # #bare-linear-router (see _ROUTER_LEAF_NAMES) -> keep bf16
+            setattr(module, name, convert(child))
+        elif type(child).__name__.endswith(("Router", "Gate")):
+            continue       # leave router/gate projections bf16 (precision-sensitive routing)
+        else:
+            _quantize_linears_(child, convert)
+
+
 def _quantize_int8_(module) -> None:
-    """int8-quantize a decoder layer: every nn.Linear (attention / router gate / shared experts /
-    dense MLP) AND the fused 3D routed-expert Parameters a MoE keeps outside nn.Linear.
+    """int8-quantize a decoder layer: every nn.Linear EXCEPT the router gate (so: attention /
+    shared experts / dense MLP) AND the fused 3D routed-expert Parameters a MoE keeps outside
+    nn.Linear.
 
     The expert sweep is folded in HERE rather than exposed as a separate call the way int4 does it
     (client.py / shard_build.py call `_quantize_experts4_` explicitly). int4 needs the split
@@ -556,13 +596,12 @@ def _quantize_int8_(module) -> None:
 
 
 def _quantize_int8_linears_(module) -> None:
-    """Recursively replace every nn.Linear under `module` with a QuantLinear."""
-    from torch import nn
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear):
-            setattr(module, name, _quantize_linear(child))
-        else:
-            _quantize_int8_linears_(child)
+    """Recursively replace every nn.Linear under `module` with a QuantLinear — router/gate
+    EXCLUDED, same set and same reasoning as int4/int2, via the shared `_quantize_linears_` walk.
+    This function used to carry its own copy of the walk WITHOUT the exclusion; see
+    `_quantize_linears_` for the failure mode that made that a P0 the moment int8 MoE became
+    reachable."""
+    _quantize_linears_(module, _quantize_linear)
 
 
 # ---------------------------------------------------------------------------
@@ -1574,17 +1613,10 @@ def _quantize_int4_(module) -> None:
     router/gate module. int4 on a router gate corrupts the top-k expert selection -> garbage
     (gemma4's Gemma4TextRouter exposes `proj` as a plain nn.Linear; custom routers hold a raw weight
     Parameter so they had no inner Linear to skip). Mirrors the cache packer's `_quant_scope`
-    exclusion so a cold load stays bit-identical to the serve-from-cache install."""
-    from torch import nn
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear):
-            if name in _ROUTER_LEAF_NAMES:
-                continue   # #bare-linear-router (see _ROUTER_LEAF_NAMES) -> keep bf16
-            setattr(module, name, _quantize_linear4(child))
-        elif type(child).__name__.endswith(("Router", "Gate")):
-            continue   # leave router/gate projections bf16 (precision-sensitive routing)
-        else:
-            _quantize_int4_(child)
+    exclusion so a cold load stays bit-identical to the serve-from-cache install. The walk itself
+    is `_quantize_linears_`, shared with int8/int2 — the exclusion lived here as a per-tier copy
+    and int8's copy was missing it, which is exactly the drift a shared walk removes."""
+    _quantize_linears_(module, _quantize_linear4)
 
 
 # --- int2: 2-bit weight-only quant (#int2) ---------------------------------------------------
@@ -1916,17 +1948,9 @@ def _quantize_int2_(module) -> None:
     """Recursively replace every nn.Linear under `module` with a QuantLinear2 — EXCEPT inside a
     router/gate module (same exclusion as _quantize_int4_: 2-bit on a router gate corrupts the
     top-k expert selection even worse than 4-bit). Mirrors the cache packer's `_quant_scope`
-    exclusion so a cold load stays bit-identical to the serve-from-cache install."""
-    from torch import nn
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear):
-            if name in _ROUTER_LEAF_NAMES:
-                continue   # #bare-linear-router -> keep bf16 (2-bit routing is even worse)
-            setattr(module, name, _quantize_linear2(child))
-        elif type(child).__name__.endswith(("Router", "Gate")):
-            continue   # leave router/gate projections bf16 (precision-sensitive routing)
-        else:
-            _quantize_int2_(child)
+    exclusion so a cold load stays bit-identical to the serve-from-cache install. Shares the
+    `_quantize_linears_` walk with int4/int8 so all three tiers exclude the SAME set."""
+    _quantize_linears_(module, _quantize_linear2)
 
 
 # --- int4 for FUSED MoE experts (3D gate_up_proj/down_proj nn.Parameters) -------------------
@@ -2899,9 +2923,15 @@ def _pack8_3d(W3):
 
 def _quantize_experts8_(module) -> None:
     """Replace fused MoE expert tensors (3D gate_up_proj/down_proj nn.Parameters) with int8
-    Packed8Tensor3D. The int8 twin of `_quantize_experts4_`; nn.Linear (attention, router gate,
-    shared experts, per-expert MoE arches like Mixtral) is handled by `_quantize_int8_linears_`,
-    and this catches ONLY the raw 3D expert Parameters that walk misses. No-op on a dense layer.
+    Packed8Tensor3D. The int8 twin of `_quantize_experts4_`; nn.Linear (attention, shared experts,
+    per-expert MoE arches like Mixtral) is handled by `_quantize_int8_linears_`, and this catches
+    ONLY the raw 3D expert Parameters that walk misses. No-op on a dense layer.
+
+    The ROUTER cannot land here and that is structural, not luck: the targets are 3D nn.Parameters
+    named exactly `gate_up_proj` / `down_proj`, while a router gate is a 2D weight named `gate` /
+    `router` / `wg` (or lives under a *Router/*Gate module). Both filters have to fail for a router
+    to be packed. `_quantize_int8_linears_` is the walk that had the real hole; see
+    `_quantize_linears_`.
 
     Two REFUSALS rather than a wrong answer:
 

@@ -288,17 +288,53 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         # find_stale_dupes needs the exact data endpoint to match — a dual-homed box that
         # re-registered via another route slips it (the 2026-07-21 om3nbox class:
         # /restart_node saw models_affected=[], then every request 500'd "no shard for
-        # model_id=..." until a manual /unload). Match by HOSTNAME (physical identity, the
-        # same assumption find_stale_dupes makes) and invalidate LOUDLY. invalidate_model
-        # pops the row from engine.models, so this fires exactly once per stale model — a
-        # reconnect storm can't turn it into an invalidation storm.
+        # model_id=..." until a manual /unload). So match on PHYSICAL identity, and
+        # invalidate LOUDLY. invalidate_model pops the row from engine.models, so this fires
+        # exactly once per stale model — a reconnect storm can't turn it into an
+        # invalidation storm.
         _held = {e.get("model_id") or (e.get("assign") or {}).get("model_id")
                  for e in (msg.get("loaded") or []) if isinstance(e, dict)}
         _host_l = (node.hostname or "").strip().lower()
+
+        def _stage_is_this_worker(_s) -> bool:
+            """Does this stage's shard belong to the worker that just registered?
+
+            #dupe-worker: hostname alone names the BOX, not the WORKER. Two worker processes
+            on one box (a second --data-port; the pair Node.dupe_node_ids flags and /status
+            renders) both report the same hostname, so the hostname-only match this backstop
+            used to make had worker B's registration invalidate worker A's perfectly healthy
+            resident models — the backstop firing on somebody else's shards, and the exact
+            hazard registry.Node's #dupe-worker comment predicted. Key on the node id that
+            actually owns the shard; fall back to the box only when that id owns nothing.
+
+            Narrowing only: every stage this returns True for was already matched by the old
+            hostname test, so a worker that genuinely restarted still gets its own stale
+            models invalidated."""
+            _sid = getattr(_s, "node_id", "") or ""
+            if _sid and _sid == node.node_id:
+                return True    # already re-pointed at me (adopt / #77 recover_node_restart)
+            _own = registry._nodes.get(_sid) if _sid else None
+            if _own is None:
+                # The owning id is registered NOWHERE. Every registry-removal path invalidates
+                # on its way out (link drop, reaper_loop, #77), so a row still pointing at a
+                # vanished id is stale by construction and unroutable regardless of which
+                # worker held it. Scope it to this box by the stage's recorded hostname.
+                return (getattr(_s, "hostname", "") or "").strip().lower() == _host_l
+            if (_own.hostname or "").strip().lower() != _host_l:
+                return False   # owner is a live node on a DIFFERENT box — not ours to touch
+            # Same box, owner still registered: same worker SLOT iff the data port matches.
+            # A restart re-uses its data port (fixed --data-port config, not ephemeral) while a
+            # second worker cannot bind a port already held — the same discriminator
+            # registry._mark_host_dupes uses, so this backstop and the /status #dupe-worker
+            # flag can never disagree about who owns what. An unknown port (0) on either side
+            # can't discriminate: treat it as ours, which keeps the old behaviour rather than
+            # silently dropping the backstop for pre-feature workers.
+            return (not _own.data_port or not node.data_port
+                    or _own.data_port == node.data_port)
+
         for _fr, _lm in list(engine.models.items()):
             _stgs = getattr(getattr(_lm, "plan", None), "stages", None) or []
-            if not any((getattr(_s, "hostname", "") or "").strip().lower() == _host_l
-                       for _s in _stgs):
+            if not any(_stage_is_this_worker(_s) for _s in _stgs):
                 continue
             if _lm.target_id in _held:
                 continue   # worker still holds it (kept for adoption / healthy reconnect flap)

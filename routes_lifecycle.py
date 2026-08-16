@@ -60,6 +60,91 @@ def _fed_target(peers, model: str, owner: str):
     return (best, "we own no nodes; it does")
 
 
+# --- #update-refused: tell an APPLIED self-update apart from a REFUSED one --------------------------
+# server._self_update_check returns None on every path and, with force=True, os._exit(42)s ITSELF the
+# instant it installs anything — so control coming back here PROVES nothing was installed, but says
+# nothing about why. "Already current" and "refused" are indistinguishable from the return value.
+# Both callers below used to os._exit(42) unconditionally after it, which is how a REFUSED deploy
+# (#no-downgrade CDN lag, #stale-bytes truncated fetch, a verify/stage failure) still bounced the
+# controller — onto the SAME old code — after the route had already answered {"ok": true}. That is the
+# hazard server._update_refused's own docstring names ("the box bounces either way ... the controller
+# came back up 'healthy' on OLD code after a forced deploy") and could not fix from its side.
+#
+# Fixing it without touching server.py needs two things, neither of which reimplements the updater:
+#   PREFLIGHT  — decide the gates that can be read off the PRIMARY file alone BEFORE /update unloads
+#                every model and tells the fleet to free RAM, so the HTTP response carries the real
+#                outcome and a refused deploy costs nothing.
+#   OUTCOME    — after the check runs, read back whether it logged a refusal. _update_refused writes
+#                "update REFUSED: <why>" into the ACTIVITY ring (a shared deque, injected by
+#                state.bind), which is a stable, already-documented contract.
+# Residual: the two "not fetchable -> aborting cycle" paths refuse by print() alone. The preflight
+# catches that for server.py itself; an EXTRA file 404ing mid-cycle still reads as "no refusal
+# logged" -> restart, i.e. exactly today's behaviour, never worse.
+
+def _update_preflight() -> str:
+    """Empty string when a forced self-update looks installable, else the reason to refuse it.
+
+    Blocking (one HTTPS GET) — call it via asyncio.to_thread. Authority still rests entirely with
+    _self_update_check: this never approves anything, it only refuses EARLY, and any unexpected
+    failure here returns "" (fail OPEN) so a broken preflight can never wedge the deploy path.
+
+    ONE attempt, deliberately, where _self_update_check retries 4x with backoff: its retry exists
+    for a freshly-ADDED module the raw CDN hasn't propagated yet (#3), and server.py is never one
+    of those — a 404 on the primary is an outage, not propagation lag. Retrying here would only
+    buy a 2-minute stall before the same 409, so say so at once and let the operator press again.
+    """
+    try:
+        blob = _fetch_repo_file("server.py")
+        if blob is None or len(blob) < 5:
+            return ("server.py will not fetch from the repo (raw CDN 404/transient) — there is "
+                    "nothing to install; this box is unchanged, retry in a minute")
+        ver = _extract_version(blob)
+        if not ver:
+            # #stale-bytes: the running primary has a VERSION by construction, so bytes without one
+            # are a truncated object / 404 body / error page served with a 200.
+            return (f"no VERSION constant in the fetched server.py ({len(blob)} B) — truncated or "
+                    "partial copy off the raw CDN; nothing installed")
+        if _ver_ordinal(ver) < _ver_ordinal(VERSION) and not SELF_UPDATE_ALLOW_DOWNGRADE:
+            return (f"repo VERSION {ver} is OLDER than running {VERSION} (CDN lag / this box is "
+                    "ahead) — force does NOT override this; set INFINITEMODEL_ALLOW_DOWNGRADE=1 "
+                    "for a deliberate rollback")
+    except Exception as exc:   # noqa: BLE001 — fail OPEN: never block a deploy on the preflight
+        print(f"[update] preflight could not run ({exc!r}) — proceeding; _self_update_check decides")
+    return ""
+
+
+async def _forced_update_outcome() -> str:
+    """Run the forced self-update and report "" (applied, or already current) or the refusal reason.
+
+    Read the asymmetry that makes this legible: with force=True the updater exit(42)s itself the
+    moment it installs anything, so returning at all means NOTHING landed — the ACTIVITY scan then
+    separates "there was nothing to land" from "we refused to land it".
+
+    An EXCEPTION out of the check counts as a refusal on purpose. The replace pass that swaps the
+    staged files is the one step that can leave the install half-done; staying up on the old code
+    already in memory is strictly safer there than relaunching into a half-swapped file set.
+
+    The idle self-update poll can theoretically log its own refusal inside this window and be read
+    as ours. It fires every 15 min and the misread costs a skipped restart plus a loud log line —
+    the fail-safe direction — so it is not worth a lock across a thread we do not own.
+    """
+    t0 = time.time() - 0.15        # ACTIVITY stamps are round(t, 1) — absorb the rounding
+    try:
+        await asyncio.to_thread(_self_update_check, "server.py", (lambda: True), True)
+    except Exception as exc:       # noqa: BLE001
+        return f"the self-update raised {exc!r} — nothing is known to have been installed"
+    for ent in list(ACTIVITY):     # appendleft ring: newest first, so stop at the first older entry
+        try:
+            if float(ent.get("t") or 0) < t0:
+                break
+            msg = str(ent.get("msg") or "")
+        except Exception:          # noqa: BLE001
+            continue
+        if msg.startswith("update REFUSED: "):
+            return msg[len("update REFUSED: "):]
+    return ""
+
+
 def register(app):
 
     @app.post("/load")
@@ -743,7 +828,36 @@ def register(app):
             # Normalize the resident quant back into a /load-able tier (media models carry
             # display strings: 'int4-e2' -> int4, 'bf16-off' -> offload mode).
             q = m.quant or "none"
-            kw = {"kv_quant": (m.kv_quant or ""), "kv_offload": bool(m.kv_offload)}
+            # #restart-recovery-knobs: snapshot the model's FULL load shape, not just the KV pair.
+            # This dict used to be {kv_quant, kv_offload} (+t2i_offload), so a model loaded with
+            # kv_slots>1, head_quant=int8, moe_offload or tp>1 came back QUIETLY NARROWER than the
+            # operator asked for: the recovery said "re-placing it onto the available fleet" and
+            # then re-placed something ELSE — a kv_slots=4 model back at 1 loses three concurrent
+            # decode slots, an int8-head model silently changes its logits back. Same class of
+            # silent config loss #load-faster hit ("a bare reconfigure would silently drop
+            # kv_quant / kv_offload / sampling defaults") and fixed with a full snapshot; keep this
+            # one in step with engine.load_faster's `snap`, which is its twin.
+            #
+            # kv_quant stays `m.kv_quant or ""` ON PURPOSE (load_faster maps "none" -> "" instead):
+            # engine_load reads an EMPTY kv_quant as "inherit ENGINE_CONFIG['kv_quant']", so a
+            # model that is resident with kv_quant=none must say "none" out loud or a fleet default
+            # changed since its load would quietly be applied to the recovered copy.
+            kw = {"kv_quant": (m.kv_quant or ""), "kv_offload": bool(m.kv_offload),
+                  "kv_slots": max(1, int(getattr(m, "kv_slots", 1) or 1)),
+                  "tp": max(1, int(getattr(m, "tp_size", 1) or 1)),
+                  # moe_offload / head_quant are NOT LoadedModel fields — engine_load writes them
+                  # onto the instance at load (`lm.moe_offload, lm.head_quant = ...`) for exactly
+                  # this reason, so these getattrs read something that is actually written (the
+                  # bug that comment records: the read existed before the write did).
+                  "moe_offload": bool(getattr(m, "moe_offload", False)),
+                  "head_quant": (getattr(m, "head_quant", "") or ""),
+                  "default_temp": getattr(m, "default_temperature", None),
+                  "default_min_p": getattr(m, "default_min_p", None)}
+            # #runtime-knobs (top_p / top_k / repeat_penalty / seed / num_predict / …) are NOT load
+            # parameters — POST /model_config writes them straight onto the LoadedModel, so a
+            # rebuilt copy starts with an empty dict. Carried separately and re-attached after the
+            # load, else a recovered replica samples differently from its surviving siblings.
+            sdef = dict(getattr(m, "sampling_defaults", None) or {})
             if q == "bf16-off":
                 q, kw["t2i_offload"] = "none", True
             elif q.startswith("int4"):
@@ -756,7 +870,7 @@ def register(app):
             # user-facing name to load, `fr` is the REGISTRY key ("base#i" for i>=1) that the
             # copy must come back under, else it re-registers as a plain reload of the base.
             recover.append((fr, m.ctx, q, kw, (getattr(m, "base", "") or fr),
-                            int(getattr(m, "replica_idx", 0) or 0)))
+                            int(getattr(m, "replica_idx", 0) or 0), sdef))
         who = _client_ip(request)
         try:
             await link.send({"type": "restart"})
@@ -801,7 +915,7 @@ def register(app):
                 # entry points test .locked() first and skip (the next sweep retries).
                 async with engine._juggle_lock:
                     await engine._await_free_refresh()   # plan against post-drop free numbers
-                    for fr, ctx, q, kw, base, ridx in recover:
+                    for fr, ctx, q, kw, base, ridx, sdef in recover:
                         if fr in engine.models:  # never dropped (or already re-loaded) — done
                             continue
                         # Siblings that are still resident (survivors, plus the copies this loop
@@ -821,6 +935,9 @@ def register(app):
                                 engine._no_evict_base = base
                             await engine.load(base, ctx, quant=q, reg_key=fr, replica_idx=ridx,
                                               exclude_nodes=(_excl or None), **kw)
+                            _new = engine.models.get(fr)
+                            if _new is not None and sdef:
+                                _new.sampling_defaults = dict(sdef)   # #runtime-knobs, see above
                         except Exception as exc:
                             log_activity(f"node-restart recovery: {fr} re-load FAILED ({exc!r}) — "
                                          "it will auto-load on the next request instead")
@@ -853,6 +970,21 @@ def register(app):
                                            + ", ".join(_steps) + ") — updating now would orphan its "
                                            "result; retry after it completes or pass force=1",
                                  "rendering": len(_renders)}, status_code=409)
+        # #update-refused: settle "is there an installable build up there at all?" BEFORE either
+        # branch tears anything down. Both branches end in a swap+restart whose refusal the caller
+        # cannot see (the response is written first, and the updater signals a refusal only by
+        # log line), so a rejected deploy used to unload every model, free the fleet's RAM, bounce
+        # the controller onto the SAME old code, and answer {"ok": true} while doing it. Deciding
+        # the primary-file gates here makes the common refusals (repo unreachable, truncated
+        # fetch, #no-downgrade) cost NOTHING and lets the HTTP status say so. force=1 does not
+        # skip this: force is the exemption from the IDLE gate, never from what came down the wire.
+        _pf = await asyncio.to_thread(_update_preflight)
+        if _pf:
+            _update_refused(f"{_pf} — /update by {who} rejected up front: nothing unloaded, "
+                            "no worker touched, controller NOT restarted")
+            return JSONResponse({"ok": False, "status": "update_refused", "reason": _pf,
+                                 "restarted": False, "unloaded": [], "workers_freed": 0,
+                                 "requested_by": who}, status_code=409)
         # #hitless-update: pull the latest code and bounce the CONTROLLER ONLY, KEEPING every
         # resident model. Workers are left entirely alone, so they keep their loaded shards
         # (#adopt) and the relaunched controller re-ADOPTS them on the NEW code — no unload, no
@@ -878,12 +1010,24 @@ def register(app):
             log_activity(msg); print(f"[update] {msg}")
             async def _go_hitless():
                 await asyncio.sleep(1.0)     # let this HTTP response flush
-                with contextlib.suppress(Exception):   # applies changed files; exits(42) if any changed
-                    await asyncio.to_thread(_self_update_check, "server.py", (lambda: True), True)
-                os._exit(42)                 # nothing to swap (or already swapped) -> plain relaunch
+                # #update-refused: applies changed files and exit(42)s ITSELF the moment it does,
+                # so reaching the next line at all means nothing was installed — and `why` says
+                # whether that was "already current" or a refusal.
+                why = await _forced_update_outcome()
+                if why:
+                    engine.updating = False  # re-arm auto-load: we are STAYING UP on the old code
+                    log_activity(f"HITLESS UPDATE ABORTED — nothing installed: {why}. Controller "
+                                 f"NOT restarted: a bounce onto the SAME code installs nothing and "
+                                 f"costs a re-adopt cycle. {len(kept)} model(s) still resident; "
+                                 f"GET /code_manifest is the proof nothing landed.")
+                    return
+                os._exit(42)                 # nothing left to swap -> plain relaunch
             asyncio.create_task(_go_hitless())
             return JSONResponse({"ok": True, "updating": True, "hitless": True, "kept": kept,
-                                 "requested_by": who})
+                                 # The swap runs AFTER this response flushes (it ends in exit(42),
+                                 # which would kill the reply), so "restarting" is an intent, not a
+                                 # result: a late refusal cancels it and says so in /logs.
+                                 "restarting": True, "requested_by": who})
         engine.updating = True               # block auto-load immediately (anti-reload-race)
         names = list(engine.models.keys())
         with contextlib.suppress(Exception):     # best-effort graceful unload (don't block on a
@@ -912,13 +1056,26 @@ def register(app):
         log_activity(msg); print(f"[update] {msg}")
         async def _go():
             await asyncio.sleep(1.5)   # let unload/free acks + this HTTP response flush
-            with contextlib.suppress(Exception):   # force-swap; _self_update_check exits if changed
-                await asyncio.to_thread(_self_update_check, "server.py", (lambda: True), True)
-            os._exit(42)               # nothing to swap (or already swapped) -> plain relaunch
+            # #update-refused: force-swap; the updater exit(42)s ITSELF once it installs anything,
+            # so returning here means nothing landed and `why` separates "already current" from a
+            # refusal the preflight could not see (an EXTRA file that 404s, a verify/stage failure).
+            why = await _forced_update_outcome()
+            if why:
+                engine.updating = False    # re-arm auto-load — this box is staying up on OLD code
+                log_activity(f"FORCED UPDATE ABORTED — nothing installed: {why}. Controller NOT "
+                             "restarted: it would have come back on the SAME code looking like a "
+                             "successful deploy. Models were already unloaded and re-auto-load on "
+                             "demand; POST /restart to bring the persisted set back now.")
+                return
+            os._exit(42)               # nothing left to swap -> plain relaunch
         asyncio.create_task(_go())
         return JSONResponse({"ok": True, "updating": True, "unloaded": names,
                              "workers_freed": len(freed), "worker_restart": bool(workers),
-                             "requested_by": who})
+                             # Intent, not result — the swap runs after this reply flushes and ends
+                             # in exit(42). The preflight above has already rejected the refusals
+                             # that can be known up front; a later one cancels the restart and is
+                             # logged as "FORCED UPDATE ABORTED" (GET /logs, and the console).
+                             "restarting": True, "requested_by": who})
 
     # code-split Inc 6: /shard_status /verify_shards /pack_result /pack_probe /compile_dist
     # /compile_shards + /weights /weights_tp /experts + the parked /mtp_probe /modelcode live

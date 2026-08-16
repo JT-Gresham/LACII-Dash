@@ -210,7 +210,15 @@ def test_walker():
     wq._quantize_int8_(blk)
     check("fused 3D experts -> Packed8Tensor3D",
           isinstance(blk.experts.gate_up_proj, PT8) and isinstance(blk.experts.down_proj, PT8))
-    check("2D router gate -> QuantLinear", isinstance(blk.gate, QL))
+    # The router must stay bf16 at EVERY tier. This assertion originally read
+    # `isinstance(blk.gate, QL)` — it encoded the int8 path's router-quantization DEFECT as the
+    # expected result, so it would have gone on passing forever while top-k expert selection was
+    # silently corrupted (the #bare-linear-router failure mode: loads clean, answers once, then
+    # degenerates). Quantizing a router is never correct; see docs/ACCELERATION.md's
+    # "a MoE's router gate always stays bf16" invariant and scratch_router_quant_exclusion_test.py.
+    import torch.nn as _nn
+    check("2D router gate stays bf16 nn.Linear (NOT quantized)",
+          isinstance(blk.gate, _nn.Linear) and not isinstance(blk.gate, QL))
     check("_experts_implementation forced to eager",
           blk.experts.config._experts_implementation == "eager")
     check("walker output == direct _pack8_3d",

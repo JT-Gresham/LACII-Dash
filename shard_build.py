@@ -24,6 +24,23 @@ def _final_norm_module(inner):
     return inner.norm
 
 
+def _is_linear_attn_type(layer_type) -> bool:
+    """#gpt-oss-sliding-kv: does this cfg.layer_types entry name a LINEAR-ATTENTION layer — one
+    whose state is a FIXED-SIZE recurrent + short-conv pair instead of a growing K/V cache? Only
+    those legitimately reserve no KV. Same discriminator engine_gen._linear_attn_arch already uses
+    ('linear' in the type name — qwen3-next / qwen3.6 / qwen3.8 spell it 'linear_attention'), kept
+    substring-based so a future 'linear_*' variant is caught by default and so the two sniffs
+    cannot drift apart.
+
+    Deliberately NARROW, and it must stay that way. Every OTHER non-'full_attention' type is still
+    a softmax-attention layer that really does hold K/V — 'sliding_attention' above all, which
+    transformers caches in a DynamicSlidingWindowLayer bounded to cfg.sliding_window, not in
+    nothing at all. Anything this predicate does not recognise therefore reads as KV-holding:
+    over-reserving costs VRAM headroom, under-reserving costs a decode-time OOM or a silently
+    short cache, so the asymmetry is deliberate."""
+    return "linear" in str(layer_type).lower()
+
+
 class ShardBuildMixin:
 
     @staticmethod
@@ -127,14 +144,15 @@ class ShardBuildMixin:
         return self._kv_bf16_per_layer(ctx) * slots
 
     def _kv_layer_mask(self) -> list:
-        """#7: per-OWNED-layer bool — True = a layer that holds a growing full-ctx KV cache.
-        For a hybrid linear-attention arch (cfg.layer_types: interleaved Gated-DeltaNet vs
-        full-attention, e.g. qwen3-next / qwen3.6) ONLY the 'full_attention' layers grow a KV;
-        the linear-attn layers keep a small fixed recurrent state (treated as ~0 here). For
-        every dense/standard model (no layer_types) ALL True -> bit-identical to the old
-        uniform reservation. CONSERVATIVE on any uncertainty (missing/short layer_types,
-        out-of-range index, parse error): default a layer to True so we never under-reserve
-        and risk decode OOM. owned layer i = global layer self.layer_start + i."""
+        """#7: per-OWNED-layer bool — True = a layer this shard must fund a K/V cache for.
+        For a hybrid LINEAR-attention arch (cfg.layer_types: interleaved Gated-DeltaNet vs
+        full-attention, e.g. qwen3-next / qwen3.6) only the softmax-attention layers grow a KV;
+        the linear-attn layers keep a small fixed recurrent state (funded separately, via
+        _linattn_state_bytes). For every dense/standard model (no layer_types) ALL True ->
+        bit-identical to the old uniform reservation. CONSERVATIVE on any uncertainty
+        (missing/short layer_types, out-of-range index, parse error): default a layer to True so
+        we never under-reserve and risk decode OOM. owned layer i = global layer
+        self.layer_start + i."""
         n = len(self.owned_layers)
         base = int(getattr(self, "layer_start", 0) or 0)
         # #kimi-linear: the same idea, for archs that declare their linear layers via
@@ -158,11 +176,26 @@ class ShardBuildMixin:
         lt = getattr(self.cfg, "layer_types", None)
         if not getattr(self, "_hybrid", False) or not lt:
             return [True] * n
+        # #gpt-oss-sliding-kv: test for LINEAR attention, NOT for `!= "full_attention"`. The old
+        # test conflated "not full-attention" with "holds no KV", which is only true of linear-attn
+        # layers. It silently zeroed the KV reservation of every SLIDING-window layer — gpt-oss ships
+        # 24 layer_types alternating sliding_attention/full_attention (checked against the live 20B
+        # config.json via om3nbox /api/show), so HALF its layers were funded at 0 bytes; Gemma-4's
+        # 5-sliding-to-1-full pattern lost ~83%. Those layers do hold K/V: shard_forward builds
+        # DynamicCache(config=cfg) for a _hybrid shard, and transformers gives a sliding_attention
+        # layer a DynamicSlidingWindowLayer bounded to cfg.sliding_window — bounded, not absent.
+        # _linattn_state_bytes returns 0 for these archs (it is gated on _linattn_flat), so the
+        # `else` arm of the kv_lyr comprehension charged them literally nothing: an under-reserve,
+        # exactly the failure this docstring says must never happen. Reserving the FULL-ctx figure
+        # for a windowed layer over-reserves by ctx/sliding_window, which is the safe direction and
+        # is also what these archs got before #7 introduced the mask. Sizing a sliding layer at its
+        # real min(ctx, sliding_window+1) bound is a measurable refinement, not a guess — it needs a
+        # torch/transformers box to confirm the layer class actually bounds, so it is NOT done here.
         mask = []
         for i in range(n):
             gi = base + i
             try:
-                mask.append(lt[gi] == "full_attention")
+                mask.append(not _is_linear_attn_type(lt[gi]))
             except Exception:
                 mask.append(True)   # unknown -> reserve full KV (never under-reserve)
         return mask
@@ -582,6 +615,15 @@ class ShardBuildMixin:
                     cfg = cfg.get_text_config()
                 self.cfg = cfg
             _lt = getattr(self.cfg, "layer_types", None)
+            # _hybrid = "this shard needs a PER-LAYER-TYPE cache", i.e. DynamicCache(config=cfg)
+            # rather than a uniform DynamicCache. `!= full_attention` is the RIGHT test for that and
+            # must stay: it is what gets gpt-oss's and Gemma-4's sliding layers their bounded
+            # DynamicSlidingWindowLayer. It is the WRONG test for "this layer holds no K/V" and for
+            # "this arch's state is not rewindable" — both of those mean LINEAR attention, for which
+            # the discriminator is _is_linear_attn_type / engine_gen._linear_attn_arch. #7's KV mask
+            # used to make that conflation (fixed — see #gpt-oss-sliding-kv in _kv_layer_mask); the
+            # _hybrid-keyed safety gates below and in shard_forward (kv_quant off, kv_offload off,
+            # no #prefill-chunk, no HIP-graph decode) still do, and are merely conservative there.
             self._hybrid = bool(_lt) and any(t != "full_attention" for t in _lt)
             # #kimi-linear: fla-style hybrids that declare their linear-attention layers via
             # linear_attn_config (kda_layers — 1-INDEXED: is_kda_layer tests layer_idx+1) instead of

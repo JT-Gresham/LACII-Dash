@@ -258,14 +258,50 @@ def _text_prefix(weight_map) -> str:
     return "model."
 
 
+def _head_bases(prefix: str) -> tuple[str, ...]:
+    """Every MODULE PATH the LM head can live at, most-nested first. Omni nests it at
+    'thinker.lm_head', Mistral3 (Devstral/Pixtral) at 'language_model.lm_head', everything else
+    keeps a top-level 'lm_head'. Factored out of _head_key so the quantized-name probe below walks
+    the SAME candidate list — a head hidden under 'thinker.lm_head.weight_packed' has to be found
+    at every base _head_key would have looked at, not just the top level."""
+    if prefix == "thinker.model.":
+        return ("thinker.lm_head", "lm_head")
+    if prefix == "language_model.model.":
+        return ("language_model.lm_head", "lm_head")
+    return ("lm_head",)
+
+
 def _head_key(weight_map, prefix: str) -> str:
-    """Where the lm_head weight lives in THIS checkpoint. Omni nests it at 'thinker.lm_head.weight';
-    others keep a top-level 'lm_head.weight'. (Tied-embeddings models have no separate head.)"""
-    if prefix == "thinker.model." and "thinker.lm_head.weight" in weight_map:
-        return "thinker.lm_head.weight"
-    if prefix == "language_model.model." and "language_model.lm_head.weight" in weight_map:
-        return "language_model.lm_head.weight"   # Mistral3 (Devstral/Pixtral): head under language_model.*
+    """Where the PLAIN (unquantized) lm_head weight lives in THIS checkpoint. Falls back to the
+    top-level name so a genuinely-absent head still raises the same clear KeyError downstream.
+    Absence of this key does NOT mean the head is tied — see _quantized_head_key/_is_tied."""
+    for base in _head_bases(prefix):
+        if f"{base}.weight" in weight_map:
+            return f"{base}.weight"
     return "lm_head.weight"
+
+
+# #quant-head-not-tied: the packed spellings an lm_head can hide under. A checkpoint that quantized
+# its head ships NO '<base>.weight' at all, so every probe that tests only the plain name reads
+# "there is no head" — see _is_tied. compressed-tensors (nvfp4 / int4 / int8 pack-quantized) writes
+# '<base>.weight_packed'; GPTQ and AWQ write '<base>.qweight'; mxfp4 writes '<base>_blocks' (an
+# UNDERSCORE, not a dot — hence the separate helper below rather than a fourth suffix here).
+_QUANT_HEAD_SUFFIXES = (".weight_packed", ".qweight")
+
+
+def _quantized_head_key(weight_map, prefix: str):
+    """Name of a QUANTIZED lm_head tensor in this checkpoint, or None if the head is absent under
+    every name we recognise. Deliberately NOT merged into _head_key: callers use _head_key's return
+    as a SOURCE name to read bf16 bytes from, and none of them can decode a packed head — the split
+    keeps 'where is the head' (this) separate from 'what can we serve' (that)."""
+    for base in _head_bases(prefix):
+        for suf in _QUANT_HEAD_SUFFIXES:
+            if base + suf in weight_map:
+                return base + suf
+        blocks = _mxfp4_blocks_name(f"{base}.weight")      # 'lm_head' -> 'lm_head_blocks'
+        if blocks in weight_map:
+            return blocks
+    return None
 
 
 def _is_tied(model_dir: str, weight_map: dict | None = None, prefix: str | None = None) -> bool:
@@ -284,13 +320,37 @@ def _is_tied(model_dir: str, weight_map: dict | None = None, prefix: str | None 
     silently re-tie any checkpoint that omits the flag WHILE shipping a real lm_head (using
     the embedding as the head = wrong logits, and silently so). The checkpoint probe fixes
     the crash without touching any of those.
+
+    #quant-head-not-tied: "no plain head key" is NOT the same question as "no head". A checkpoint
+    that QUANTIZED its lm_head stores it as 'lm_head.weight_packed' (compressed-tensors),
+    'lm_head.qweight' (GPTQ/AWQ) or 'lm_head_blocks' (mxfp4) and ships NO 'lm_head.weight' — so the
+    plain-key probe above concluded "tied" and every caller then served
+    '<prefix>embed_tokens.weight' AS THE HEAD (_selected_names/_assemble_sd/_plan_weight_stream/
+    _build_weight_tp_blob all take the tied branch; shard_compile + gptq_pack write tied=True into
+    the shard-cache manifest). The embedding matrix has the right SHAPE for a head, so nothing
+    raises: the model loads, the cache checksums, and the logits are silently wrong. Probe the
+    packed spellings before concluding, and REFUSE rather than guess when one is found — serving a
+    quantized head is unimplemented (every caller reads the head as bf16 bytes), and refusing costs
+    nothing real because no checkpoint on this fleet quantizes its head today. An explicit
+    `tie_word_embeddings: true` still wins: a stray packed head next to a declared tie is dead
+    weight in the checkpoint, not evidence the config is lying.
     """
     with open(os.path.join(model_dir, "config.json"), encoding="utf-8") as fh:
         cfg = json.load(fh)
     wm = _weight_map(model_dir) if weight_map is None else weight_map
     pfx = _text_prefix(wm) if prefix is None else prefix
     if _head_key(wm, pfx) not in wm:
-        return True                      # no head tensor exists -> necessarily tied
+        qk = _quantized_head_key(wm, pfx)            # #quant-head-not-tied
+        if qk is None:
+            return True                  # no head tensor under ANY name -> necessarily tied
+        if bool(cfg.get("tie_word_embeddings", False)):
+            return True                  # config declares the tie explicitly -> honour it
+        raise NotImplementedError(
+            f"checkpoint stores the LM head QUANTIZED as '{qk}' and ships no plain "
+            f"'{_head_key(wm, pfx)}', while config.json does not declare tie_word_embeddings. "
+            "Serving a quantized head is unimplemented; treating the missing plain key as tied "
+            "embeddings would serve the EMBEDDING MATRIX as the head (wrong logits, no error). "
+            "Refusing rather than guessing.")
     return bool(cfg.get("tie_word_embeddings", False))
 
 
@@ -875,6 +935,36 @@ _TP_COL = (".self_attn.q_proj.", ".self_attn.k_proj.", ".self_attn.v_proj.",
 _TP_ROW = (".self_attn.o_proj.", ".mlp.down_proj.")
 
 
+def _tp_unshardable_moe(out_name: str) -> bool:
+    """#tp-moe-replicate: is this a decoder-layer MoE weight that _tp_kind_and_slice classifies as
+    REPLICATED but that a real TP split would have to shard?
+
+    The classifier above matches LITERAL substrings '.mlp.gate_proj.' / '.mlp.down_proj.' etc. A
+    per-expert MoE weight is named '...mlp.experts.3.gate_proj.weight' and a fused one
+    '...mlp.experts.gate_up_proj' — NEITHER contains '.mlp.gate_proj.', so both fall through to the
+    `return None, 0, 0` default and get served WHOLE to every rank. Same for the shared expert
+    ('...mlp.shared_expert.up_proj.weight'). On a big MoE the experts are ~90% of the bytes, so TP
+    would shard the 10% that is attention and replicate everything that matters — the exact opposite
+    of what the caller asked for.
+
+    Today this is latent, not active: the worker cannot get that far. client.py's
+    _tp_make_structure_ / _tp_shard_model_ walk `L.mlp.gate_proj` unconditionally, and a MoE block
+    (Qwen3MoeSparseMoeBlock, Mixtral's block_sparse_moe) has no such attribute — so TP + MoE dies
+    with an AttributeError on the worker before /weights_tp is ever asked for a slice. That guard is
+    incidental (an attribute that happens not to exist in another file), not deliberate: the day
+    anyone teaches _tp_make_structure_ about experts without teaching THIS function about them, the
+    silent full-size serve starts working. Refuse here, where the wrong classification is made.
+
+    The router/gate ('...mlp.gate.weight', [n_experts, hidden]) is CORRECTLY replicated — it is not
+    on the parallel dim — and must not match; it carries no '.experts.'/'.shared_expert' marker.
+    Scale sidecars are excluded so a quant-format branch above still owns its own refusal."""
+    if ".layers." not in out_name:
+        return False
+    if ".experts." not in out_name and ".shared_expert" not in out_name:
+        return False
+    return not _is_fp8_meta_name(out_name)
+
+
 def _tp_kind_and_slice(out_name: str, geo: dict):
     """(kind, off, length) for a served tensor's parallel-dim slice, from THIS rank's geo. kind in
     {'col','row',None}; None -> replicated (serve whole). q/o -> q slice, k/v -> kv slice,
@@ -928,22 +1018,14 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
     # exactly how you end up with a model that loads, checksums fine, and generates garbage, so
     # there is no nvfp4-specific notion of "which axis" anywhere below.
     nvfp4_group = _nvfp4_group_size(model_dir)
-    if nvfp4_group is not None:
-        # LOUD REFUSAL, not a fallback. If the checkpoint quantized the LM head, its weight lives at
-        # 'lm_head.weight_packed' and 'lm_head.weight' is ABSENT — at which point _is_tied()'s
-        # "no head tensor exists -> necessarily tied" probe concludes the model is tied and we serve
-        # the EMBEDDING matrix as the head. Wrong logits, no exception, no crash: the silent-garbage
-        # failure this whole path is written to avoid. Every nvfp4 checkpoint this fleet has seen
-        # keeps lm_head in compressed-tensors' `ignore` list (bf16), so refusing costs nothing real
-        # and guessing costs correctness. NOTE: the pipeline path (_plan_weight_stream) has the same
-        # blind spot and is NOT fixed here — see the follow-up.
-        _hk = _head_key(wm, prefix)
-        if _hk.endswith(".weight") and _hk not in wm and (_hk[: -len(".weight")] + ".weight_packed") in wm:
-            raise NotImplementedError(
-                f"nvfp4 checkpoint quantizes the LM head ('{_hk}_packed' present, '{_hk}' absent): "
-                "_is_tied() would silently mistake that for tied embeddings and serve the embedding "
-                "matrix as the head (wrong logits, no error). Serving a quantized head is "
-                "unimplemented — refusing rather than guessing.")
+    # #quant-head-not-tied: the quantized-LM-head refusal that used to sit HERE (nvfp4-only, and it
+    # ran AFTER _is_tied had already answered) now lives IN _is_tied, which is the single place the
+    # wrong decision was being made. That covers this path, the pipeline path (_plan_weight_stream),
+    # the blob helper (_build_weight_blob, currently uncalled) and the two cache compilers
+    # (shard_compile._compile_shards, gptq_pack) —
+    # all of which took the tied branch and served the embedding matrix as the head — and it covers
+    # GPTQ/AWQ '.qweight' and mxfp4 '_blocks' heads, not just compressed-tensors '.weight_packed'.
+    # `tied` above therefore cannot be a quantized head misread as a tie by the time we get here.
     names = _selected_names(wm, start, end, has_embed, has_head, tied, prefix)
     out_pairs: list[tuple[str, str]] = []         # (output_name 'model.*', source_name)
     if has_embed:
@@ -1016,6 +1098,19 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
                     out_name = out_name.replace(".weight_packed", ".weight")
                 kind, off, length = _tp_kind_and_slice(out_name, geo)
                 if kind is None:                  # replicated: embed/norm/head/layernorm/rotary
+                    if _tp_unshardable_moe(out_name):
+                        # #tp-moe-replicate. Checked HERE rather than up-front so the quant-format
+                        # refusals above (a fused 3D packed expert is rejected by the nvfp4 ndim
+                        # guard) keep reporting their own, more specific reason. Nothing has been
+                        # written or freed at this point — this path only builds an in-memory dict —
+                        # so the refusal costs the caller one wasted tensor read, not state.
+                        raise NotImplementedError(
+                            f"tensor-parallel serve of a MoE expert weight ('{out_name}') is "
+                            "unimplemented: _tp_kind_and_slice matches literal '.mlp.<proj>.' "
+                            "names and does not recognise per-expert/fused expert names, so this "
+                            "rank would receive the WHOLE tensor instead of its 1/tp slice — every "
+                            "rank holding the full expert stack, which is most of the model. "
+                            f"Refusing rather than replicating (tp_size={tp_size}).")
                     sd[out_name] = t.clone() if out_name == "lm_head.weight" and tied else t
                     continue
                 if out_name.endswith(".bias"):
