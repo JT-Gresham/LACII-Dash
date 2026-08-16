@@ -4,7 +4,36 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-14 (latest) — Qwen3.8-27B, a reasoning leak, and four quantization gaps (server 0.3.16 / client 0.3.24)
+## 2026-08-14 (latest) — pick which machine runs a media model (server 0.3.17)
+
+### Added
+
+- **The media Load dialogs (t2a / t2i / t2music) now let you choose the node.** The backend could
+  already do it — `#media-pin` taught all five media leaves to honour `node=`, and `can_t2a` /
+  `can_t2i` had been advertised for a while — but the dialogs never offered the choice, so
+  placement was always whatever the heuristic picked. Verified backend-first:
+  `POST /load?model=ace-step&node=amdcomp&t2i_offload=1` → `mode: pin:amdcomp/gpu`, resident in 20 s.
+
+  The select is built from nodes that ACTUALLY advertise the matching capability, so a machine that
+  cannot serve the model is never offered rather than offered and failing at load. Options show
+  free (and in-use) VRAM and sort by headroom. Default "Auto" sends no `node=`, so behaviour is
+  unchanged for anyone who ignores it.
+
+  Three details that would each have been a bug: the buttons used to `closeOv()` **before** the
+  handler ran, which would have torn `#m-node` out of the DOM and made every pick silently do
+  nothing; t2i's auto-spill retry now carries the same pin, because spilling to RAM is a
+  placement-*within*-node decision and silently relocating would contradict an explicit pick; and
+  with no capable node the dialog explains itself instead of rendering an empty dropdown.
+
+  Verified live: ace-step loaded on **amdcomp**, survived a hitless controller update still on
+  amdcomp, and rendered an 8 s clip — HTTP 200, 1.53 MB, valid 44.1 kHz stereo WAV, 40 s wall.
+
+### Fixed
+
+- Three media dialogs still told the operator these models run only on "the GPU sharing the
+  controller box", refuted by `#media-anywhere`.
+
+## 2026-08-14 — Qwen3.8-27B, a reasoning leak, and four quantization gaps (server 0.3.16 / client 0.3.24)
 
 ### Added
 
