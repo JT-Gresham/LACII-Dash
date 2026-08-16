@@ -66,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.18"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.19"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -92,6 +92,12 @@ SELF_UPDATE_POLL_S = 900   # poll the repo every 15 minutes (idle-gated); the Co
                            # forced "Update + Deploy" (/update?force=1) is the immediate path
 SELF_UPDATE_FETCH_TRIES = 4      # #3: bounded retry per file within a cycle (CDN propagation lag on a
 SELF_UPDATE_FETCH_BACKOFF_S = 8  # freshly-added module 404s on raw.githubusercontent until it syncs)
+# #stale-bytes: the ONLY way to install a primary whose VERSION is OLDER than the running one (a
+# deliberate rollback commit). force=1 used to be that lever, which made "operator pressed Update"
+# and "the raw CDN handed us a stale copy" indistinguishable — see _self_update_check. Set
+# INFINITEMODEL_ALLOW_DOWNGRADE=1 in the controller's environment for the rollback, restart, deploy.
+SELF_UPDATE_ALLOW_DOWNGRADE = (os.environ.get("INFINITEMODEL_ALLOW_DOWNGRADE", "").strip().lower()
+                               in ("1", "true", "yes"))
 
 
 def _extract_version(blob: bytes) -> str:
@@ -204,7 +210,58 @@ def _extra_update_files(src: bytes) -> list[str]:
     return []
 
 
-def _self_update_check(fname: str, is_idle, force: bool = False) -> None:
+def _update_refused(why: str) -> None:
+    """Say NO to an update cycle, WITH the reason, on the console and the dashboard activity feed.
+
+    A forced /update calls exit(42) after this function returns whatever we decided
+    (routes_lifecycle._go), so the box bounces either way — which is exactly why the refusal has
+    to be loud. The live hit it exists for: the controller came back up "healthy" on OLD code
+    after a forced deploy (the raw CDN had propagated some files and not others) and nothing said
+    it had installed anything odd, so the deploy read as done. The console/journal survives the
+    restart; the ACTIVITY ring and the GET /logs buffer do not — GET /code_manifest (sha/mtime
+    unchanged) is the post-restart proof that nothing landed."""
+    msg = f"update REFUSED: {why}"
+    print(f"[update] {msg}")
+    with contextlib.suppress(Exception):     # defined further down the module; runtime lookup
+        log_activity(msg)
+
+
+def _verify_update_bytes(changed: list, fetched: dict) -> str:
+    """Empty string when every file we are about to WRITE is usable, else a reason to refuse.
+
+    Nothing used to inspect the fetched bytes at all: "content differs from disk" was the whole
+    test, and the updater then wrote the file and exit(42)'d into it. Two failure modes make that
+    unsafe. raw.githubusercontent propagates a push PER FILE (1-5 min), so a cycle can pull a
+    coherent-looking mix; and a partially-transferred object (or a checkout truncated by a syncing
+    filesystem — this repo has been bitten twice, dashboard_html.py 2249 -> 114 lines) also just
+    "differs". Restarting into a .py that does not parse strands the box in a supervisor
+    crash-loop with no controller left to fix it from, so parse it here and refuse the WHOLE cycle
+    instead: nothing is written, and the next poll retries once the CDN settles.
+
+    Only the CHANGED files are parsed — the rest are byte-identical to what this process is
+    already running, so they are proven good by the fact that we are executing. Non-code payloads
+    (calib_corpus.txt) have no structure to check and are left alone; config.json is JSON-parsed
+    because a broken one silently reverts every host/port to the built-in defaults."""
+    for fn in changed:
+        blob = fetched.get(fn) or b""
+        if fn.endswith(".py"):
+            try:
+                ast.parse(blob.decode("utf-8", "replace"), filename=fn)
+            except SyntaxError as exc:
+                return (f"fetched {fn} does not parse ({exc.msg} at line {exc.lineno}) - "
+                        f"truncated/partial copy off the raw CDN")
+            except Exception as exc:
+                return f"fetched {fn} could not be parsed ({exc!r})"
+        elif fn.endswith(".json"):
+            try:
+                json.loads(blob.decode("utf-8", "replace"))
+            except Exception as exc:
+                return f"fetched {fn} is not valid JSON ({exc!r})"
+    return ""
+
+
+def _self_update_check(fname: str, is_idle, force: bool = False,
+                       allow_downgrade: bool = False) -> None:
     """Multi-file self-update: fetch the primary file + EXTRA_UPDATE_FILES, and if ANY changed
     (and we're idle, OR force=True) stage ALL changed files together. RESTART only when the fetched
     primary-file VERSION differs from the running VERSION (#4: a same-VERSION doc/comment commit must
@@ -213,7 +270,11 @@ def _self_update_check(fname: str, is_idle, force: bool = False) -> None:
     won't fetch, abort THIS cycle (never apply a half-updated set) and retry next poll. force=True is
     the dashboard/API 'Update' button: swap NOW without waiting for idle (the caller has already
     unloaded models + told workers to free RAM). The fetch list comes from the FETCHED primary
-    file unioned with the running one (#newmodule-2cycle, below)."""
+    file unioned with the running one (#newmodule-2cycle, below).
+
+    force skips the IDLE gate and the same-VERSION no-restart rule — it does NOT skip the checks
+    on WHAT came down (#stale-bytes, below). allow_downgrade (env INFINITEMODEL_ALLOW_DOWNGRADE)
+    is the separate, deliberate lever for installing an OLDER VERSION."""
     here = os.path.dirname(os.path.abspath(__file__))
 
     def _fetch_retried(fn: str):
@@ -284,25 +345,66 @@ def _self_update_check(fname: str, is_idle, force: bool = False) -> None:
     # #4: only RESTART on a VERSION bump in the primary file. Stage same-VERSION content changes to disk
     # (atomic, picked up on the next natural restart) but don't bounce the fleet for a doc/comment commit.
     remote_ver = _extract_version(fetched.get(fname, b""))
+    # #stale-bytes: a primary we cannot read a VERSION out of is not a build — the running one has
+    # one by construction, so an empty result means the bytes we just pulled are truncated, a 404
+    # body, or an error page the CDN handed back with a 200. Never install that, forced or not.
+    if not remote_ver:
+        _update_refused(f"no VERSION constant in the fetched {fname} ({len(fetched.get(fname) or b'')} B) "
+                        "- truncated/partial copy off the raw CDN; nothing applied, retry next poll")
+        return
     # #no-downgrade: after a git push the raw CDN lags per-file by 1-5 min, so a box running code
     # AHEAD of the CDN (pscp deploy, or restarting mid-propagation) used to see "content differs" ->
     # overwrite its files with the STALE repo copy and restart into a DOWNGRADE (live hit: worker
-    # m4c177 -> m4c176 minutes after the m4c177 push). The AUTOMATIC loop refuses to apply a remote
-    # whose primary VERSION is strictly OLDER than the running one (skips the writes too, so stale
-    # extras never land on disk); a FORCED /update (explicit operator intent — e.g. a deliberate
-    # rollback commit) still applies it, loudly labeled.
-    if remote_ver and _ver_ordinal(remote_ver) < _ver_ordinal(VERSION):
-        if not force:
-            print(f"[update] repo VERSION {remote_ver} is OLDER than running {VERSION} - "
-                  f"ignoring (CDN lag / local ahead); re-check next poll")
+    # m4c177 -> m4c176 minutes after the m4c177 push). Refuse a remote whose primary VERSION is
+    # strictly OLDER than the running one, and skip the writes too so stale extras never land.
+    #
+    # #stale-bytes: force=1 used to be the exemption from this, on the theory that a forced /update
+    # means deliberate rollback intent. It does not — the SAME button is how every routine deploy
+    # goes out, minutes after the push that the CDN is still propagating, which is precisely when a
+    # stale primary is most likely. That exemption is why a forced deploy could come back "healthy"
+    # on OLD code. A rollback is now its own opt-in (INFINITEMODEL_ALLOW_DOWNGRADE=1 in the
+    # controller env, or allow_downgrade=True) so operator intent and CDN lag stop looking alike.
+    if _ver_ordinal(remote_ver) < _ver_ordinal(VERSION):
+        if not (allow_downgrade or SELF_UPDATE_ALLOW_DOWNGRADE):
+            _update_refused(f"repo VERSION {remote_ver} is OLDER than running {VERSION} (CDN lag / "
+                            f"local ahead){' - force does NOT override this' if force else ''}; "
+                            "set INFINITEMODEL_ALLOW_DOWNGRADE=1 for a deliberate rollback")
             return
-        print(f"[update] FORCED DOWNGRADE {VERSION} -> {remote_ver} (operator /update)")
+        print(f"[update] DOWNGRADE {VERSION} -> {remote_ver} (INFINITEMODEL_ALLOW_DOWNGRADE opt-in)")
+    # #stale-bytes: parse what we are about to write before any of it goes live.
+    bad = _verify_update_bytes(changed, fetched)
+    if bad:
+        _update_refused(f"{bad}; nothing applied, retry next poll")
+        return
     version_bumped = bool(remote_ver) and remote_ver != VERSION
-    for fn in changed:                           # write all .new first, then atomic-replace each
-        path = os.path.join(here, fn)
-        tmp = path + ".new"
-        with open(tmp, "wb") as fh:
-            fh.write(fetched[fn])
+    # Stage EVERY file to <name>.new and read each one BACK off disk before any of them goes live.
+    # The old loop wrote-and-replaced one file at a time (despite the comment claiming otherwise),
+    # so a write that failed halfway — full disk, a CIFS/sync hiccup — left HALF the set swapped
+    # and then exit(42)'d into the mix. Reading the staged copy back is the cheap guard against the
+    # silent short write this repo has already been bitten by twice (a syncing filesystem truncated
+    # dashboard_html.py in place). Any failure: drop the .new files, apply nothing, retry next poll.
+    # The final replace pass is still per-file rather than one atomic set swap — an OS-level failure
+    # mid-pass can still split it — but every byte is verified on disk before that pass starts.
+    staged = []
+    try:
+        for fn in changed:
+            path = os.path.join(here, fn)
+            tmp = path + ".new"
+            staged.append((tmp, path))       # recorded BEFORE the write so a failed one still cleans up
+            with open(tmp, "wb") as fh:
+                fh.write(fetched[fn])
+                fh.flush()
+                os.fsync(fh.fileno())
+            with open(tmp, "rb") as fh:
+                if fh.read() != fetched[fn]:
+                    raise IOError(f"staged {fn} does not match what was fetched (short write)")
+    except Exception as exc:
+        for tmp, _ in staged:
+            with contextlib.suppress(Exception):
+                os.remove(tmp)
+        _update_refused(f"could not stage {changed}: {exc!r}; nothing applied, retry next poll")
+        return
+    for tmp, path in staged:
         os.replace(tmp, path)
     if not force and not version_bumped:
         print(f"[update] {changed} staged on disk (VERSION {VERSION} unchanged) - NOT restarting (#4)")
@@ -593,6 +695,17 @@ class Node:
     # half-provisioned box can't break every load. Reset on reconnect.
     can_infer: bool = True
     incapable_reason: str = ""
+    # #dupe-worker: OTHER live node ids registered under this SAME hostname on a DIFFERENT data
+    # port — i.e. a genuine SECOND worker process on one box. Not the restart case: a restart
+    # re-uses data_host:data_port (the port is fixed config/--data-port, not ephemeral), so #77's
+    # find_stale_dupes matches it and drops the old entry; a second worker cannot re-bind a port
+    # already held, so a differing port is the tell. "One worker per box" has been an operator
+    # rule in docs/ACCELERATION.md + docs/nodes/*.md with NOTHING enforcing it, and the pair do
+    # more than "fight over registration": control_plane's #restart-stale backstop matches by
+    # HOSTNAME, so worker B registering invalidates the models worker A is holding. Reported
+    # here (and in /status) and never acted on — killing one is an operator decision, since the
+    # loser takes whatever model is resident on it down with it.
+    dupe_node_ids: tuple = ()
     # #media-anywhere: worker-advertised MEDIA runtime availability (acestep / diffusers
     # importable on that box) — lets the controller place a t2a/t2i model on a REMOTE capable
     # GPU, not just the co-located one. False for workers that never reported it (pre-feature).
@@ -735,6 +848,8 @@ class Node:
             "client_version": self.client_version, "wire": self.wire,
             "age_s": round(self.age, 1), "alive": self.alive,
             "can_infer": self.can_infer, "incapable_reason": self.incapable_reason,
+            # #dupe-worker: non-empty = a SECOND worker is live on this hostname (dashboard warns)
+            "dupe_node_ids": list(self.dupe_node_ids),
             "can_t2a": self.can_t2a, "can_t2i": self.can_t2i, "can_stt": self.can_stt,
             "can_tts": self.can_tts,
             "can_t2music": self.can_t2music, "has_einops": self.has_einops,
@@ -796,11 +911,51 @@ class Registry:
                 caps=frozenset(str(c) for c in (reg.get("caps") or [])),
             )
             self._nodes[node_id] = node
+            # #dupe-worker: refresh the same-hostname flags now that this node is in the registry,
+            # and say so LOUDLY when THIS registration is the second worker on a box. Detection
+            # only — see Node.dupe_node_ids for why neither worker is killed here.
+            self._mark_host_dupes()
+            if node.dupe_node_ids:
+                others = ", ".join(
+                    f"{i}({self._nodes[i].data_host}:{self._nodes[i].data_port})"
+                    for i in node.dupe_node_ids if i in self._nodes)
+                log_activity(
+                    f"DUPLICATE WORKER on {node.hostname}: {node_id}"
+                    f"({node.data_host}:{node.data_port}) registered while {others} "
+                    f"{'is' if len(node.dupe_node_ids) == 1 else 'are'} still live on the same "
+                    "hostname. Run ONE worker per box: the hostname-matched restart-stale check "
+                    "will invalidate models the other one holds. NOT killing either — that is an "
+                    "operator call (the loser's resident model goes with it); stop the wrong one "
+                    "by hand.")
             # NOTE: a node JOINING is just added capacity — it must NOT force resident models
             # to reload (that caused a worker reconnect/flap to re-stream the whole 35B). New
             # nodes are simply available for the NEXT load. Only node loss reloads, and only
             # the models that used the lost node (via invalidate_model on remove/reap).
             return node
+
+    def _mark_host_dupes(self) -> None:
+        """#dupe-worker: recompute Node.dupe_node_ids across the LIVE fleet. Call with the lock
+        held — every caller is already a membership change (add / remove / reap_dead), which is
+        also the only thing that can alter the answer, so a stale flag can outlive the second
+        worker by at most one reap sweep instead of forever.
+
+        A node pairs with another when the hostname matches (case-folded — a worker may report
+        its name in either case) and the data PORT differs, both ports known. Matching ports is
+        the same physical worker having restarted (#77 find_stale_dupes owns that, and it runs
+        right after add(), so the stale entry is gone a moment later); differing ports is a
+        second process, because two workers on one box cannot both bind one port. The one false
+        positive left is a restart that ALSO changed --data-port — it clears itself when the old
+        entry is reaped, and costs only a warning, never an action."""
+        by_host: dict = {}
+        for n in list(self._nodes.values()):
+            if n.alive:
+                by_host.setdefault((n.hostname or "").strip().lower(), []).append(n)
+        for peers in by_host.values():
+            for n in peers:
+                n.dupe_node_ids = tuple(sorted(
+                    o.node_id for o in peers
+                    if o.node_id != n.node_id and o.data_port != n.data_port
+                    and o.data_port and n.data_port))
 
     def node_caps(self, node_id: str) -> frozenset:
         """#wire-caps: the wire-capability set node_id advertised at registration. UNKNOWN
@@ -831,6 +986,7 @@ class Registry:
         async with self._lock:
             if self._nodes.pop(node_id, None) is not None:
                 self.dirty = True
+                self._mark_host_dupes()   # #dupe-worker: clears the survivor's flag when its twin leaves
 
     async def heartbeat(self, node_id: str, free_mem_gb: float, cpu_percent: float,
                         free_disk_gb: float = 0.0) -> bool:
@@ -871,6 +1027,9 @@ class Registry:
                 del self._nodes[n.node_id]
             if dead:
                 self.dirty = True
+            # #dupe-worker: every sweep, not just when something died — this is the periodic pass
+            # that retires a flag whose partner went quiet (the flag only counts LIVE nodes).
+            self._mark_host_dupes()
             return dead
 
     def alive_sorted(self) -> list[Node]:

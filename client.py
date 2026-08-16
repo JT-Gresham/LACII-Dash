@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.25"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.26"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -1096,6 +1096,121 @@ def _enable_keepalive(writer: asyncio.StreamWriter) -> None:
 _CTRL_READER_LIMIT = 128 * 1024 * 1024
 
 
+# ---------------------------------------------------------------------------
+# #reservation-reconcile (worker half): NON-DESTRUCTIVE VRAM trim
+# ---------------------------------------------------------------------------
+#
+# The controller's reservation_reconcile_loop can only fix the LEDGER — it returns phantom
+# placement budget that engine._reservations was still subtracting. It cannot touch the other
+# half of the same symptom: VRAM that this worker's torch caching allocator is physically
+# holding but not using. After model churn the allocator's pool fragments, so `reserved`
+# stays high while `allocated` is low; rocm-smi/nvidia-smi report the whole pool as USED, so
+# the next placement sees a full GPU and spills to CPU (the #vram-reusable heartbeat credit
+# tells the planner about the pool, but nothing ever RETURNS it to the device).
+#
+# The only worker-side memory message that existed was `free_memory`, which is DESTRUCTIVE —
+# it unloads every shard first (it is the forced-update path). There was no way to ask a
+# worker "give back what you are not using" without also throwing away resident models, so in
+# practice nobody asked and the VRAM stayed stranded until a worker restart.
+#
+# NOTE: this belongs beside _release_vram in worker_hw (code-split Inc 7 is the home for
+# memory/GC helpers). It is here because this change was scoped to client.py; relocate it
+# VERBATIM the next time worker_hw is touched.
+
+def _vram_pool_stats() -> dict:
+    """Allocator + device byte counters, summed over every visible GPU (a worker can own shards
+    on more than one). `reserved` is the caching-allocator pool — the ONLY thing empty_cache can
+    hand back. `allocated` is live tensors, which empty_cache never touches: an unchanged
+    allocated across a trim is the evidence the trim was non-destructive. `device_free` is the
+    number the box itself agrees with (the pool reads as USED to smi), so it is what actually
+    proves VRAM came back. Zeros + gpus=0 on a CPU-only worker."""
+    out = {"reserved": 0, "allocated": 0, "device_free": 0, "device_total": 0, "gpus": 0}
+    with contextlib.suppress(Exception):
+        import torch
+        if not torch.cuda.is_available():
+            return out
+        out["gpus"] = int(torch.cuda.device_count())
+        for i in range(out["gpus"]):
+            with contextlib.suppress(Exception):
+                out["reserved"] += int(torch.cuda.memory_reserved(i))
+                out["allocated"] += int(torch.cuda.memory_allocated(i))
+            with contextlib.suppress(Exception):   # mem_get_info: torch >= 1.10, absent on some builds
+                free_b, total_b = torch.cuda.mem_get_info(i)
+                out["device_free"] += int(free_b)
+                out["device_total"] += int(total_b)
+    return out
+
+
+def _gpu_work_in_flight(worker) -> str:
+    """Name the in-flight GPU work on this worker, or "" when it is idle.
+
+    WHY the trim is gated on this rather than taking the locks: _fwd_lock is acquired
+    NON-BLOCKING by shard_forward (#fwd-serialize) — a forward that finds it held fails FAST so
+    the controller re-prefills. Holding it here to make the trim exclusive would therefore FAIL
+    REAL REQUESTS, which is far worse than skipping a hygiene sweep. So we OBSERVE the locks and
+    refuse instead.
+
+    What we are actually avoiding: empty_cache does not free in-use tensors, so a lost race
+    cannot corrupt a forward. The cost is a STALL — the free path implicitly synchronizes the
+    device (and _release_vram already has to torch.cuda.synchronize() first on ROCm, because HIP
+    defers frees until the stream syncs), and afterwards the running forward's next allocations
+    must go back to cudaMalloc instead of reusing the pool. On a tightly packed
+    coexistence-budgeted GPU that turns a hygiene sweep into a latency spike or an OOM in the
+    middle of someone's generation. A build is refused for the same reason: shard_build is
+    actively churning the pool it is about to reuse.
+
+    The check-then-act window is inherent (a forward may start a microsecond later) and is
+    deliberately accepted: the worst case is the stall above, not corruption."""
+    if getattr(worker, "_building", False):
+        return "a shard build is in progress"
+    for mid, sh in list(getattr(worker, "shards", {}).items()):
+        with contextlib.suppress(Exception):
+            lk = getattr(sh, "_fwd_lock", None)
+            if lk is not None and lk.locked():
+                return f"a forward is running on {mid}"
+            # media leaves (t2i/tts/t2a/stt/t2music) serialize their renders on _gen_lock
+            gl = getattr(sh, "_gen_lock", None)
+            if gl is not None and gl.locked():
+                return f"a {getattr(sh, 'kind', 'media')} render is running on {mid}"
+    return ""
+
+
+def _trim_vram(worker) -> dict:
+    """Return the torch caching allocator's UNUSED pool to the device without unloading anything.
+    Runs on a thread (the ROCm synchronize + the implicit device sync inside the free path can
+    block for a while, and stalling the event loop would stall heartbeats and get this node
+    reaped). Reports bytes before/after so the controller can log what the trim actually
+    recovered instead of asserting it recovered something. Refuses while GPU work is in flight —
+    see _gpu_work_in_flight."""
+    busy = _gpu_work_in_flight(worker)
+    if busy:
+        st = _vram_pool_stats()
+        return {"ok": False, "skipped": busy, "before": st, "after": st, "reclaimed": 0}
+    before = _vram_pool_stats()
+    if not before["gpus"]:
+        return {"ok": True, "skipped": "no GPU on this worker", "before": before,
+                "after": before, "reclaimed": 0}
+    import gc
+    gc.collect()          # tensors dropped but not yet collected are not reclaimable until this runs
+    with contextlib.suppress(Exception):
+        import torch
+        # ROCm/HIP can DEFER pending frees until the stream syncs, so sync first or empty_cache
+        # sees nothing to release (same ordering _release_vram had to adopt for #vram-release-rocm).
+        if bool(getattr(torch.version, "hip", None)):
+            with contextlib.suppress(Exception):
+                torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        with contextlib.suppress(Exception):
+            # Frees the allocator's IPC-shared blocks whose owning refs are gone. No-op in a
+            # worker that never exported a tensor over IPC; guarded because older/ROCm builds
+            # have shipped without it.
+            torch.cuda.ipc_collect()
+    after = _vram_pool_stats()
+    return {"ok": True, "skipped": "", "before": before, "after": after,
+            # what the DEVICE got back — the pool delta can differ when another process moves too
+            "reclaimed": max(0, after["device_free"] - before["device_free"])}
+
+
 async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                   on_connected) -> None:
     """One connect → register → {heartbeat, command-reader} lifecycle. Returns on
@@ -1253,6 +1368,28 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     with contextlib.suppress(Exception):
                         await reply({"type": "freed", "node_id": node_id, "free_gb": round(freed, 2)})
                     print(f"[free] controller requested RAM release -> {freed:.1f} GB free")
+                elif mtype == "trim_vram":
+                    # #reservation-reconcile (worker half): the NON-destructive counterpart of
+                    # free_memory above. Hand the torch allocator's unused pool back to the device
+                    # and report bytes before/after — resident shards are KEPT, which is the whole
+                    # point (free_memory's unload-everything is far too blunt to run for hygiene).
+                    # Dispatched as a task, not awaited inline: the trim can block on a device sync
+                    # and this loop must keep serving ping/unload meanwhile. Keyed by req_id so a
+                    # controller that fans out to the whole fleet matches replies to requests.
+                    async def _do_trim(_m=msg):
+                        res = await asyncio.to_thread(_trim_vram, worker)
+                        with contextlib.suppress(Exception):
+                            await reply({"type": "vram_trimmed", "node_id": node_id,
+                                         "req_id": _m.get("req_id"), **res})
+                        b, a = res["before"], res["after"]
+                        if res.get("skipped"):
+                            print(f"[trim] VRAM trim skipped — {res['skipped']}")
+                        else:
+                            print(f"[trim] pool {b['reserved']/GB:.2f}->{a['reserved']/GB:.2f} GB, "
+                                  f"live {b['allocated']/GB:.2f}->{a['allocated']/GB:.2f} GB, "
+                                  f"device free {b['device_free']/GB:.2f}->"
+                                  f"{a['device_free']/GB:.2f} GB")
+                    asyncio.create_task(_do_trim())
                 elif mtype == "self_update":
                     # #fleet-update: forced fleet-wide deploy — run the self-update check NOW
                     # (apply changed files; restart only on a VERSION bump, the same rule as
@@ -1680,6 +1817,28 @@ def main() -> None:
     install_log_tee()   # #logs: mirror stdout/stderr into a ring; relayed to the controller on heartbeat
     args = parse_args()
     _check_deps(args)
+    # DELIBERATELY NOT SET HERE: PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+    # It is the right fix for the fragmentation that _trim_vram only mops up after — it stops the
+    # allocator stranding VRAM in the first place — and on gfx1151 it is MEASURED GOOD (docs/ROCM.md:
+    # freed segments actually return to the OS; A/B decode 17.7 -> 18.2-18.7 tok/s, coherent). But it
+    # does not belong in this file, for three reasons:
+    #   1. WRONG VARIABLE ON ROCm. This fleet's ROCm workers take PYTORCH_HIP_ALLOC_CONF (that is what
+    #      docs/ROCM.md prescribes and what om3nbox actually runs). Setting only the CUDA name would
+    #      be a silent no-op on exactly the nodes where the win was measured, while reading in code
+    #      review as though it were handled everywhere.
+    #   2. UNMEASURED ON THE CUDA FLEET. shard_forward captures a decode CUDA graph
+    #      (torch.cuda.CUDAGraph / torch.cuda.graph), which allocates from a private graph pool —
+    #      the classic place expandable segments and graph capture interact badly. Nobody has A/B'd
+    #      that here. gfx1151 evidence does not transfer to beast/amdcomp, and a bad interaction
+    #      shows up as a wedged capture, not a clean error.
+    #   3. WRONG MECHANISM. om3nbox already sets it via a systemd drop-in — per-node, operator-owned,
+    #      and adjustable without a code deploy. Hardcoding it in main() would fight that; even
+    #      os.environ.setdefault would only be inert there while still forcing an unvalidated default
+    #      onto every CUDA node.
+    # OPEN QUESTION: does expandable_segments:True hold up on the CUDA nodes with #cudagraph decode
+    # enabled? Settle it with an A/B on one node (decode tok/s + a long-context gen for coherence)
+    # before turning it on anywhere by default; until then it stays a per-node unit-file setting.
+    #
     # Pin CPU thread count once at process start (physical cores) and report the CPU
     # fp32-GEMM policy. Harmless on GPU workers (torch threads just go unused there).
     if getattr(args, "no_cpu_fp32", False):

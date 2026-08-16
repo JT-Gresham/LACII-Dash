@@ -253,7 +253,8 @@ def register(app):
                              "free_vram_gb": round(free_v, 2), "knobs": knobs, "why": why})
 
     @app.get("/plan")
-    async def plan(model: str, ctx: int = 0, quant: str = "none", mode: str = "auto", node: str = "", cpu_only: bool = False) -> JSONResponse:
+    async def plan(model: str, ctx: int = 0, quant: str = "none", mode: str = "auto", node: str = "",
+                   cpu_only: bool = False, kv_quant: str = "none") -> JSONResponse:
         # #60 Preview: same inputs as /load (model, ctx, quant, mode) -> the placement + #76
         # assessment WITHOUT loading. tp modes are pipeline-planned here (TP frees the fleet and
         # plans differently at load); the dashboard tells the user TP preview is approximate.
@@ -301,6 +302,77 @@ def register(app):
         if ctx <= 0:   # default to the model's native training context (from spec)
             ctx = spec.max_ctx or DEFAULT_CTX
         spec = spec.for_quant(quant) if quant in ("int8", "int4", "int2") else spec   # size the real footprint
+        # #172 kv-preview: size the KV cache the way the WORKER will actually reserve it. /plan used
+        # to size KV at bf16 unconditionally, so the footprint it printed CONTRADICTED the TurboQuant
+        # selector sitting next to it in the same dialog (a turbo3 load reserves ~3 bits/coord, not
+        # 16) — the Preview overstated KV ~4-5x and operators declined placements that do fit.
+        _kvq = (kv_quant or "none").strip().lower()
+        if _kvq not in ("none", "turbo2", "turbo3", "turbo4"):
+            _kvq = "none"   # mirror /load: an unrecognised preset is 'none', never a smaller plan
+        _kvq_req = _kvq     # what was ASKED for, before the hybrid gate below (federated proxy
+        #                     forwards this: the peer owns the config and applies its own gate)
+        _kvq_note = ""
+        if _kvq != "none":
+            # Mirror shard_build's gate (_kvq_on = kv_quant != none and not self._hybrid): a hybrid
+            # arch NEVER builds a TurboQuant cache, so previewing the packed footprint for one would
+            # claim a fit the worker then reserves at bf16 and OOMs. _hybrid is exactly transformers'
+            # layer_types carrying any non-full_attention entry (sliding-window Gemma/Mistral count,
+            # not just linear-attention qwen3-next), OR fla-style linear_attn_config.kda_layers.
+            # Read from the downloaded config — a model with no local dir plans off the built-in
+            # dense ModelSpec table, where no hybrid exists.
+            if _pd:
+                try:
+                    with open(os.path.join(_pd, "config.json"), encoding="utf-8") as _cfh:
+                        _cfg = json.load(_cfh)
+                    _cfg = _cfg.get("text_config") or _cfg
+                    _lt = _cfg.get("layer_types") or []
+                    _lac = _cfg.get("linear_attn_config")
+                    if (any(t != "full_attention" for t in _lt)
+                            or bool(isinstance(_lac, dict) and _lac.get("kda_layers"))):
+                        _kvq_note = ("kv_quant ignored — a hybrid / sliding-attention arch never "
+                                     "builds a TurboQuant cache, so the worker reserves KV at bf16")
+                except Exception:   # noqa: BLE001 — unreadable config: we CANNOT rule out a hybrid
+                    # CONSERVATIVE: never shrink a preview we can't justify, and say WHICH reason —
+                    # showing the hybrid text here would blame the wrong thing.
+                    _kvq_note = ("kv_quant ignored — this model's config.json could not be read, "
+                                 "so the hybrid-arch check that gates TurboQuant could not run; "
+                                 "KV is previewed at bf16")
+            if _kvq_note:
+                _kvq = "none"
+        if _kvq != "none":
+            try:
+                import dataclasses
+                import kv_quant as _kq
+                # Ask kv_quant for the stored bytes rather than assuming bits/16: the indices are
+                # bit-packed to a BYTE boundary and each head carries an fp16 norm, so turbo3 is not
+                # 3/16. Same function the worker reserves with (shard_build._kv_bytes_per_layer).
+                _pt = _kq.kv_quant_bytes_per_token_per_layer(_kvq, spec.num_kv_heads, spec.head_dim)
+                _bf = 2 * spec.num_kv_heads * spec.head_dim * KV_DTYPE_BYTES   # bf16 K+V/tok/layer
+                if _pt > 0 and _bf > 0:
+                    # + one bf16 dequant transient, amortized over the layers: the worker holds one
+                    # full-ctx bf16 layer per device owning any KV layer, and /status's #172 card
+                    # counts it the same way. A MULTI-stage placement gets one transient PER stage;
+                    # the planner is an estimator and the worker's kv_reserve_probe is the exact
+                    # per-stage enforcer (it fails a stage cleanly and triggers a replan).
+                    #
+                    # Applied as a multiplier on kv_layer_frac because that is the one ModelSpec
+                    # knob that scales kv_bytes_per_layer for EVERY controller-side consumer at
+                    # once — plan_pipeline's required bytes, _assess_placement's warnings and
+                    # suggested_ctx, and the footprint table below — so fit and figures can't disagree.
+                    #
+                    # KNOWN GAP, deliberately not papered over here: the LIVE load's planner still
+                    # sizes KV at bf16 for a kv_quant load — engine_load bakes only kv_slots into
+                    # the spec (spec.for_kv_slots, ~L974), never the packed KV ratio. So in the
+                    # narrow band where packed KV fits and bf16 does not, this Preview now says
+                    # "fits" and /load still raises CapacityError. That is the load planner being
+                    # wrong, not this one (the worker's kv_reserve_probe reserves the packed
+                    # figure); the fix is a shared ModelSpec.for_kv_quant applied at BOTH sites.
+                    _r = _pt / _bf + 1.0 / max(1, spec.num_layers)
+                    spec = dataclasses.replace(
+                        spec, kv_layer_frac=float(spec.kv_layer_frac or 1.0) * _r)
+            except Exception as _exc:   # noqa: BLE001 — preview must never 500; bf16 is conservative
+                print(f"[plan] kv_quant sizing failed ({_exc!r}); previewing bf16 KV", flush=True)
+                _kvq = "none"
         cons, pv = LOAD_MODES.get(mode, LOAD_MODES["auto"])   # mirror /load's mode -> placement flags
         mems = []
         node_by_id = {}
@@ -327,7 +399,11 @@ def register(app):
         d["mem"] = {"quant": (quant if quant in ("int8", "int4", "int2") else "none"), "ctx": ctx,
                     "weights_gb": round(_wt_gb, 2), "kv_gb": round(_kv_gb, 2),
                     "kv_per_1k_gb": round(_kv_gb / max(1, ctx) * 1000, 3),
-                    "total_gb": round(_wt_gb + _kv_gb, 2)}
+                    "total_gb": round(_wt_gb + _kv_gb, 2),
+                    # #172 kv-preview: the preset the figures above were actually sized with — 'none'
+                    # whenever the requested one was dropped, so the dialog can say so instead of
+                    # silently showing bf16 KV under a turbo3 selection.
+                    "kv_quant": _kvq, "kv_quant_note": _kvq_note}
         if p.ok:   # #60/#76: surface the basis + pre-load assessment so a Preview matches the load
             d["basis"] = _describe_plan(p.stages, node_by_id, cpu_only, (pv and not cpu_only), quant,
                                         gpu_spread=(mode == "all-gpu" and not cpu_only))
@@ -392,6 +468,8 @@ def register(app):
                             _pq += f"&node={urllib.parse.quote(node)}"
                         if cpu_only:
                             _pq += "&cpu_only=true"
+                        if _kvq_req != "none":   # #172 kv-preview: peer must size KV the same way
+                            _pq += f"&kv_quant={urllib.parse.quote(_kvq_req)}"
                         _pr = await asyncio.to_thread(
                             _peers._http_get_json, f"{_peers.peer_base(_pp)}/plan?{_pq}", 15.0)
                         if isinstance(_pr, dict):

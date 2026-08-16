@@ -6,8 +6,114 @@ across all mixins by MRO. Controller-only leaf module; in EXTRA_UPDATE_FILES.
 """
 from __future__ import annotations
 
+# ── #wedge-detect thresholds ────────────────────────────────────────────────────────────────
+# Deliberately conservative, and deliberately NOT the gen-stall watchdog's numbers. What this
+# eventually feeds (a re-place, or a /restart_node) EVICTS whatever the node is holding: a false
+# positive costs a multi-minute reload of a large resident model on a box that was fine, while a
+# false negative costs only a slower recovery — every failing request already fails FAST via the
+# error frame / hop_error / stage_error paths, so nothing hangs while we wait for certainty.
+# So the bar is three separate conditions, all of which must hold:
+#   N     — how many forward failures the same node must rack up. 5, vs the watchdog's own
+#           3-in-15-min quarantine rule, because this signal fires far more often per unit of
+#           brokenness (one broken node fails EVERY request against it in seconds, whereas a
+#           stall costs the watchdog a whole threshold interval to even notice).
+#   WINDOW— failures older than this are forgotten entirely, so a slow drip of unrelated errors
+#           across a day never accumulates into a restart.
+#   SPREAD— the surviving failures must SPAN at least this long. This is the important one: with
+#           kv_slots>1 (or any concurrency) a single dead next-hop fails every in-flight request
+#           on that model in the same instant, which is ONE fault with N victims, not N faults.
+#           Requiring the failures to be spread over time means only a node that keeps failing
+#           ACROSS client retries qualifies.
+# These are judgement calls sized off the watchdog's existing rule, not numbers measured against
+# a captured wedge storm — do not cite them as measured. wedge_fwd_fail_n=0 in ENGINE_CONFIG
+# disables the detector outright (escape hatch if it ever proves trigger-happy in the field).
+FWD_FAIL_WEDGE_N = 5
+FWD_FAIL_WINDOW_S = 300.0
+FWD_FAIL_SPREAD_S = 30.0
+# A superseded forward is the CURE, not the fault: shard_forward raises _ForwardSuperseded when a
+# newer request asks an orphaned forward to yield (per-slot reclaim, #fwd-cancel). The worker's
+# generic stage-error catch turns it into an ordinary error frame, so it arrives here looking
+# exactly like a compute failure. Counting it would make every successful orphan cleanup look like
+# node brokenness — the single most likely source of a false restart. Filtered by name.
+FWD_FAIL_BENIGN = ("_ForwardSuperseded",)
+
 
 class EngineLifecycleMixin:
+
+    # ---- #wedge-detect: repeated stage-forward failures against ONE node ----------------------
+    def note_stage_failure(self, friendly: Optional[str], err: str,
+                           node_id: Optional[str] = None) -> Optional[str]:
+        """Record one stage-forward failure and, if the same node has failed repeatedly, mark that
+        node wedged in ``engine._wedge_recent`` — the SAME structure (and same ``(count, ts)`` tuple
+        shape, same 15-min horizon) the gen-stall watchdog's #wedge-quarantine writes, namespaced
+        ``node::<id>`` so it can never collide with the watchdog's model / ``<model>::slot<n>`` keys.
+
+        WHY THIS EXISTS: _wedge_recent was fed by the gen-stall watchdog and nothing else, i.e. only
+        by a generation that produced NO token for the stall threshold. A node that fails forwards
+        FAST never stalls — the request errors in seconds, the client retries, the same node fails
+        again, and the counter that drives self-heal never moves. That is the 2026-07-09 wedge-storm
+        shape with the timings inverted, and it was completely invisible to the recovery machinery.
+
+        ``node_id`` may be passed explicitly by a caller that knows which box raised (the control-link
+        stage_error/hop_error frames carry ``node_id``/``next_host``); when it is None we resolve it
+        from the replica ONLY if that replica has exactly one stage, because a data-plane error frame
+        carries no node stamp and guessing which of K stages raised is precisely the false positive
+        this whole routine is built to avoid.
+
+        Returns the node id if THIS failure is the one that crossed the bar (so a caller can hang an
+        escalation off it), else None. Detection only — it evicts/restarts nothing itself.
+        """
+        try:
+            _thr = int(ENGINE_CONFIG.get("wedge_fwd_fail_n", FWD_FAIL_WEDGE_N) or 0)
+        except (TypeError, ValueError):
+            _thr = FWD_FAIL_WEDGE_N
+        if _thr <= 0:
+            return None
+        if any(_b in (err or "") for _b in FWD_FAIL_BENIGN):
+            return None
+        if node_id is None:
+            m = self.models.get(friendly) if friendly else None
+            _sn = list(getattr(m, "stage_node_ids", None) or []) if m is not None else []
+            if len(_sn) != 1:
+                return None   # multi-stage (or already gone): attribution unknown, count nothing
+            node_id = _sn[0]
+        now = time.time()
+        _ff = getattr(self, "_fwd_fail_recent", None)
+        if _ff is None:
+            _ff = self._fwd_fail_recent = {}
+        _cnt, _first, _last = _ff.get(node_id, (0, 0.0, 0.0))
+        if (now - _last) > FWD_FAIL_WINDOW_S:
+            _cnt, _first = 0, now   # window expired -> this failure starts a fresh streak
+        _cnt += 1
+        _ff[node_id] = (_cnt, _first, now)
+        if _cnt < _thr or (now - _first) < FWD_FAIL_SPREAD_S:
+            return None
+        _ff[node_id] = (0, now, now)   # re-arm: the next mark needs a whole fresh streak
+        _wr = getattr(self, "_wedge_recent", None)
+        if _wr is None:
+            _wr = self._wedge_recent = {}
+        _wk = f"node::{node_id}"
+        _wcnt, _wts = _wr.get(_wk, (0, 0.0))
+        _wcnt = _wcnt + 1 if (now - _wts) < 900.0 else 1
+        _wr[_wk] = (_wcnt, now)
+        _nd = registry._nodes.get(node_id)
+        log_activity(f"wedge-detect: {getattr(_nd, 'hostname', None) or node_id} failed {_cnt} "
+                     f"stage forwards spread over {int(now - _first)}s "
+                     f"({_ollama_name(friendly) if friendly else '?'}, last: {str(err)[:160]}) — "
+                     f"marked wedged (mark #{_wcnt}); no eviction taken")
+        return node_id
+
+    def wedged_nodes(self, within_s: float = 900.0) -> list:
+        """Node ids marked wedged by #wedge-detect within the last `within_s` (default: the same
+        15-min horizon #wedge-quarantine uses). The escalation hook: a consumer that wants to act
+        (re-place the models on the node, POST /restart_node) reads this instead of re-deriving the
+        signal. Counts accumulate across marks and are never zeroed here — nothing acts on them yet,
+        so the tally is 'how many times this box crossed the bar', not 'how many times we restarted
+        it'; whoever wires the escalation should zero its own key after acting, as the watchdog does.
+        """
+        now = time.time()
+        return [k[6:] for k, (c, ts) in (getattr(self, "_wedge_recent", None) or {}).items()
+                if k.startswith("node::") and c > 0 and (now - ts) < within_s]
 
     # -- data listener: receives logits frames from the last stage --
     async def ensure_data_listener(self) -> None:
@@ -38,11 +144,20 @@ class EngineLifecycleMixin:
                 net_account(self._head_id(hm), from_node=wire)  # head -> controller
                 rid = hdr.get("req_id")
                 fut = self.pending.pop(rid, None) if rid is not None else None
+                # #wedge-detect: read the routed replica BEFORE the pops below drop it — model_id
+                # above is the target_id, which is SHARED across data-parallel replicas, so it can't
+                # tell us which box actually ran this forward.
+                _fr = self.pending_friendly.get(rid) if rid is not None else None
                 if rid is not None:
                     self.pending_model.pop(rid, None)
                     self.pending_friendly.pop(rid, None)   # #5 keep replica map in lockstep
                     getattr(self, "pending_slot", {}).pop(rid, None)   # #kv-slots lockstep
                 if hdr.get("kind") == "error":
+                    # #wedge-detect: a stage raised. This frame carries no node stamp, so
+                    # note_stage_failure only counts it when the replica is single-stage (see there).
+                    # Never allowed to affect the request: the failure is the future's, not ours.
+                    with contextlib.suppress(Exception):
+                        self.note_stage_failure(_fr, str(hdr.get("error", "")))
                     if fut and not fut.done():
                         fut.set_exception(RuntimeError(hdr.get("error", "stage error")))
                     continue

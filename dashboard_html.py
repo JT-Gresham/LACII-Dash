@@ -832,6 +832,9 @@ function previewSoon(name){ clearTimeout(_pvTimer); const el=$('#l-out'); if(el)
 async function preview(name){
   const p=placeParams(name); const q=new URLSearchParams({model:p.model,quant:p.quant,ctx:p.ctx});
   if(p.mode)q.set('mode',p.mode); if(p.node)q.set('node',p.node); if(p.cpu_only)q.set('cpu_only',p.cpu_only);
+  // #172 kv-preview: send the TurboQuant preset too, or the footprint below sizes KV at bf16 and
+  // contradicts the KV-quant selector three rows above it in this same dialog.
+  if(p.kv_quant)q.set('kv_quant',p.kv_quant);
   const out=$('#l-out'); if(!out)return; out.textContent='estimating…';
   let r; try{ r=await (await fetch('/plan?'+q.toString())).json(); }
   catch(e){ out.innerHTML='<span class="err">'+esc(String(e.message||e))+'</span>'; return; }
@@ -842,13 +845,18 @@ async function preview(name){
     const split=(mem.est_vram_gb!=null)
       ? ('<span style="color:var(--good)">~'+gb(mem.est_vram_gb)+' VRAM</span> · <span class="em">~'+gb(mem.est_ram_gb)+' RAM</span>')
       : '<span class="em">— (does not fit; see below)</span>';
+    // #172 kv-preview: name the preset the KV figure was actually sized with. mem.kv_quant is the
+    // EFFECTIVE one, so it reads 'bf16' whenever /plan dropped the request (hybrid arch) — the row
+    // never silently shows a bf16 number under a turbo3 selection.
+    const _kvq=(mem.kv_quant&&mem.kv_quant!=='none')?String(mem.kv_quant):'';
     html+='<div style="margin:2px 0"><b>Estimated footprint</b> · '+esc(mem.quant)+' · ctx '+(mem.ctx||0).toLocaleString()+'</div>'
       +'<table class="kv">'
       +'<tr><td>weights</td><td class="v">'+gb(mem.weights_gb)+'</td></tr>'
-      +'<tr><td>KV cache @ '+(mem.ctx||0).toLocaleString()+'</td><td class="v">'+gb(mem.kv_gb)+' <span class="em">(~'+gb(mem.kv_per_1k_gb)+' / 1k tok)</span></td></tr>'
+      +'<tr><td>KV cache @ '+(mem.ctx||0).toLocaleString()+' <span class="em">('+(_kvq?esc(_kvq):'bf16')+')</span></td><td class="v">'+gb(mem.kv_gb)+' <span class="em">(~'+gb(mem.kv_per_1k_gb)+' / 1k tok)</span></td></tr>'
       +'<tr><td>total</td><td class="v"><b>'+gb(mem.total_gb)+'</b></td></tr>'
       +'<tr><td>placement</td><td class="v">'+split+'</td></tr>'
       +'</table>';
+    if(mem.kv_quant_note)html+='<div class="note">⚠ '+esc(mem.kv_quant_note)+'</div>';
   }
   if(!r.ok){ html+='<div class="err" style="margin-top:6px">⚠ '+esc(r.error||'does not fit the fleet at these settings')+'</div>'; out.innerHTML=html; return; }
   const st=(r.stages||[]).map(s=>esc(s.hostname)+' L'+s.layer_start+'-'+s.layer_end).join(', ');
@@ -1061,14 +1069,16 @@ async function openDetail(name){
   DETAIL_OPEN=name;
   const cz=m.cached||{};
   // precache (shard cache): compile int4/int8/int2 so future loads serve from cache instantly.
-  // int2 is explicit-build ONLY (never on first load): RTN-int2 quality is collapsed until the
-  // calibrated packer lands, so the button carries the caveat. t2i checkpoints have no shard
-  // cache (diffusers layout — the LLM compiler can't parse them).
+  // int2 is explicit-build ONLY (never on first load) — NOT because the calibrated packer is
+  // missing (#38 shipped it, gptq_pack.py) but because GPTQ calibration is SEQUENTIAL (layer L
+  // needs layer L-1's quantized output) and runs hours on a big model, so nothing may kick it off
+  // behind a request. The button carries that caveat plus the measured quality scope. t2i
+  // checkpoints have no shard cache (diffusers layout — the LLM compiler can't parse them).
   let pre='';
   if(m.ready&&!(m.capabilities||[]).includes('t2i')){ let chips='';
     for(const q of ['int4','int8','int2']){
       if(cz[q]&&cz[q].ok) chips+='<span class="chip al">'+q+' cached '+gb(cz[q].size_gb)+'</span> ';
-      else chips+='<button class="btn sm ghost" '+(q==='int2'?'title="~2.5 bits/weight capacity tier, half the int4 cache size. CAVEAT: the current round-to-nearest int2 packing collapses generation quality on dense LLMs — build for experiments only until the calibrated (GPTQ-class) packer lands. Never auto-built on first load; an existing cache does serve int2 loads." ':'')+'onclick="openCompile(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
+      else chips+='<button class="btn sm ghost" '+(q==='int2'?'title="~2.5 bits/weight capacity tier, half the int4 cache size. GPTQ-calibrated (per-layer Hessian error compensation over a bundled offline corpus), NOT round-to-nearest. DENSE models only — a MoE auto-downgrades its experts to int4. Never auto-built on first load: calibration is sequential and runs hours on a big model, so you start it here deliberately (prefer an idle box — a GPU compile beside live residents has crashed one). Quality has only ever been measured at 7B and below, where int4 is strictly better; the tier exists for big dense models that cannot fit at int4. Without a valid v2 calibrated cache an int2 load refuses rather than serving uncalibrated weights." ':'')+'onclick="openCompile(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
     }
     pre='<h3 style="font-size:13px;margin-top:14px">Precache (shard cache)</h3><div>'+chips+'</div>';
   }
@@ -1631,7 +1641,7 @@ CONFIG_HTML = r"""<!doctype html>
   <div class="frm">
     <div class="fld" title="Cap on how many models can be resident at once. Loading one more first evicts the least-recently-used IDLE model (if LRU auto-unload is on); with no evictable victim the load fails. Pinned (do-not-auto-unload) models are never evicted."><label>Max concurrent loaded models</label><input id="max_loaded" type="number" min="1"></div>
     <div class="fld" title="How many requests may wait in line per model — generations for one model run one at a time. When the queue is full, further requests get a retryable 429/503 (honest backpressure) instead of piling up behind a long generation."><label>Per-model queue depth</label><input id="queue_depth" type="number" min="1"></div>
-    <div class="fld" title="Quantization tier used when a request or dashboard click auto-loads a model. int4 is the recommended default; if a quantized auto-load fails, one bf16 retry is attempted. Hover each option in the list for details."><label>Auto-load default quant</label><select id="autoload_quant"><option title="Fused 4-bit: ~4x smaller than bf16, near-lossless, fastest fused GPU kernels — the recommended default">int4</option><option title="Experimental 2-bit (~2.5 bits/weight, dense models only — a MoE auto-downgrades to int4). Current round-to-nearest packing collapses output quality; awaits a calibrated (GPTQ-class) packer">int2</option><option title="8-bit: 2x smaller than bf16, effectively lossless. No 8-bit MoE-expert packer — a MoE auto-downgrades to int4">int8</option><option value="none" title="Full bf16 weights — exact but largest (~2 bytes per parameter); needs the most VRAM/RAM">none (bf16)</option></select></div>
+    <div class="fld" title="Quantization tier used when a request or dashboard click auto-loads a model. int4 is the recommended default; if a quantized auto-load fails, one bf16 retry is attempted. Hover each option in the list for details."><label>Auto-load default quant</label><select id="autoload_quant"><option title="Fused 4-bit: ~4x smaller than bf16, near-lossless, fastest fused GPU kernels — the recommended default">int4</option><option title="2-bit capacity tier (~2.5 bits/weight, dense models only — a MoE auto-downgrades its experts to int4). GPTQ-calibrated, not round-to-nearest — but the cache is NEVER auto-built: calibration is sequential and runs hours on a big model, so an int2 auto-load refuses unless that model's int2 cache was compiled first. Quality has only ever been measured at ≤7B, where int4 is strictly better; the tier is for big dense models that cannot fit at int4.">int2</option><option title="8-bit: 2x smaller than bf16, effectively lossless. No 8-bit MoE-expert packer — a MoE auto-downgrades to int4">int8</option><option value="none" title="Full bf16 weights — exact but largest (~2 bytes per parameter); needs the most VRAM/RAM">none (bf16)</option></select></div>
     <div class="fld" title="Context window (tokens) sized into auto/click loads. The per-layer KV-cache memory reserve grows with ctx, so bigger windows make placement fatter. 0 = the model's native maximum (can be huge — 128k+ on many models)."><label>Auto-load default ctx (0 = native)</label><input id="autoload_ctx" type="number" min="0"></div>
     <div class="fld" title="Placement mode for auto-loads. auto = GPU-VRAM-first on the fewest nodes — best latency, the recommended default. If models seem to randomly load slow into system RAM, check this is not set to single. Hover each option in the list for details."><label>Auto-load placement mode</label><select id="autoload_mode"><option title="GPU-VRAM-first, fewest nodes — best latency (recommended)">auto</option><option title="A stage on EVERY enabled GPU, nothing on CPU — fails if the fleet's total VRAM cannot hold the model">all-gpu</option><option title="Spread stages across the whole fleet, CPUs and GPUs alike">distribute</option><option title="Layers across every capable node proportional to its capacity — for huge MoE models too big for the GPU-first subset">proportional</option><option title="Fewest nodes counting RAM+VRAM together — collapses to one box if it fits; RAM-first, usually the slow choice for big models">single</option></select></div>
     <div class="fld" title="Prefill stall-watchdog: reclaim a generation that has produced NO tokens and reports no per-layer forward progress for this many seconds — its slot, queue and per-model lock reset so the next request re-flows the pipeline. Slow-but-ADVANCING prefills are never reclaimed (workers report progress over their heartbeat). Repeated reclaims of one model trip the wedge quarantine, which forces a fresh automatic re-place. 0 = watchdog off."><label>Prefill stall-watchdog (s, 0=off)</label><input id="gen_stall_s" type="number" min="0"></div>

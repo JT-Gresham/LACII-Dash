@@ -63,6 +63,10 @@ class ControlLink:
     # model_id (target_id); unload-all (no model_id in the frame) keys under None.
     pending_loads: dict = field(default_factory=dict)    # model_id -> asyncio.Future
     pending_unloads: dict = field(default_factory=dict)  # model_id (or None) -> asyncio.Future
+    # #reservation-reconcile (worker half): in-flight trim_vram requests keyed by req_id. Kept on
+    # the LINK, not on engine, so a node that drops mid-trim fails its future in the same finally
+    # that already fails pending loads/unloads (see below) instead of hanging out the timeout.
+    pending_vram_trims: dict = field(default_factory=dict)  # req_id -> asyncio.Future
 
     async def send(self, obj: dict) -> None:
         async with self.lock:
@@ -541,6 +545,29 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
                 if _fut is not None and not _fut.done():
                     _fut.set_result(msg)
                 getattr(engine, "_t2music_progress", {}).pop(msg.get("req_id"), None)
+            elif mtype == "vram_trimmed":
+                # #reservation-reconcile (worker half): reply to a trim_vram. MUST be dispatched
+                # here, above the ("ready", "error") arm — an unhandled frame would fall through
+                # and _resolve_pending would hand it to whatever load future happened to be
+                # pending on this link. Resolve by req_id; log unconditionally, matched or not,
+                # because a trim that found the node BUSY (skipped) is the case worth seeing.
+                _f = link.pending_vram_trims.pop(msg.get("req_id"), None)
+                if _f is not None and not _f.done():
+                    _f.set_result(msg)
+                _b, _a = msg.get("before") or {}, msg.get("after") or {}
+                if msg.get("skipped"):
+                    log_activity(f"vram-trim: {node.hostname} skipped — {msg['skipped']}")
+                else:
+                    _gb = 1 << 30
+                    log_activity(
+                        f"vram-trim: {node.hostname} returned "
+                        f"~{int(msg.get('reclaimed', 0)) / _gb:.1f} GB of stranded VRAM to the "
+                        f"device — allocator pool {int(_b.get('reserved', 0)) / _gb:.1f} -> "
+                        f"{int(_a.get('reserved', 0)) / _gb:.1f} GB, live weights "
+                        f"{int(_b.get('allocated', 0)) / _gb:.1f} -> "
+                        f"{int(_a.get('allocated', 0)) / _gb:.1f} GB (unchanged == nothing was "
+                        f"unloaded), device free {int(_b.get('device_free', 0)) / _gb:.1f} -> "
+                        f"{int(_a.get('device_free', 0)) / _gb:.1f} GB")
             elif mtype in ("ready", "error"):
                 _resolve_pending(link.pending_loads, msg, peer_host)
             elif mtype == "unloaded":
@@ -560,7 +587,7 @@ async def handle_control(reader: asyncio.StreamReader, writer: asyncio.StreamWri
             if link is not None:
                 # #1: fail EVERY in-flight load/unload on this link (dict keyed by model_id) so
                 # none block on the full multi-minute timeout when a worker drops mid-operation.
-                for _d in (link.pending_loads, link.pending_unloads):
+                for _d in (link.pending_loads, link.pending_unloads, link.pending_vram_trims):
                     for fut in list(_d.values()):
                         if fut is not None and not fut.done():
                             fut.set_exception(ConnectionError(
@@ -658,6 +685,41 @@ async def reservation_reconcile_loop() -> None:
                              f"making its node(s) read 'no room' (no restart needed)")
         except Exception as exc:   # a hygiene loop must never die
             print(f"[reservation-reconcile] sweep error: {exc!r}", flush=True)
+
+
+# #reservation-reconcile (worker half): the sweep above returns phantom placement BUDGET, but the
+# matching physical problem lives in the worker process — the torch caching allocator's pool
+# fragments across model churn and holds VRAM that smi (and therefore placement) counts as USED.
+# trim_vram asks a worker to hand that pool back WITHOUT unloading anything; free_memory, the only
+# pre-existing worker memory message, unloads every shard first and is far too blunt for hygiene.
+VRAM_TRIM_TIMEOUT_S = 120.0   # a ROCm trim syncs the device first and can sit behind queued kernels
+
+
+async def request_vram_trim(node_id: str, timeout: float = VRAM_TRIM_TIMEOUT_S) -> dict:
+    """Ask ONE worker to trim its allocator pool; return its before/after report.
+
+    The timeout is not optional: the command loop of a worker running older code silently ignores
+    an unknown message type, so a pre-trim_vram node NEVER replies and an unbounded await would
+    hang the caller for the life of the link. On timeout we drop our own future and report it —
+    a hygiene call must never become a wedge. The worker refuses the trim outright while a
+    forward/render is in flight (ok=False + skipped), so calling this on a busy node is safe but
+    pointless; callers doing a fleet sweep should expect skips and not treat them as errors."""
+    link = engine.links.get(node_id)
+    if link is None:
+        return {"ok": False, "skipped": "node has no control link"}
+    req_id = f"trim-{node_id}-{time.time():.6f}"
+    fut = asyncio.get_running_loop().create_future()
+    link.pending_vram_trims[req_id] = fut
+    try:
+        await link.send({"type": "trim_vram", "req_id": req_id})
+        return await asyncio.wait_for(fut, timeout)
+    except asyncio.TimeoutError:
+        return {"ok": False, "skipped": f"no reply in {timeout:.0f}s "
+                                        f"(worker may predate trim_vram)"}
+    except Exception as exc:
+        return {"ok": False, "skipped": repr(exc)}
+    finally:
+        link.pending_vram_trims.pop(req_id, None)
 
 
 async def gen_stall_watchdog() -> None:

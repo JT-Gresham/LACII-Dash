@@ -263,12 +263,40 @@ class EngineLoadMixin:
                 vram[nid] = vram.get(nid, 0) + int(b.get("vram", 0))
         return ram, vram
 
-    def _perf_auto_kv_slots(self, spec, quant: str, ctx: int, kv_slots: int, tp: int,
-                            kv_quant: str, kv_offload: bool, friendly: str, advice: list,
-                            pin_host: str = "") -> int:
-        """#perf-auto: pick C (kv_slots) from the detected setup when the caller left it at 1.
+    def _perf_auto_knobs(self, spec, quant: str, ctx: int, kv_slots: int, tp: int,
+                         kv_quant: str, kv_offload: bool, moe_offload: bool, head_quant: str,
+                         friendly: str, advice: list, pin_host: str = "") -> tuple:
+        """#perf-auto: fill knobs the caller left unset from the DETECTED setup.
 
-        WHY THIS IS THE ONE KNOB WORTH AUTO-RAISING. #prefix-kv keeps ONE prompt-prefix record per
+        Returns (kv_slots, moe_offload) — the ONLY knobs perf_profile.resolve() returns that this
+        loader APPLIES. Everything else it resolves is ADVICE: printed into the load log and offered
+        by the dashboard's ⚡ button for the operator to accept, never switched on behind their back.
+        The line between the two lists is not confidence, it is BLAST RADIUS — an applied knob must
+        not change what the model SAYS, and must not be able to make a working load worse:
+
+          APPLIED  kv_slots  — placement of the KV reservation; output-identical (first live
+                    validation: three concurrent conversations, bit-identical greedy output vs the
+                    sequential baseline). Sized so it can never push a layer to CPU (below).
+          APPLIED  moe_offload — placement of the routed-expert block; output-identical (see the
+                    justification at the apply site).
+          ADVICE   head_quant — CHANGES OUTPUT (int8 head +0.0050 nats / 98.4% top-1, int4 head
+                    REJECTED at 92.5% of the whole int4 body's damage). Deliberately operator
+                    opt-in, gated by client.py's validator; perf_profile section 4b says so and
+                    this loader must not quietly undo that.
+          ADVICE   quant, kv_quant — also change output (different weights / a quantized KV cache),
+                    and quant is already owned by the auto-load tier ladder.
+          ADVICE   kv_offload — output-safe, but the resolver only ever answers False here, and
+                    "False" would silently overrule an operator's fleet-wide /config?kv_offload=1.
+                    Applying an OFF is never urgent; the knob is already off unless someone asked.
+          ADVICE   speculative, draft_gpu — this call site passes neither has_draft_model nor
+                    has_mtp_head, so both always resolve False; applying that would clobber an
+                    explicit draft_gpu=1. draft_gpu also places the draft on the CONTROLLER's GPU,
+                    which is an operator decision, not a resolver one.
+          NO KNOB  attn (a worker CLI flag, not per-load), prefix_min (the env var
+                    INFINITEMODEL_PREFIX_MIN, whose default already IS the resolved 128),
+                    cuda_graph (nothing reads it — pinned-off advice only).
+
+        WHY kv_slots IS WORTH AUTO-RAISING. #prefix-kv keeps ONE prompt-prefix record per
         slot. At C=1 a single interleaved request — a second client, an agent's side-query, a
         keep-alive probe — overwrites it, so every later turn re-prefills the whole conversation.
         Measured on an idle card with a 2594-token prompt: C=1 interleaved 6506 ms (prefix MISS)
@@ -285,8 +313,11 @@ class EngineLoadMixin:
         keeps C=1 and behaves byte-identically to before.
         """
         import perf_profile as _pp
-        if int(kv_slots or 1) > 1 or tp > 1 or kv_quant != "none" or kv_offload:
-            return kv_slots                     # explicit request, or a path that hard-gates C=1
+        # These gates bind C ONLY (they are the reasons _kvslots_clamp re-clamps at load time:
+        # an explicit request, or a cache that carries no slot id). They used to skip the whole
+        # resolver, which meant one kv_offload=1 load silenced every other decision AND its
+        # rationale — a load with kv_offload on wants MoE placement + the advice lines just as much.
+        _c_gated = int(kv_slots or 1) > 1 or tp > 1 or kv_quant != "none" or kv_offload
         cands = [n for n in registry.alive_sorted() if n.can_infer and n.eff_vram_gb > 0]
         if pin_host:
             # Size against the node this load will ACTUALLY land on. Without this the resolver
@@ -294,7 +325,7 @@ class EngineLoadMixin:
             # cannot hold — the exact CPU-spill this sizing exists to prevent.
             cands = [n for n in cands if n.hostname == pin_host]
         if not cands:
-            return kv_slots
+            return kv_slots, moe_offload
         best = max(cands, key=lambda n: self._node_live_free_vram_gb(n))
         free_gb = self._node_live_free_vram_gb(best)
         dev = _pp.classify_device(
@@ -302,6 +333,29 @@ class EngineLoadMixin:
             is_hip="amd" in (getattr(best, "device_name", "") or "").lower()
                    or "radeon" in (getattr(best, "device_name", "") or "").lower(),
             unified_memory=False)
+        # Tell the resolver what the caller ALREADY chose so it defers instead of "deciding" a knob
+        # that is not actually free — its contract is fill-if-unset. ONLY genuinely-set values go in:
+        # take() treats anything outside (None, "", -1) as explicit, and False is outside it, so
+        # passing kv_offload=False / moe_offload=False would read as "the operator chose off" and
+        # the resolver could never fill them. kv_quant/kv_offload arrive here already merged with
+        # their ENGINE_CONFIG defaults, which is exactly the operator intent this must respect —
+        # before this, the log claimed "kv_offload=False — <reason>" on a fleet where the operator
+        # had globally turned it ON.
+        _req = {"quant": quant}
+        if _c_gated:
+            # C is not free on this load (explicit request, or a cache that hard-gates C=1), so hand
+            # the resolver the value it will actually get. Two reasons: the rationale must not
+            # advertise a C the loader is about to ignore, and section 4's MoE fit check budgets
+            # slots x KV — sizing it against a C that cannot happen would skew moe_offload.
+            _req["kv_slots"] = int(kv_slots or 1)
+        if (kv_quant or "none") != "none":
+            _req["kv_quant"] = kv_quant
+        if kv_offload:
+            _req["kv_offload"] = True
+        if moe_offload:
+            _req["moe_offload"] = True
+        if head_quant:
+            _req["head_quant"] = head_quant
         _lt = getattr(spec, "layer_types", None)
         knobs, why = _pp.resolve(
             params_b=float(getattr(spec, "meas_params", 0) or 0) / 1e9
@@ -316,17 +370,49 @@ class EngineLoadMixin:
             is_hybrid=bool(_lt) and any(t != "full_attention" for t in (_lt or [])),
             is_multimodal=bool(getattr(spec, "is_multimodal", False)),
             arch=str(getattr(spec, "arch", "") or ""),
+            # section 4b only suggests an int8 lm_head where one EXISTS: a tied head aliases
+            # embed_tokens, so without this the log proposed quantizing a matrix that is not
+            # a separate matrix (/optimize_knobs already passes it).
+            tie_word_embeddings=bool(getattr(spec, "tie_embeddings", False)),
             device_class=dev, free_vram_gb=free_gb, ctx=int(ctx or 4096),
-            requested={"quant": quant})
+            requested=_req)
         advice.extend(why)
-        c = int(knobs.get("kv_slots", 1) or 1)
-        if c > 1:
+        c = int(kv_slots or 1) if _c_gated else int(knobs.get("kv_slots", 1) or 1)
+        if c > 1 and not _c_gated:
             log_activity(f"{friendly}: #perf-auto kv_slots=1 -> {c} on {best.hostname} "
                          f"({free_gb:.1f} GB free) — keeps interleaved conversations' prefixes "
                          f"warm (measured 3.9x on the interleaved turn)")
+        # #perf-auto moe_offload: apply the TRUE direction only — the resolver says the weights + KV
+        # do not fit the node it sized against, so some of this model is going to end up off the GPU.
+        #
+        # WHY THIS ONE IS SAFE TO APPLY when the others are not. It is a pure PLACEMENT flag: same
+        # weights, same math, bit-identical output. It cannot pessimize a model that fits, because
+        # shard_build only consults it on the SPILL path — the `whole` branch (everything on GPU)
+        # never sets layer_split, so the flag is INERT whenever the shard fits VRAM, and a
+        # false-positive True (the resolver sizes ONE node; the planner may spread the model over
+        # several) therefore costs nothing. When the shard does NOT fit, its only effect is to turn
+        # "this whole MoE layer goes to CPU" into "attention+norms stay on GPU, the routed-expert
+        # block stays in RAM" — and back to the whole layer if even the mixer misses the budget.
+        # Whole CPU layers are the measured catastrophe on this fleet (two CPU layers took a 7B from
+        # 27 to 9.7 tok/s) and the split is what keeps the KV-reading attention on the card.
+        # It also moves NOTHING between nodes: the placement plan is built after this and never
+        # reads the flag — it only rides the load message to the worker (and into lm.moe_offload,
+        # so a #load-faster re-place keeps it).
+        # Gated to where the worker will actually act on it: shard_build requires int4/int8 experts
+        # (bf16 experts may be mmap views, so they take the whole-layer path) and #moe-offload is
+        # pipeline-only — the TP path ignores the flag. Setting it outside those would put a lie in
+        # the load message and in the persisted snapshot.
+        mo = bool(moe_offload)
+        if (not moe_offload and bool(knobs.get("moe_offload"))
+                and tp <= 1 and quant in ("int4", "int8")):
+            mo = True
+            log_activity(f"{friendly}: #perf-auto moe_offload=1 — MoE weights + KV do not fit "
+                         f"{best.hostname}'s {free_gb:.1f} GB free VRAM, so any layer that spills "
+                         f"keeps attention+norms on the GPU and leaves its experts in RAM instead "
+                         f"of moving the whole layer to CPU (output-identical)")
         for line in why:
             print(f"[perf-auto] {friendly}: {line}", flush=True)
-        return c
+        return c, mo
 
     def _kvslots_clamp(self, kv_slots: int, tp: int, kv_quant: str, kv_offload: bool,
                        model_dir: str) -> tuple:
@@ -771,14 +857,18 @@ class EngineLoadMixin:
             # xC kv_reserve_probe (KV_RESERVE_OOM -> replan), never OOMs mid-decode.
             # #perf-auto: resolve performance knobs the caller left UNSET from the DETECTED setup
             # (device class, free VRAM, model shape, MoE/hybrid, draft availability). Only knobs
-            # backed by a measurement are APPLIED; the rest are logged as advice, because this
-            # session established that plausible-sounding tuning reverses under measurement more
-            # often than not. Explicit caller values always win. Off switch: /config?perf_auto=0.
+            # that cannot change the model's OUTPUT and cannot make a working load worse are
+            # APPLIED — today kv_slots and moe_offload, both pure placement; the rest are logged as
+            # advice, because this session established that plausible-sounding tuning reverses under
+            # measurement more often than not, and because head_quant/quant/kv_quant move the logits
+            # and stay an operator decision (_perf_auto_knobs' docstring carries the full split).
+            # Explicit caller values always win. Off switch: /config?perf_auto=0.
             _perf_adv: list = []
             if bool(ENGINE_CONFIG.get("perf_auto", True)) and spec is not None and not cpu_only:
                 try:
-                    kv_slots = self._perf_auto_kv_slots(spec, quant, ctx, kv_slots, tp, kv_quant,
-                                                        kv_offload, friendly, _perf_adv, pin_host)
+                    kv_slots, moe_offload = self._perf_auto_knobs(
+                        spec, quant, ctx, kv_slots, tp, kv_quant, kv_offload,
+                        moe_offload, head_quant, friendly, _perf_adv, pin_host)
                 except Exception as _pexc:
                     # NEVER silent: a resolver that fails invisibly is indistinguishable from one
                     # that decided to change nothing, which makes the whole feature unfalsifiable.
@@ -1920,6 +2010,7 @@ class EngineLoadMixin:
             await self._await_free_refresh()
         node = edge = None
         _refreshed = False
+        _offload_fallback = False   # #t2i-offload-fallback: set when the GPU-resident attempt gave up
         while True:
             # co-located = same box as the controller: hostname match (the robust signal —
             # a standalone worker may register its LAN IP, e.g. om3nbox's 192.168.x) or a
@@ -1973,14 +2064,42 @@ class EngineLoadMixin:
                     raise RuntimeError(
                         f"t2i offload needs ~{_OFFLOAD_VRAM_GB:.0f} GB free VRAM (transients) and "
                         f"~{all_b / GB + 6.0:.0f} GB free RAM on the controller-co-located GPU node "
-                        "— it never evicts residents (that is its point); free some VRAM/RAM or "
-                        "use the normal GPU load")
+                        "— it never evicts residents (that is its point); free some VRAM/RAM"
+                        + ("" if _offload_fallback else " or use the normal GPU load"))
                 # right after a restart/unload the heartbeat can still show the OLD vram_used —
                 # wait one stats refresh and re-check ONCE before declaring no room (bit us live:
                 # a load fired seconds after /update saw pre-unload numbers + nothing evictable)
                 if not _refreshed:
                     _refreshed = True
                     await self._await_free_refresh()
+                    continue
+                if cand:
+                    # #t2i-offload-fallback: GPU-resident won't fit and nothing is evictable (pinned
+                    # or busy residents hold the VRAM). t2a has flipped to its RAM-offload recipe on
+                    # exactly this shape since #t2a-offload-fallback; t2i hard-failed on it, so the
+                    # same full card kept serving music and refused images — an asymmetry with no
+                    # reason behind it. Offload is a PROVEN t2i serving mode (v2: bf16 DiT in RAM,
+                    # accelerate streams each block to the GPU per forward, ~4 GB transient VRAM,
+                    # NEVER evicts), just slower per step — always better than refusing the render.
+                    # bf16-only, exactly as the top-of-function `if offload: quant = "none"` does:
+                    # the int4 fused kernels are prepared per-device and don't survive block hopping.
+                    # want_edge follows or the post-loop "tight VRAM — edge N" line would fire for a
+                    # mode that has no edge blocks at all, and the worker would be sent int4 + offload
+                    # together. pin_host / exclude_nodes are deliberately NOT relaxed: spilling to RAM
+                    # is a placement decision WITHIN a node, not permission to move the model to a
+                    # different one — the loop re-runs _place_filter with the same pin next pass.
+                    # Only with candidates left: when cand is empty, offload cannot help either and
+                    # the resident raise below names the real problem (no eligible GPU node).
+                    # Fires at most once per load — the `if offload:` branch above owns every later
+                    # pass, so the retry ends in a placement or that branch's raise, never a loop.
+                    _res_need = _est_gb(1 if quant != "none" else 0) + _MARGIN_GB
+                    log_activity(f"{_ollama_name(friendly)}: GPU-resident image model won't fit "
+                                 f"(~{_res_need:.1f} GB, nothing evictable) — falling back to bf16 "
+                                 f"RAM offload (~{_OFFLOAD_VRAM_GB:.0f} GB transient VRAM + "
+                                 f"~{all_b / GB + 6.0:.0f} GB RAM, never evicts)")
+                    offload, quant, want_edge = True, "none", 0
+                    _offload_fallback = True
+                    _refreshed = False       # let the offload pass get its own stats refresh
                     continue
                 _need = _est_gb(1 if quant != "none" else 0) + _MARGIN_GB
                 raise RuntimeError(

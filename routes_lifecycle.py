@@ -94,9 +94,11 @@ def register(app):
                 if "quant" not in _qkeys:
                     _q += f"&quant={ENGINE_CONFIG.get('autoload_quant') or 'int4'}"
                 if "ctx" not in _qkeys and not ctx:
-                    _actx = int(ENGINE_CONFIG.get("autoload_ctx") or 0)
-                    if _actx > 0:
-                        _q += f"&ctx={_actx}"
+                    # Forward our autoload_ctx EVEN WHEN IT IS 0. Now that an omitted ctx inherits
+                    # autoload_ctx locally too (below), "send nothing" no longer means "native" to
+                    # the peer — it means the PEER's autoload_ctx, which is exactly the gap this
+                    # block exists to close. An explicit ctx=0 is our default expressed literally.
+                    _q += f"&ctx={int(ENGINE_CONFIG.get('autoload_ctx') or 0)}"
                 _lbl = _pm.peer_label(_peer)
                 log_activity(f"load {model}: federating to {_lbl} ({_why})")
                 try:
@@ -114,7 +116,8 @@ def register(app):
         # restart fresh (the manual escape hatch for a wedged 0%-forever load) instead of queueing on
         # it. Also reloads an already-resident copy (skips the idempotent no-op). Without force, a
         # concurrent same-model request still queues on the in-flight load as before.
-        # ctx=0 (default) => the model's native training context (config.json).
+        # ctx: OMITTED => the fleet default `autoload_ctx` (see below); an EXPLICIT ctx=0 =>
+        # the model's native training context (config.json).
         # `mode` chooses HOW the model is placed (maps to consolidate, prefer_vram):
         #   auto       (T, T) GPU-VRAM-first, fewest nodes — best decode latency [default]
         #   single     (T, F) fewest nodes by total RAM+VRAM — collapses to one box if it fits
@@ -131,6 +134,16 @@ def register(app):
         # size — split every layer across `tp` GPU nodes (rank 0 drives the group over the
         # all-reduce mesh). tp>1 overrides mode. tp must divide num_key_value_heads.
         # Legacy: if mode is omitted but consolidate=false is passed, honor it.
+        # #auto-defaults: an OMITTED ctx inherits the fleet default (`autoload_ctx`, normally 8k)
+        # — the same rule the auto-load path (ensure_loaded) and the federation forward above
+        # already apply. Only a BARE `curl -X POST /load?model=X` was reaching the engine with
+        # ctx=0, which reserves full-ctx KV for the model's NATIVE window (128k+ on many models):
+        # a much fatter placement than the identical model loaded by a click or by a request that
+        # auto-loaded it. Absent-vs-explicit is read off the query string (not the 0 sentinel), so
+        # `ctx=0` still means "native training context" — the same test the federation branch uses.
+        if not ctx and "ctx" not in {kv.split("=", 1)[0]
+                                     for kv in str(request.url.query or "").split("&") if kv}:
+            ctx = int(ENGINE_CONFIG.get("autoload_ctx") or 0)
         # #load-default-quant: an UNSPECIFIED quant inherits the fleet default (`autoload_quant`,
         # normally int4) — NOT bf16. The old hardcoded "none" default silently loaded a full-size
         # bf16 copy for any caller that omitted quant (a 30B MoE -> ~57 GB that spilled to CPU and
@@ -689,10 +702,6 @@ def register(app):
                       or (_now - (m.last_used or 0)) < 600)
             if not in_use:
                 continue   # idle -> invalidation frees every stage; re-auto-loads on demand
-            if getattr(m, "replica_idx", 0):
-                log_activity(f"node-restart: replica {fr} not auto-recovered (re-add replicas "
-                             "manually)")
-                continue
             # Normalize the resident quant back into a /load-able tier (media models carry
             # display strings: 'int4-e2' -> int4, 'bf16-off' -> offload mode).
             q = m.quant or "none"
@@ -701,7 +710,15 @@ def register(app):
                 q, kw["t2i_offload"] = "none", True
             elif q.startswith("int4"):
                 q = "int4"
-            recover.append((fr, m.ctx, q, kw))
+            # #39 replicas: recover EVERY copy, not just #0. This used to `continue` on any
+            # replica_idx, so bouncing one node of a replicated model silently NARROWED its
+            # serving width — the dropped copy stayed gone (and with it a whole decode slot,
+            # since dispatch round-robins over resident replicas) until someone re-ran
+            # /load?replicas=N by hand. Carry the pair the reload needs: `base` is the
+            # user-facing name to load, `fr` is the REGISTRY key ("base#i" for i>=1) that the
+            # copy must come back under, else it re-registers as a plain reload of the base.
+            recover.append((fr, m.ctx, q, kw, (getattr(m, "base", "") or fr),
+                            int(getattr(m, "replica_idx", 0) or 0)))
         who = _client_ip(request)
         try:
             await link.send({"type": "restart"})
@@ -731,23 +748,51 @@ def register(app):
                 # treated as a live-model reload).
                 for _ in range(30):
                     await asyncio.sleep(1.0)
-                    if all(fr not in engine.models for fr, _c, _q, _k in recover):
+                    if all(r[0] not in engine.models for r in recover):
                         break
-                await engine._await_free_refresh()   # plan against post-drop free numbers
-                for fr, ctx, q, kw in recover:
-                    if fr in engine.models:      # never dropped (or already re-loaded) — done
-                        continue
-                    try:
-                        log_activity(f"node-restart recovery: {fr} was in use — re-placing it "
-                                     f"onto the available fleet (was on {nd.hostname})")
-                        await engine.load(fr, ctx, quant=q, **kw)
-                    except Exception as exc:
-                        log_activity(f"node-restart recovery: {fr} re-load FAILED ({exc!r}) — "
-                                     "it will auto-load on the next request instead")
+                # #39: hold the juggler's fleet-wide "one managed re-place at a time" lock for the
+                # WHOLE recovery — two hazards, one lock. (1) Copies of one model must live on
+                # DISJOINT nodes (a worker keys shards by model_id, so two copies of one target
+                # cannot share a node — the invariant replicate() maintains with exclude_nodes);
+                # the per-copy exclusion below is computed from the RESIDENT siblings, so a second
+                # recovery task (two nodes bounced back to back) computing its exclusions in the
+                # same window could plan two copies onto the same freed node. (2) A juggle /
+                # wedge-quarantine re-place landing mid-loop invalidates the free numbers
+                # _await_free_refresh just gathered. The loop itself is already sequential, so the
+                # lock is purely about those OTHER writers. It cannot stall the juggler: both its
+                # entry points test .locked() first and skip (the next sweep retries).
+                async with engine._juggle_lock:
+                    await engine._await_free_refresh()   # plan against post-drop free numbers
+                    for fr, ctx, q, kw, base, ridx in recover:
+                        if fr in engine.models:  # never dropped (or already re-loaded) — done
+                            continue
+                        # Siblings that are still resident (survivors, plus the copies this loop
+                        # already re-placed — each is resident by the time the next iteration
+                        # runs, which is why this is recomputed per copy rather than snapshotted).
+                        _sibs = [s for s in engine.replicas_of(base) if s.friendly != fr]
+                        _excl = {nid for s in _sibs for nid in s.stage_node_ids}
+                        try:
+                            log_activity(f"node-restart recovery: {fr} was in use — re-placing it "
+                                         f"onto the available fleet (was on {nd.hostname})"
+                                         + (f" — avoiding {len(_excl)} node(s) held by "
+                                            f"{len(_sibs)} sibling replica(s)" if _sibs else ""))
+                            if _sibs:
+                                # Same guard replicate() uses: without it the LRU can evict the
+                                # very sibling whose nodes we just excluded — net zero replicas,
+                                # and the re-place then has nowhere to land anyway.
+                                engine._no_evict_base = base
+                            await engine.load(base, ctx, quant=q, reg_key=fr, replica_idx=ridx,
+                                              exclude_nodes=(_excl or None), **kw)
+                        except Exception as exc:
+                            log_activity(f"node-restart recovery: {fr} re-load FAILED ({exc!r}) — "
+                                         "it will auto-load on the next request instead")
+                        finally:
+                            if _sibs:      # only clear the guard WE set (replicate() owns its own)
+                                engine._no_evict_base = None
             asyncio.create_task(_recover())
         return JSONResponse({"ok": True, "node": nd.hostname, "node_id": nd.node_id,
                              "requested_by": who, "models_affected": affected,
-                             "recovering": [fr for fr, _c, _q, _k in recover]})
+                             "recovering": [r[0] for r in recover]})
 
     @app.post("/update")
     async def update_endpoint(request: Request, workers: int = 0, force: bool = False,

@@ -610,6 +610,20 @@ class ShardBuildMixin:
             # Force eager for gpt_oss regardless of the requested `attn`. (gpt-oss's sliding-window
             # softmax layers still get the causal mask in shard_forward — they have no `.layer_type`
             # attr, so the hybrid mask-skip doesn't strip it; windowing exactness is a follow-up.)
+            # #gpt-oss-sliding — do NOT "fix" that approximation by stamping layer_type HERE. Checked
+            # against the live 20B config.json (om3nbox /api/show): gpt-oss DOES ship layer_types —
+            # 24 entries alternating sliding_attention/full_attention from layer 0, sliding_window 128
+            # — so _hybrid above is ALREADY True for it. Its decoder layers express that split as
+            # `.attention_type` (+ self_attn.sliding_window), not the `.layer_type` shard_forward's
+            # hybrid branch reads, which is exactly why every layer currently receives the plain causal
+            # mask. Stamping `layer_type = "sliding_attention"` would make that branch pass
+            # attention_mask=None for those layers — NO mask at all, i.e. a non-causal prefill — which
+            # is far worse than an over-wide window. The windowed mask (_causal_addmask(window=...))
+            # is reachable only under shard_forward's `_per_type` gate, and that gate sniffs Gemma-4's
+            # PER-TYPE rotary (hasattr(rotary, "<type>_inv_freq")); gpt-oss has one shared yarn rotary,
+            # so no stamp on this side can reach it. The fix belongs in shard_forward: a window gate
+            # independent of _per_type, dispatching per layer on self_attn.sliding_window (already the
+            # per-layer discriminator the _per_type branch uses).
             if str(getattr(self.cfg, "model_type", "")).lower() == "gpt_oss":
                 self.cfg._attn_implementation = attn = "eager"
             # transformers 5.x LlamaRotaryEmbedding reads cfg.rope_parameters["rope_type"] in __init__;

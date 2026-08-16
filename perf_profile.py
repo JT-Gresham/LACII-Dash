@@ -9,6 +9,15 @@ its reasoning printed into the load log.
 CONTRACT: the resolver only ever fills knobs the caller left UNSET. An explicit request always
 wins — this never overrides an operator.
 
+WHAT THE LOADER DOES WITH THE ANSWER. Resolving a knob is not the same as applying it. engine_load
+APPLIES only the ones that cannot change the model's OUTPUT and cannot make a working load worse —
+today kv_slots (section 3) and moe_offload (section 4), both pure placement. Everything else is
+ADVICE: it goes into the load log and into the dashboard's ⚡ button for the operator to accept.
+head_quant (4b), quant (1) and kv_quant (2) all move the logits and are therefore NEVER auto-applied
+however good the speed case looks; attn, prefix_min and cuda_graph have no per-load knob to apply
+them to. Anything added here should say which side of that line it falls on, and
+_perf_auto_knobs' docstring in engine_load.py carries the reason per knob.
+
 Everything below is grounded in measurements from the 2026-08-13 performance investigation or in
 prior vault findings, and each rule carries its evidence. Rules asserted without evidence were
 deliberately left out: three plausible-sounding optimizations (CUDA graphs, lm_head int8 on CUDA,
@@ -217,6 +226,13 @@ def resolve(*,
                  f"a 2nd slot would force layers to CPU, which costs far more than a prefix miss")
 
     # ---- 4. MoE expert offload ------------------------------------------------------------
+    # APPLIED by engine_load (the TRUE direction only). Safe to apply because it is placement, not
+    # arithmetic: shard_build reads the flag ONLY on the spill path, so it is inert for a shard that
+    # fits VRAM whole, and on a shard that does not fit it converts "whole MoE layer -> CPU" into
+    # "attention+norms on GPU, routed experts in RAM" (falling back to the whole layer if even the
+    # mixer misses the budget). Output is bit-identical either way. That inertness is what makes a
+    # false positive harmless: this sizes against ONE node's free VRAM while the pipeline planner
+    # may spread the model over several, so `not fits` is a "may spill", not a "will spill".
     if is_moe:
         fits = (weights_gb + slots * kv_per_slot_gb) <= budget_gb * 0.95
         take("moe_offload", not fits,
