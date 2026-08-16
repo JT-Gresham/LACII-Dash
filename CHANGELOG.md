@@ -4,7 +4,44 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — MoE finally has a tier above int4 (server 0.3.20 / client 0.3.27)
+## 2026-08-17 (latest) — two silent-corruption P0s, found by auditing this session's own work (0.3.21 / 0.3.28)
+
+### Fixed
+
+- **int8 quantized a MoE's router/gate; int4 and int2 skip it.** The "router always stays bf16"
+  invariant (`docs/ACCELERATION.md`) was implemented as a **per-tier copy**, and int8's copy never
+  had it. Quantizing a router corrupts top-k **expert selection** — the `#bare-linear-router`
+  failure mode (`4dc57e6`): loads clean, answers once correctly, then degenerates.
+
+  It was latent only because `routes_lifecycle` downgraded int8-on-MoE to int4. **Removing that
+  downgrade earlier in this same session made it live** — the int8 MoE load demonstrated as a
+  success an hour earlier was very likely running a quantized router.
+
+  Fixed by collapsing three per-tier walks into one shared `_quantize_linears_` carrying the
+  exclusion **once**, so a fourth tier cannot reintroduce the hole. Verified live: after the fix
+  the worker reports `48x (128, 2048) torch.bfloat16` for the router while experts stay int8.
+
+- **`_kv_layer_mask` reserved ZERO KV bytes for every sliding-window layer.** It read "not
+  full_attention" as "holds no K/V", which is true only of *linear* attention. A `sliding_attention`
+  layer is ordinary softmax with a **bounded** K/V. gpt-oss (12 of 24 layers) and **Gemma-4 (20 of
+  24)** were funded at literally zero bytes — a silent under-reservation, and it desynchronised the
+  worker from a controller that sizes KV for every layer.
+
+- A gpt-oss compile guard that could never fire (it tested MXFP4 on a directory normalized to bf16
+  at add time); `_is_tied` serving the embedding matrix as the LM head for quantized-head
+  checkpoints; a refused/failed self-update still calling `os._exit(42)` after the route returned
+  `ok`; `#restart-stale` invalidating a co-hosted worker's healthy models; node-restart recovery
+  dropping `kv_slots`/`head_quant`/`tp`.
+
+### A test had to be corrected, not merely added
+
+`scratch_moe_int8_pack_test` asserted `2D router gate -> QuantLinear` — it encoded the **defect** as
+the expected result and would have passed forever while routing was corrupted. A test that asserts
+current behaviour proves nothing about whether that behaviour is right. The decisive new assertion
+is **tier parity**: the skipped set must be identical across int4/int8/int2 and equal exactly the
+routers.
+
+## 2026-08-17 — MoE finally has a tier above int4 (server 0.3.20 / client 0.3.27)
 
 ### Added
 
