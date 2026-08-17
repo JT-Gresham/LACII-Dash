@@ -782,7 +782,13 @@ class ShardBuildMixin:
         # PRE-PACKED (Packed4Tensor3D buffers), so there is no per-expert /experts streaming and no
         # fuse/quant — the cached install builds every holder directly. Force the streaming-expert
         # paths off so _quant_after never runs (the install dispatcher below skips it for cache).
-        use_cache = (cache == quant and quant in ("int4", "int2"))
+        # int8 joins int4/int2 here (#moe-int8 follow-up): shard_compile has packed an int8 cache all
+        # along (pack_linear_int8 == worker_quant._pack8_expert, plus the int8-only lm_head), but the
+        # serve side refused it, so an int8 compile was write-only — hours of CPU and tens of GB that
+        # every load then ignored and re-quantized. Only DENSE int8 can arrive: compile_shards still
+        # refuses int8 MoE (no 3D int8 branch in pack_unit_tensors), and _install_cached's 3D branch
+        # refuses a 3D tensor in a non-int4 cache regardless.
+        use_cache = (cache == quant and quant in ("int4", "int2", "int8"))
         if use_cache:
             stream_experts = stream_experts_nf = False
         # TP-v2: rebuild every layer's linears as REDUCED-DIM modules (still meta) BEFORE streaming
@@ -887,11 +893,11 @@ class ShardBuildMixin:
 
         def _install_cached(src, kind, li) -> None:
             # SERVE-FROM-CACHE install (#shard-cache Inc 2). The controller streamed this unit's tensors
-            # ALREADY int4-packed (bit-identical to load-time quant), so build the resident holders
+            # ALREADY packed at `quant` (bit-identical to load-time quant), so build the resident holders
             # DIRECTLY and skip the ~4x bf16 stream + the per-layer quant/fuse entirely:
-            #   * '<lin>.weight.{qweight,scale,zero}' (2D)  -> QuantLinear4 in place of the meta nn.Linear
-            #   * '<experts>.{gate_up,down}_proj.{qweight,scale,zero}' (3D) -> Packed4Tensor3D Parameter
-            #   * everything else (norms / biases / embed / head) is bf16 passthrough -> load_state_dict.
+            #   * '<lin>.weight.{qweight,scale[,zero]}' (2D) -> QuantLinear{4,2,8} in place of the meta nn.Linear
+            #   * '<experts>.{gate_up,down}_proj.{qweight,scale,zero}' (3D) -> Packed4Tensor3D Parameter (int4 only)
+            #   * everything else (norms / biases / embed / bf16 head) is bf16 passthrough -> load_state_dict.
             # in_features comes from the meta module we replace (the cache stores padded widths only), so
             # NO manifest is needed on the worker. NEVER call _fuse_moe_experts / _quantize_* here. The
             # post-loop meta-guard catches any tensor we failed to materialize.
@@ -899,10 +905,22 @@ class ShardBuildMixin:
             # #int2: the packed-tensor SHAPE is quant-ambiguous (both tiers ship qweight/scale/zero),
             # so the holder class + group come from the LOAD's quant — use_cache already guarantees
             # cache dir == quant, and both packers are bit-identical to their load-time twins.
-            QL = _quant2_linear_cls() if quant == "int2" else _quant4_linear_cls()
+            # #int8: NOT in client.py's worker_quant back-import set, so take it off the module.
+            from worker_quant import _quant_linear_cls   # int8 weight-only QuantLinear
+            QL = (_quant_linear_cls() if quant == "int8" else
+                  _quant2_linear_cls() if quant == "int2" else _quant4_linear_cls())
             PT = _packed4_3d_cls()
             G = _INT2_GROUP if quant == "int2" else _INT4_GROUP
-            packed: dict = {}      # base -> {'q':qweight, 's':scale, 'z':zero}
+            # THE int8 DIFFERENCE, and the one thing that must not be got wrong: int8 is a
+            # per-output-ROW SYMMETRIC pack (w = q * scale, scale [out,1], no group), so
+            # pack_linear_int8 emits qweight+scale and NO '.zero' at all. int4/int2 are group-wise
+            # ASYMMETRIC (w = (q - zero) * scale) and their holders REQUIRE it. Demanding a zero here
+            # would reject every int8 unit; supplying a fabricated one (or reusing the int4 holder,
+            # which subtracts it) would shift EVERY weight by zero*scale — a load that succeeds and
+            # generates quietly-wrong tokens. So the tier decides, and a zero appearing in an int8
+            # cache is itself refused: it can only mean the unit was packed by something else.
+            need_zero = quant != "int8"
+            packed: dict = {}      # base -> {'q':qweight, 's':scale, 'z':zero} ('z' absent at int8)
             plain: dict = {}       # bf16 passthrough keys
             for k, v in sd.items():
                 if k.endswith(".qweight"):
@@ -916,6 +934,8 @@ class ShardBuildMixin:
 
             def _nav(path):
                 parent = model
+                if not path:
+                    return parent          # top-level attr (int8's 'lm_head') -> '' would getattr('')
                 for p in path.split("."):
                     parent = parent[int(p)] if p.isdigit() else getattr(parent, p)
                 return parent
@@ -923,10 +943,14 @@ class ShardBuildMixin:
             eager_cfgs: set = set()
             for base, tr in packed.items():
                 qw, sc, ze = tr.get("q"), tr.get("s"), tr.get("z")
-                if qw is None or sc is None or ze is None:
+                if qw is None or sc is None or (need_zero and ze is None):
                     raise RuntimeError(f"cache: incomplete packed tensor {base!r} (have {sorted(tr)})")
+                if not need_zero and ze is not None:
+                    raise RuntimeError(f"cache: packed tensor {base!r} carries a zero point in an "
+                                       "int8 cache — the int8 pack is symmetric (w = q*scale) and "
+                                       "never emits one; refusing to serve a foreign pack")
                 if qw.dim() == 3:                      # fused 3D MoE experts -> Packed4Tensor3D
-                    if quant != "int4":                # int2 cache is dense-only; never guess a holder
+                    if quant != "int4":                # int2/int8 caches are dense-only; never guess a holder
                         raise RuntimeError(f"cache: 3D expert tensor {base!r} in a {quant} cache — "
                                            "only int4 has a 3D-expert format; refusing")
                     ppath, _, attr = base.rpartition(".")
@@ -958,7 +982,19 @@ class ShardBuildMixin:
                     in_f = int(metalin.in_features)
                     bp = plain.pop(mod_path + ".bias", None)   # this Linear's bf16 bias, if any
                     bias = (torch.nn.Parameter(bp, requires_grad=False) if bp is not None else None)
-                    setattr(parent, attr, QL(qw, sc, ze, bias, in_f, G))
+                    if quant == "int8":
+                        # QuantLinear(qweight, scale, bias): no zero, no group, and no in_features
+                        # (the int8 pack is unpadded, so qw is already [out, in]).
+                        setattr(parent, attr, QL(qw, sc, bias))
+                    else:
+                        setattr(parent, attr, QL(qw, sc, ze, bias, in_f, G))
+                    if self.head is not None and metalin is self.head:
+                        # int8 is the ONE tier that quantizes lm_head (see _quant_after's head
+                        # branch, and pack_unit_tensors' is_int8_head), and doing so REPLACES the
+                        # module — self.head would still point at the discarded meta nn.Linear, which
+                        # _place_modules moves and the forward calls. int4/int2 leave the head bf16,
+                        # so this line only ever fires for int8.
+                        self.head = getattr(parent, attr)
                     self.loaded_params += int(qw.shape[0]) * in_f
             if plain:                                  # bf16 passthrough: norms / embed / head / leftover
                 try:

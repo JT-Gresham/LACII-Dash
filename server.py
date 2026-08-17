@@ -66,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.22"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.23"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -666,6 +666,25 @@ def save_deleted_models() -> None:
 # Node registry
 # ---------------------------------------------------------------------------
 
+def _parse_compute_cap(raw) -> Optional[tuple]:
+    """#sm-probe: normalize a worker-reported CUDA compute capability to (major, minor).
+
+    The worker sends it as a JSON list [major, minor] (JSON has no tuples) and OMITS the key
+    entirely when it does not know one — a CPU worker, a ROCm worker (torch there returns the
+    gfx arch pair, which is not an SM version), or any worker built before the field existed.
+    Everything that is not a usable pair of ints therefore collapses to None, and None means
+    UNKNOWN: perf_profile.classify_device() answers CUDA_MODERN for it, which is the safe
+    default. Absent must never be read as "old" — mislabelling a current card CUDA_LEGACY would
+    hand the resolver a slower profile for a card that has nothing wrong with it."""
+    try:
+        if raw is None:
+            return None
+        major, minor = int(raw[0]), int(raw[1])
+    except Exception:
+        return None
+    return (major, minor)
+
+
 @dataclass
 class Node:
     node_id: str
@@ -730,6 +749,19 @@ class Node:
     # pre-feature worker is never displayed as missing a toolchain nobody asked it about.
     has_triton: bool = True
     has_cc: bool = True
+    # #sm-probe: the CUDA compute capability the worker reported, as a (major, minor) tuple —
+    # the third leg of "can this node reach a fused int4 kernel" beside has_triton/has_cc.
+    # worker_quant gates the torch tinygemm int4 path on get_device_capability() >= (8, 0)
+    # (worker_quant.py ~727); a pre-Ampere card fails it and every int4 linear falls to the
+    # naive path that rematerializes the whole bf16 weight per forward — so there int4 is a
+    # MEMORY tier and never a speed tier, which is what perf_profile's CUDA_LEGACY says.
+    # Carried here because that class is otherwise UNREACHABLE: classify_device() only returns
+    # it when it is handed a capability, and nothing reached a Node before this field existed.
+    # None = UNKNOWN, never "old": absent from a pre-#sm-probe worker, from a CPU worker, and
+    # deliberately from ROCm (torch there returns the gfx arch pair, not an SM version), and in
+    # every one of those cases the resolver must keep its "assume modern" default rather than
+    # slander the card as legacy. Not a placement input and not a can_infer gate.
+    compute_cap: Optional[tuple] = None
     can_t2music: bool = False   # #t2music-serve: MusicGen (transformers+soundfile; = can_stt)
     # #wire-caps: wire-protocol capability set the worker advertised at registration (e.g.
     # {"ntensor"}). EMPTY for old workers that sent no 'caps' field — every capability-gated
@@ -855,6 +887,9 @@ class Node:
             "can_t2music": self.can_t2music, "has_einops": self.has_einops,
             # #cc-probe: fused-quant-kernel buildability (triton + its C toolchain)
             "has_triton": self.has_triton, "has_cc": self.has_cc,
+            # #sm-probe: [major, minor] CUDA compute capability, or null when unknown (old
+            # worker / CPU node / ROCm) — null reads as "assume modern", not as legacy.
+            "compute_cap": list(self.compute_cap) if self.compute_cap else None,
             "caps": sorted(self.caps),   # #wire-caps: advertised wire capabilities (/status)
             "vram_total_gb": round(self.vram_total_gb, 2),
             "vram_used_gb": round(self.vram_used_gb, 2),
@@ -906,6 +941,14 @@ class Registry:
                 has_einops=bool(reg.get("has_einops", True)),   # #einops-probe (absent -> assume OK)
                 has_triton=bool(reg.get("has_triton", True)),   # #cc-probe (absent -> assume OK)
                 has_cc=bool(reg.get("has_cc", True)),
+                # #sm-probe: carry the worker's CUDA compute capability through. Registration is
+                # whitelist-parsed (every field via reg.get), so a key nobody reads here is a key
+                # that never reaches a Node — which is exactly why perf_profile's CUDA_LEGACY was
+                # unreachable while the worker was already reporting the number. Arrives as
+                # [major, minor] (JSON has no tuples); anything absent, short, or non-numeric
+                # normalizes to None = UNKNOWN, and unknown must land on the resolver's "assume
+                # modern" default. Absent NEVER means old.
+                compute_cap=_parse_compute_cap(reg.get("compute_cap")),
                 # #wire-caps: record the worker's advertised wire capabilities. Absent/unknown
                 # field (old worker) -> empty frozenset -> every gated wire feature stays off.
                 caps=frozenset(str(c) for c in (reg.get("caps") or [])),

@@ -376,14 +376,42 @@ def _quantize_linear(lin):
     return QL(qW, scale.to(W.dtype), lin.bias)
 
 
-def _quantize_int8_(module) -> None:
-    """Recursively replace every nn.Linear under `module` with a QuantLinear."""
+def _quantize_linears_(module, convert) -> None:
+    """Recursively replace every nn.Linear under `module` with `convert(lin)` — EXCEPT a MoE's
+    router/gate, which EVERY quant tier leaves bf16.
+
+    ONE walk for int8/int4/int2 deliberately. The exclusion used to be written out per tier and
+    the int8 copy simply did not have it: `_quantize_int8_` quantized routers while
+    `_quantize_int4_`/`_quantize_int2_` skipped them, with a comment saying why. A per-tier copy
+    of a rule that must never drift IS the bug, so there is now nothing here to keep in sync.
+
+    Quantizing a router corrupts top-k EXPERT SELECTION, and it does not crash — it degenerates
+    generation into repetition loops. shard_compile._quant_scope, which decides what the shard
+    CACHE packs, is tier-agnostic and already excluded the router, so int8's cold load was also
+    diverging from its own cache scope.
+
+    Exclusion shape: child CLASS ending Router/Gate — skip the whole subtree (gemma4's
+    Gemma4TextRouter exposes `proj` as a plain nn.Linear; custom routers hold a raw weight
+    Parameter with no inner Linear). This MATCHES `_quant_scope._under_router` in this tree
+    exactly, which is what keeps a cold load bit-identical to the serve-from-cache install.
+
+    The lm_head is NOT in scope: callers hand this a decoder layer, and int8's head quant (which
+    int4/int2 deliberately skip) is a separate explicit call at the call sites."""
     from torch import nn
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
-            setattr(module, name, _quantize_linear(child))
+            setattr(module, name, convert(child))
+        elif type(child).__name__.endswith(("Router", "Gate")):
+            continue       # leave router/gate projections bf16 (precision-sensitive routing)
         else:
-            _quantize_int8_(child)
+            _quantize_linears_(child, convert)
+
+
+def _quantize_int8_(module) -> None:
+    """Recursively replace every nn.Linear under `module` with a QuantLinear — router/gate
+    EXCLUDED, same set and same reasoning as int4/int2, via the shared `_quantize_linears_` walk.
+    This function used to carry its own copy of the walk WITHOUT the exclusion."""
+    _quantize_linears_(module, _quantize_linear)
 
 
 # ---------------------------------------------------------------------------
@@ -1121,15 +1149,10 @@ def _quantize_int4_(module) -> None:
     router/gate module. int4 on a router gate corrupts the top-k expert selection -> garbage
     (gemma4's Gemma4TextRouter exposes `proj` as a plain nn.Linear; custom routers hold a raw weight
     Parameter so they had no inner Linear to skip). Mirrors the cache packer's `_quant_scope`
-    exclusion so a cold load stays bit-identical to the serve-from-cache install."""
-    from torch import nn
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear):
-            setattr(module, name, _quantize_linear4(child))
-        elif type(child).__name__.endswith(("Router", "Gate")):
-            continue   # leave router/gate projections bf16 (precision-sensitive routing)
-        else:
-            _quantize_int4_(child)
+    exclusion so a cold load stays bit-identical to the serve-from-cache install. The walk itself
+    is `_quantize_linears_`, shared with int8/int2 — the exclusion lived here as a per-tier copy
+    and int8's copy was missing it."""
+    _quantize_linears_(module, _quantize_linear4)
 
 
 # --- int2: 2-bit weight-only quant (#int2) ---------------------------------------------------
@@ -1449,15 +1472,9 @@ def _quantize_int2_(module) -> None:
     """Recursively replace every nn.Linear under `module` with a QuantLinear2 — EXCEPT inside a
     router/gate module (same exclusion as _quantize_int4_: 2-bit on a router gate corrupts the
     top-k expert selection even worse than 4-bit). Mirrors the cache packer's `_quant_scope`
-    exclusion so a cold load stays bit-identical to the serve-from-cache install."""
-    from torch import nn
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear):
-            setattr(module, name, _quantize_linear2(child))
-        elif type(child).__name__.endswith(("Router", "Gate")):
-            continue   # leave router/gate projections bf16 (precision-sensitive routing)
-        else:
-            _quantize_int2_(child)
+    exclusion so a cold load stays bit-identical to the serve-from-cache install. Shares the
+    `_quantize_linears_` walk with int4/int8 so all three tiers exclude the SAME set."""
+    _quantize_linears_(module, _quantize_linear2)
 
 
 # --- int4 for FUSED MoE experts (3D gate_up_proj/down_proj nn.Parameters) -------------------

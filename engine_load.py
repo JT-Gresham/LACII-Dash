@@ -403,10 +403,26 @@ class EngineLoadMixin:
         # #unified-mem clamp uses (placement.is_unified_mem_node, incl. a node's explicit
         # `unified_mem` flag), so the resolver and the budgeter can never disagree about a node;
         # it returns False when placement.py is too old to answer, which keeps the old behavior.
+        # #sm-probe: pass the node's CUDA compute capability too — it is the ONLY input that makes
+        # CUDA_LEGACY reachable, and this is the path that matters. A pre-Ampere card fails
+        # worker_quant's `get_device_capability() >= (8, 0)` gate, so int4 there falls to the naive
+        # path that rematerializes the whole bf16 weight per forward (a memory tier, never a speed
+        # tier) — exactly what CUDA_LEGACY exists to say. Omitting it meant that even once the
+        # worker started reporting the field, every CUDA node still classified as modern HERE while
+        # /optimize_knobs' dry run (routes_dashboard) already knew better. Normalized the same way
+        # that call site does: registry.add stores (major, minor) or None, and anything else must
+        # collapse to None = UNKNOWN, which classify_device answers CUDA_MODERN for. Absent must
+        # never read as "legacy" — that would hand a current card the slower profile.
+        _cc = getattr(best, "compute_cap", None)
+        try:
+            _cap = (int(_cc[0]), int(_cc[1])) if _cc and len(_cc) >= 2 else None
+        except Exception:
+            _cap = None
         dev = _pp.classify_device(
             has_gpu=True,
             is_hip="amd" in (getattr(best, "device_name", "") or "").lower()
                    or "radeon" in (getattr(best, "device_name", "") or "").lower(),
+            capability=_cap,
             unified_memory=self._is_unified_node(best))
         # Tell the resolver what the caller ALREADY chose so it defers instead of "deciding" a knob
         # that is not actually free — its contract is fill-if-unset. ONLY genuinely-set values go in:
@@ -3997,11 +4013,19 @@ class EngineLoadMixin:
             up = self._upgrade_for(m)
             if up is None:
                 return {"ok": False, "error": "no faster placement is available right now"}
-            # snapshot FULL config so the swap is config-neutral (bare reconfigure would silently drop
-            # kv_quant / kv_offload / sampling defaults); a kv_quant of 'none' maps to load()'s '' default.
+            # snapshot FULL config so the swap is config-neutral (bare reconfigure would silently
+            # drop kv_quant / kv_offload / sampling defaults). kv_quant carries the model's RESOLVED
+            # value verbatim, an explicit 'none' INCLUDED: load() reads an EMPTY kv_quant as "inherit
+            # ENGINE_CONFIG['kv_quant']", so the old 'none' -> '' mapping re-placed the model with
+            # whatever the fleet default is NOW — a model deliberately serving an unquantized KV
+            # cache came back turbo-N if someone changed the global since its load, which is a
+            # different cache and different output for an operation that promises to change only
+            # placement. 'none' is exactly the string load() normalizes to, so nothing else moves.
+            # (The restart-recovery twin in routes_lifecycle already says 'none' out loud for this
+            # same reason; the two snapshots now agree.)
             _kvq = getattr(m, "kv_quant", "none") or "none"
             snap = dict(ctx=m.ctx, quant=(m.quant or "none"), tp=getattr(m, "tp_size", 1),
-                        kv_quant=(_kvq if _kvq != "none" else ""),
+                        kv_quant=_kvq,
                         kv_offload=bool(getattr(m, "kv_offload", False)),
                         kv_slots=max(1, int(getattr(m, "kv_slots", 1) or 1)),   # #kv-slots kept
                         default_temp=getattr(m, "default_temperature", None),
