@@ -94,6 +94,29 @@ elif "placement_enabled" not in _pf.group(0):
     failures.append("engine_load.py: _place_filter no longer applies placement_enabled — every "
                     "media leaf lost the opt-out rule with it (they do not check it themselves)")
 
+# --------------------------------- 2c. the two paths a dispatch backstop CANNOT protect
+# _node_live_free_vram_gb is the documented single source of truth for placeable VRAM, and
+# _juggle_would_fit_vram / _plan_vram_first pair it with eff_ram_gb and NOTHING else — so if it
+# reports raw free VRAM, a both-tiers-off node offers capacity and can win a VRAM-first re-place.
+_lf = re.search(r"def _node_live_free_vram_gb\(.*?(?=\n    def )", _src("engine_load.py"), re.S)
+if _lf is None:
+    failures.append("engine_load.py: _node_live_free_vram_gb is gone — the juggler and "
+                    "#load-faster re-place budget against it alone")
+elif "vram_enabled" not in _lf.group(0):
+    failures.append("engine_load.py: _node_live_free_vram_gb no longer zeroes a disabled VRAM "
+                    "tier — the #juggler and #load-faster re-place can promote onto an "
+                    "opted-out node again")
+
+# _embed_candidates validates BEFORE the destructive unload and selects AFTER it. A rejection it
+# does not know about becomes a refusal that fires once the resident copy is already destroyed.
+_ec = re.search(r"def _embed_candidates\(.*?(?=\n    def )", _src("engine_load.py"), re.S)
+if _ec is None:
+    failures.append("engine_load.py: _embed_candidates is gone")
+elif "placement_enabled" not in _ec.group(0):
+    failures.append("engine_load.py: _embed_candidates does not apply placement_enabled — the "
+                    "opt-out would then be enforced only at dispatch, i.e. AFTER "
+                    "_load_embedding_locked has already unloaded the resident model")
+
 # ---------------------------------------------------------------- 3. every load dispatch is gated
 # Each load in engine_load.py sends {"type": "load", ...} on a link. That link must come from
 # _load_link (which checks the opt-out), never from a bare links.get.

@@ -4,7 +4,7 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — a disabled node still got work, and a refusal blamed the wrong resource (0.3.27 / 0.3.31)
+## 2026-08-17 (latest) — a disabled node still got work, and a refusal blamed the wrong resource (0.3.28 / 0.3.31)
 
 ### Fixed
 
@@ -53,6 +53,27 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   is what the "collapse to one helper" was supposed to mean in the first place: `_place_filter` is
   the sole applier for the media paths, and the parity test gained an assertion that it still
   applies the rule, since dropping that one call would now silently disarm all five leaves at once.
+
+- **The juggler and the `#load-faster` ⬆ re-place could still promote onto an opted-out node.**
+  Found by a 110-agent adversarial sweep of every controller→node dispatch and candidate-selection
+  site, run because a missed path is the whole failure mode here. `_node_live_free_vram_gb` is the
+  documented *single source of truth* for placeable VRAM and reads the heartbeat's raw
+  `vram_total - vram_used` — deliberately **not** `usable_vram_gb`, so that freed VRAM actually
+  moves the number. It never consulted `vram_enabled`. The load planner survives that because it
+  takes `min(tracked, live)` and its tracked side is tier-aware, but `_juggle_would_fit_vram` and
+  `_plan_vram_first` pair this figure with `eff_ram_gb` and nothing else: on a both-tiers-off node
+  that yielded `ram=0.0` correctly and `fv=`*live free VRAM* incorrectly, so the node still offered
+  capacity. Fixed in the helper (0.0 when the VRAM tier is off) rather than at the two callers —
+  the other two callers were already tier-filtered and are unaffected.
+
+- **The opt-out refusal could fire *after* the embedding path destroyed the resident model.**
+  `_load_embedding_locked` validates, then unloads the resident, then selects, then dispatches —
+  and `_embed_candidates` exists precisely so the pre-unload validation and post-unload selection
+  cannot disagree. Enforcing the opt-out only at the dispatch added a rejection reason that the
+  validator did not know, so pinning an embedding reload at an opted-out node would have passed
+  validation, destroyed the working copy, and *then* refused. The check now lives in
+  `_embed_candidates`, so it fails before anything is torn down. Both this and the item above are
+  asserted by the parity test, which cannot be satisfied by a dispatch-side guard alone.
 
 - **An ACE-Step refusal named VRAM when RAM was the constraint.** The RAM-offload recipe has *two*
   independent budgets — transient VRAM for the DiT hop, and system RAM for the resting weights —

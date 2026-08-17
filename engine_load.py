@@ -2040,19 +2040,34 @@ class EngineLoadMixin:
 
         Factored out so the PRE-UNLOAD validation and the POST-UNLOAD selection cannot drift apart —
         they must agree, or a load can pass validation and then fail to find a node after it has
-        already destroyed the resident copy."""
-        alive = [n for n in registry.alive_sorted() if n.can_infer]
+        already destroyed the resident copy.
+
+        #node-optout: that hazard is why the opt-out is enforced HERE and not left to _load_link.
+        The embedding path is the one load that validates, then unloads the resident, then selects
+        (see _load_embedding_locked: validate -> _unload_model_locked -> select -> dispatch). A
+        refusal that lives only at the dispatch is a refusal that fires AFTER the resident copy has
+        been destroyed — the caller loses a working model and gets an error, which is strictly worse
+        than never having tried. Every new rejection criterion must be taught to this function, or
+        it re-opens the exact gap the function exists to close."""
+        alive = [n for n in registry.alive_sorted() if n.can_infer and n.placement_enabled]
         if not alive:
-            raise RuntimeError("no capable worker nodes connected for the embedding model")
+            raise RuntimeError("no capable worker nodes connected for the embedding model "
+                               "(all missing inference deps, or opted out with both memory tiers "
+                               "disabled in the node config)")
         cands = [n for n in alive if not _peer_claimed_host(n.hostname)]
         if exclude_nodes:
             cands = [n for n in cands if n.node_id not in exclude_nodes]
         if pin_host:
             _pinned = [n for n in cands if n.hostname == pin_host]
             if not _pinned:
+                _off = any(x.hostname == pin_host and not x.placement_enabled
+                           for x in registry.alive_sorted())
+                _why = (f" — it has BOTH memory tiers disabled in the node config, so it is opted "
+                        f"out of placement entirely" if _off else "")
                 raise RuntimeError(
                     f"embedding model pinned to '{pin_host}', which is not an available "
-                    f"inference node (candidates: {', '.join(n.hostname for n in cands) or 'none'})")
+                    f"inference node (candidates: {', '.join(n.hostname for n in cands) or 'none'})"
+                    f"{_why}")
             cands = _pinned
         if not cands:
             raise RuntimeError("no capable worker node available for the embedding model after "
@@ -3803,7 +3818,20 @@ class EngineLoadMixin:
         and never moves when VRAM frees — using it silently pinned the juggler's fit-check and its
         anti-churn guard to a value that could never change, so a hybrid model never relocated even
         after a co-resident unloaded and freed the GPU. Both the load planner (below) and the
-        juggler budget against THIS number so they can never disagree again."""
+        juggler budget against THIS number so they can never disagree again.
+
+        #node-optout: VRAM the operator switched off is not placeable VRAM, so this answers 0.0 for
+        a node with its VRAM tier disabled. It has to be enforced HERE rather than at each caller,
+        because this is the one number two of them use ALONE. The load planner takes
+        min(tracked, live) and its tracked side is `usable_vram - committed`, which is already
+        tier-aware — but `_juggle_would_fit_vram` and `_plan_vram_first` (the #juggler promotion and
+        the #load-faster ⬆ re-place) pair this raw figure with `eff_ram_gb` and nothing else. On a
+        both-tiers-off node that gave `ram=0.0` correctly and `fv=live free VRAM` incorrectly, so
+        the node still offered capacity and could win a VRAM-first re-place onto hardware the
+        operator had withdrawn. The other two callers are unaffected: `_perf_auto_knobs` pre-filters
+        on `eff_vram_gb > 0`, and the planner's min() was already pinned to 0 by its tracked side."""
+        if not n.vram_enabled:
+            return 0.0
         rv = (res_vram.get(n.node_id, 0) if res_vram else 0)
         return max(0.0, n.vram_total_gb - n.vram_used_gb
                    + getattr(n, "vram_reusable_gb", 0.0)
