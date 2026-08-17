@@ -226,9 +226,21 @@ def register(app):
         on_gpu = bool(gpu_c)
         free_v = engine._node_live_free_vram_gb(best) if on_gpu else 0.0
         _dn = (getattr(best, "device_name", "") or "").lower()
+        # #sm-probe: the capability is what makes CUDA_LEGACY reachable — without it every CUDA
+        # node classifies as modern and the resolver cannot warn that a pre-Ampere card fails
+        # worker_quant's >=(8,0) gate (int4 there rematerializes the full bf16 weight per forward).
+        # The worker now reports it at registration as [major, minor]; normalize back to a 2-tuple
+        # of ints because JSON has no tuples, and fall back to None on anything unexpected — a
+        # missing or malformed value must land on the resolver's "assume modern" default rather
+        # than mislabel a card as legacy or raise inside the comparison.
+        _cc = getattr(best, "compute_cap", None)
+        try:
+            _cap = (int(_cc[0]), int(_cc[1])) if _cc and len(_cc) >= 2 else None
+        except Exception:
+            _cap = None
         dev = _pp.classify_device(has_gpu=on_gpu,
                                   is_hip=("amd" in _dn or "radeon" in _dn),
-                                  capability=getattr(best, "compute_cap", None),
+                                  capability=_cap,
                                   unified_memory=False)
         _lt = getattr(spec, "layer_types", None)
         knobs, why = _pp.resolve(
@@ -250,6 +262,9 @@ def register(app):
         return JSONResponse({"ok": True, "friendly": friendly, "ctx": int(ctx),
                              "node": best.hostname, "device_class": dev,
                              "device_name": getattr(best, "device_name", "") or "cpu",
+                             # #sm-probe: report the capability the class was decided from — null
+                             # means the node never sent one, which is why it reads as modern.
+                             "compute_cap": list(_cap) if _cap else None,
                              "free_vram_gb": round(free_v, 2), "knobs": knobs, "why": why})
 
     @app.get("/plan")

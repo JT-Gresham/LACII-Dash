@@ -178,6 +178,87 @@ def pack_linear_int8(W):
     return qW, scale.to(W.dtype)
 
 
+def _refuse_unpackable(raw: dict, lin2d, exp3d, quant: str) -> None:
+    """Refuse, AT THE PACKER, any unit whose pack would NOT equal the worker's cold load.
+
+    `compile_shards` is not the only way in. THREE callers reach `pack_unit_tensors` directly and
+    run none of compile_shards' guards — /pack_probe's reference pack and /compile_dist's
+    local-fallback pack (routes_shards.py), and the worker's remote-pack handler
+    (worker_load.handle_pack, which packs with whatever `quant` the control frame carries). A
+    refusal that lives only at the compile entry point therefore protects only one of four paths,
+    which is why the gpt-oss in-major guard was moved down here already (`_in_major_expert_names`).
+    This is the rest of that move: everything compile_shards refuses that is decidable from the
+    unit itself now refuses here too, so a distributed compile cannot write a cache the local
+    compile would have rejected.
+
+    Decidable HERE (all four paths covered):
+      * unknown `quant`. The 2D branch's `else` is int8, so ANY unrecognized tier silently packed
+        int8 while the manifest stamped `_packer_tag(<that tier>)` — a cache labelled with a tier
+        whose math it does not contain.
+      * int2. `compile_shards` routes int2 to `gptq_pack.compile_int2_gptq` BEFORE any unit is
+        packed, so `pack_linear_int2` is only ever the WIRE FORMAT gptq_pack emits into, never the
+        artifact. A caller arriving here with quant='int2' gets plain RTN crumbs stamped
+        `v2-g64-int2-gptq` — a tag that asserts calibration — and int2 caches ARE served, so it
+        would verify clean and generate token salad. This is the one bypass in the set that both
+        corrupts and survives every check.
+      * fused 3D MoE experts at a non-int4 tier. There is no 3D branch outside int4 below, so the
+        experts (~90% of a big MoE) would fall through to bf16 passthrough while the cold load
+        quantizes them. See compile_shards' MoE guard for the per-tier detail.
+      * per-expert MoE weights that are neither fused away nor in the quantized scope. After
+        `_fuse_moe_experts`, a surviving `...experts.<N>.<proj>.weight` means either the skeleton
+        was missing (no fuse ran, but the model expects fused 3D) or the skeleton keeps experts
+        per-expert. Only the second is packable, and it is exactly `lin2d` listing those names
+        (MiniMax-M2). `lin2d is None` is the skeleton-build failure compile_shards already refuses:
+        the name heuristic would 2D-pack them on a guess the cold load may not share.
+
+    NOT decidable here (needs the model DIRECTORY, so it stays in compile_shards): a raw MXFP4
+    snapshot (`_mxfp4_quantized`) and an fp8/nvfp4-source fused-3D MoE. Both are properties of the
+    checkpoint on disk, not of the already-bf16 tensors handed to the packer. To close those for
+    the distributed paths the callers would have to send the source-format facts in the pack frame
+    — see the follow-up note; nothing here can infer them."""
+    import re
+    if quant not in ("int4", "int8", "int2"):
+        raise ValueError(f"shard pack supports quant int4|int8|int2 (got {quant!r}) — an "
+                         "unrecognized tier used to fall through to the int8 packer while the "
+                         "manifest was stamped with the tier that was asked for")
+    if quant == "int2":
+        raise ValueError(
+            "int2 shard packing is GPTQ-CALIBRATED: compile_shards routes int2 to "
+            "gptq_pack.compile_int2_gptq and never reaches this packer. pack_linear_int2 here is "
+            "the WIRE FORMAT gptq_pack writes into, not a compile path — packing a unit with it "
+            "produces plain round-to-nearest crumbs stamped 'v2-g64-int2-gptq', which passes "
+            "verify_shard_cache and serves token salad. Compile int2 via /compile_shards (it is "
+            "sequential + calibrated, so it is also not distributable)")
+    if exp3d is not None:
+        _fused = {n for n, W in raw.items() if W.dim() == 3 and n in exp3d}
+    else:   # name-heuristic fallback — the SAME test `is_expert3d` uses below, minus the tier gate
+        _fused = {n for n, W in raw.items()
+                  if W.dim() == 3 and ".experts." in n
+                  and (n.endswith(".gate_up_proj") or n.endswith(".down_proj"))}
+    if _fused and quant != "int4":
+        raise ValueError(
+            f"fused 3D MoE experts ({len(_fused)} tensors, e.g. {sorted(_fused)[0]}) cannot be "
+            f"packed at {quant}: this packer has a 3D expert branch only for int4, so they would "
+            "be written bf16 while a cold load quantizes them — the cache would diverge from the "
+            "load it exists to replace. Compile MoE at int4 (see compile_shards' MoE guard for "
+            "why int8 and int2 are refused for different reasons)")
+    # A per-expert name that SURVIVED the fuse. `_fuse_moe_experts` pops every key it stacks, so
+    # anything left either never got a skeleton to fuse against or belongs to an arch that keeps
+    # experts as 2D Linears — and only the latter, evidenced by `lin2d` listing them, is packable.
+    _per_expert = {n for n, W in raw.items()
+                   if W.dim() == 2 and re.search(r"\.experts\.\d+\.\w+\.weight$", n)}
+    if _per_expert and (lin2d is None or not _per_expert <= lin2d):
+        _why = ("no quant scope was passed (skeleton build failed), so the name heuristic would "
+                "2D-pack them on a guess" if lin2d is None else
+                "they are not in the quant scope, i.e. the skeleton expects them FUSED to 3D but "
+                "no skeleton was passed, so `_fuse_moe_experts` never ran")
+        raise ValueError(
+            f"per-expert MoE weights ({len(_per_expert)} tensors, e.g. "
+            f"{sorted(_per_expert)[0]}) survived the fuse and cannot be packed: {_why}. Pass the "
+            "meta skeleton (compile_shards/_quant_scope, or the worker's `fuse` flag) so they are "
+            "stacked into the model's fused 3D layout exactly as the cold load does")
+
+
 def pack_unit_tensors(raw: dict, lin2d, exp3d, skel, quant: str = "int4",
                       group_size: int = INT4_GROUP):
     """Pack ONE cache unit's raw bf16 tensors (keyed by logical 'model.*' name) into the cache's
@@ -189,12 +270,17 @@ def pack_unit_tensors(raw: dict, lin2d, exp3d, skel, quant: str = "int4",
     BIT-IDENTICAL to a locally-packed one BY CONSTRUCTION (same fuse + same pack), exactly like
     `_fuse_moe_experts` is shared. Pure: no I/O, no globals. `skel` (the meta model) drives per-expert
     MoE fusion (None -> no fuse); `lin2d`/`exp3d` are the exact quant scope from `_quant_scope` (None
-    -> name-heuristic fallback, fine for dense arches). int4 packs layer Linears + 3D experts; int2
-    packs layer Linears only (dense tier — no 2-bit expert packer); int8 packs layer Linears +
-    lm_head; everything else (norms/embed/biases/router) passes through bf16."""
+    -> name-heuristic fallback, fine for dense arches). int4 packs layer Linears + 3D experts; int8
+    packs layer Linears + lm_head; everything else (norms/embed/biases/router) passes through bf16.
+    int2 REFUSES here — it is the GPTQ-calibrated tier and never routes through this packer; see
+    `_refuse_unpackable`, which also carries every other compile-side refusal that is decidable from
+    the unit itself, so the three callers that skip `compile_shards` cannot skip them either."""
     group_size = _default_group(quant, group_size)   # int2 packs at INT2_GROUP unless overridden
     if skel is not None:
         raw = _fuse_moe_experts(raw, skel)
+    # Refuse AFTER the fuse: a per-expert checkpoint that fused into 3D must be judged on the fused
+    # result, not on the keys it arrived with (same reason `_in_major_expert_names` runs post-fuse).
+    _refuse_unpackable(raw, lin2d, exp3d, quant)
     # #gptoss-cache: refuse IN-major fused experts HERE, at the shared packer, not only in
     # compile_shards. Three other paths reach this function without ever running compile_shards'
     # guards — /compile_dist's local-fallback pack, /pack_probe's reference pack (both
@@ -413,8 +499,44 @@ def compile_shards(model_dir: str, quant: str = "int4", group_size: int = INT4_G
     _moe_per_expert = _moe and not _moe_fused and not _exp3d and _skel_expert_lins
     if _moe:
         if quant != "int4":
-            raise ValueError("MoE shard-cache compile supports int4 only "
-                             "(no worker int8/int2 3D-expert quantizer)")
+            # #moe-int8: the OLD reason ("no worker int8/int2 3D-expert quantizer") is now HALF
+            # WRONG, and the half that changed is int8. worker_quant ships the int8 3D family
+            # (Packed8Tensor3D / _pack8_3d / _quantize_experts8_), `_quantize_int8_` calls it, and
+            # routes_lifecycle no longer downgrades int8-on-MoE to int4 — an int8 MoE COLD LOAD
+            # packs its experts today. The pack MATH is not the blocker either: `pack_linear_int8`
+            # above and worker_quant `_pack8_expert` are the same three statements (same amax/127
+            # scale in W's own dtype, same round, same clamp(-127,127)), `_pack8_3d` is a per-expert
+            # loop over `_pack8_expert`, and scratch_moe_int8_pack_test asserts that twin identity
+            # — so looping `pack_linear_int8` per expert here WOULD reproduce the cold load byte for
+            # byte.
+            #
+            # What blocks it is that nothing could consume the result, the same shape of gap as the
+            # gpt-oss in-major refusal below (packer ready, serve side not):
+            #   * `pack_unit_tensors` has no 3D int8 branch — `is_expert3d` is gated to int4, so an
+            #     int8 MoE compile TODAY writes the experts (~90% of the weights) as bf16 passthrough
+            #     while the cold load quantizes them. That is a divergent cache, which is precisely
+            #     what this refusal exists to prevent.
+            #   * the serve side is int4/int2-only in three independent places (shard_build's
+            #     `use_cache`, worker_load's `cache` gate, engine_load's `_cache_quant`), and
+            #     `shard_build._install_cached`'s 3D branch refuses a non-int4 cache outright and
+            #     requires a `.zero` the symmetric int8 pack never emits. An int8 MoE cache would be
+            #     write-only: hours of compile and tens of GB that no load ever reads, advertised as
+            #     `ok` by shard_cache_status. Lifting this is a serve-side change FIRST.
+            # int2 is refused for a different and PERMANENT reason: it is the GPTQ-calibrated tier
+            # (compile_shards routes it to gptq_pack above), and gptq_pack is dense-only because its
+            # sequential per-layer Hessian is built from dense activations while a routed expert
+            # only ever sees the tokens routed to it. A plain-RTN 3D int2 packer would be the WRONG
+            # artifact, not a missing one — it would compile, checksum, and generate garbage.
+            _why = ("int2 is the GPTQ-calibrated tier and gptq_pack is dense-only; an RTN 3D int2 "
+                    "expert packer would be the wrong artifact, not a missing one"
+                    if quant == "int2" else
+                    "the worker CAN int8-pack MoE experts now (_pack8_3d/Packed8Tensor3D, and "
+                    "pack_linear_int8 == _pack8_expert bit for bit), but this packer has no 3D int8 "
+                    "branch (experts would be cached bf16, diverging from the cold load) and the "
+                    "serve path is int4/int2-only (shard_build.use_cache, worker_load's cache gate, "
+                    "engine_load._cache_quant; _install_cached refuses a 3D tensor in a non-int4 "
+                    "cache and needs a .zero int8 never emits) — the cache would be write-only")
+            raise ValueError(f"MoE shard-cache compile supports int4 only: {_why}")
         # fp8/nvfp4-source MoE (#nvfp4-moe): compressed-tensors quantizes nn.Linear modules, so a
         # quantized MoE stores experts PER-EXPERT (`...experts.<N>.<proj>.weight_packed`/`.weight`),
         # each a 2D tensor `_get_bf16` already dequantizes (the SAME path dense nvfp4/fp8 uses); the

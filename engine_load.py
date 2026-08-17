@@ -146,6 +146,10 @@ class EngineLoadMixin:
         # Load button — quant (int4), context (8k), and placement mode — so request-triggered loads
         # and click-loads behave identically. The request's own ctx (>0) still overrides the default.
         aq = str(ENGINE_CONFIG.get("autoload_quant", "int4") or "none")
+        # #moe-int8/#int2: /config accepts int2 and int8 as autoload_quant, so an auto-load can ask
+        # for a tier POST /load would have refused on a MoE — the one path that reaches a tier the
+        # manual path rejects. Same rule, same helper (see _moe_tier_downgrade).
+        aq = await self._moe_tier_downgrade(friendly, aq)
         a_ctx = int(ENGINE_CONFIG.get("autoload_ctx", DEFAULT_CTX) or 0)
         use_ctx = ctx if (ctx and ctx > 0) else a_ctx
         a_mode = str(ENGINE_CONFIG.get("autoload_mode", "auto") or "auto")
@@ -170,15 +174,75 @@ class EngineLoadMixin:
                                        proportional=_prop, gpu_spread=_gpus, auto=True)
             raise
 
+    async def _moe_tier_downgrade(self, friendly: str, quant: str) -> str:
+        """#moe-int8 / #int2: the MoE quant-tier rule, applied to ANY load path. Returns the tier to
+        actually use (unchanged for everything that is not a MoE at int8/int2).
+
+        This lived only in the POST /load route, so the AUTO-load path could reach a tier the manual
+        path rejects: /config accepts `autoload_quant` int2 and int8, and a request-triggered load
+        went straight to engine.load() with it. Not theoretical — an int2 MoE auto-load would have
+        packed 3D routed experts round-to-nearest and served token salad, and a gpt-oss MoE at int8
+        fails at the WORKER mid-load (with partial shards already placed) instead of instantly.
+
+        The rule (kept identical to the route's — the invariant is TIER PARITY between the two
+        paths, so a divergence here is the bug, not a feature):
+          * int2 on a MoE -> int4. int2 is the GPTQ-CALIBRATED tier by policy and gptq_pack refuses
+            MoE ("dense models only"): its sequential per-layer Hessian is built from dense
+            activations, while a routed expert only ever sees the tokens routed to it. An RTN 3D
+            int2 packer would load, checksum, and emit garbage — the wrong artifact, not a gap.
+          * int8 on a gpt-oss MoE -> int4. Those experts are IN-major, and the transpose-pack plus
+            the fused forward that consume them exist only for w4a16; _quantize_experts8_ refuses
+            them loudly at the worker.
+          * int8 on any other MoE -> HONORED. worker_quant grew the int8 3D expert family
+            (Packed8Tensor3D / _pack8_3d) in 0.3.20, so the experts really are packed. Do NOT
+            "helpfully" re-add the old blanket int8 downgrade; it was removed deliberately.
+        Any failure to read the checkpoint honors the requested tier (a load that would have worked
+        must not be downgraded because a weight map was unreadable) — same as the route.
+        """
+        if quant not in ("int8", "int2"):
+            return quant
+        try:
+            import shards as _sh
+            _tgt = MODELS[friendly][0] if friendly in MODELS else friendly
+            _mdir = await asyncio.to_thread(_controller_model_dir, _tgt)
+            if not _mdir:
+                return quant
+            _wm = await asyncio.to_thread(_sh._weight_map, _mdir)
+            if not await asyncio.to_thread(_sh._has_moe_experts, _wm):
+                return quant
+            # gpt-oss detector: `...experts.gate_up_proj_bias` is the per-expert bias only the
+            # gpt-oss expert block has — the same signal worker_quant._is_gptoss_experts keys on.
+            _gptoss = any(s.endswith("gate_up_proj_bias") for s in _wm)
+            if quant == "int2" or _gptoss:
+                _why = ("int2 is the GPTQ-CALIBRATED tier and gptq_pack is dense-only; an RTN 3D "
+                        "expert packer would load and emit garbage" if quant == "int2" else
+                        "gpt-oss experts are IN-major — the transpose-pack + fused forward that "
+                        "consume them exist only for w4a16")
+                log_activity(f"{_ollama_name(friendly)}: {quant} on this MoE — DOWNGRADING to "
+                             f"int4 ({_why})")
+                return "int4"
+            log_activity(f"{_ollama_name(friendly)}: int8 MoE — routed experts ARE packed "
+                         "(#moe-int8), but there is no grouped int8 MoE kernel and no int8 shard "
+                         "cache for a MoE: expect eager per-expert decode and a cold quantize")
+        except Exception as _moe_exc:
+            log_activity(f"{_ollama_name(friendly)}: MoE check for {quant} downgrade failed "
+                         f"({_moe_exc}) — honoring {quant} as requested")
+        return quant
+
     async def _precompile_int4(self, friendly: str, quant: str, tp: int) -> None:
         """#cache-on-first-load: for an int4 load with NO shard cache yet, BUILD it first
         (blocks until written) so THIS load — and every future load — serves the small pre-packed
         layers instead of streaming full bf16 and re-quantizing on the fly. No-op when that tier's
         cache already exists, when quant is anything but int4, or for tp>1 (its dispatch path
         doesn't read the whole-layer cache). int4 ONLY by design: an int2 cache is never auto-built
-        on first load (RTN-int2 output is collapsed until the calibrated packer lands) — an
-        operator builds one deliberately via the dashboard Precache button / POST /compile_shards,
-        and an EXISTING int2 cache still serves (the serve gate is separate). Reuses the
+        on first load. The reason is no longer a missing packer — the GPTQ-calibrated one landed
+        (#38, gptq_pack.py), which is exactly why an int2 cache is worth having at all. It is the
+        COST: that compile estimates a per-layer Hessian from real forward activations over a
+        calibration batch, strictly layer-by-layer (each stage runs through the already-quantized
+        earlier ones), so it runs for hours on a big model — an order of magnitude beyond the int4
+        RTN pack, and not something to do inside a request-triggered load. An operator builds one
+        deliberately via the dashboard Precache button / POST /compile_shards, and an EXISTING int2
+        cache still serves (the serve gate is separate). Reuses the
         /compile_shards SUBPROCESS (deprioritized, GIL-safe — an in-process compile would starve
         the event loop / drop live generations). Non-fatal: ANY failure falls through to the
         normal cold load. Shared by the /load route AND the auto-load path (ensure_loaded) so
@@ -271,6 +335,9 @@ class EngineLoadMixin:
         Returns (kv_slots, moe_offload) — the ONLY knobs perf_profile.resolve() returns that this
         loader APPLIES. Everything else it resolves is ADVICE: printed into the load log and offered
         by the dashboard's ⚡ button for the operator to accept, never switched on behind their back.
+        `advice` is an OUT parameter: the caller's list, filled with the ADVICE-knob rationale lines
+        so they reach the ACTIVITY load log (see the selection comment at the fill site — the full
+        rationale goes to stdout/GET /logs, which has no 80-entry ring to blow).
         The line between the two lists is not confidence, it is BLAST RADIUS — an applied knob must
         not change what the model SAYS, and must not be able to make a working load worse:
 
@@ -328,11 +395,19 @@ class EngineLoadMixin:
             return kv_slots, moe_offload
         best = max(cands, key=lambda n: self._node_live_free_vram_gb(n))
         free_gb = self._node_live_free_vram_gb(best)
+        # unified_memory is a REPORTED fact, not a constant: on an APU whose "VRAM" is GTT carved
+        # from system RAM (om3nbox Strix Halo gfx1151, steamdeck Van Gogh) classify_device must
+        # answer `unified`, not `rocm` — the two classes describe different spill economics and the
+        # class is what selects the int4-kernel reasoning. Hard-coding False classified every Strix
+        # Halo box in the fleet as plain ROCm. _is_unified_node is the SAME detector the planner's
+        # #unified-mem clamp uses (placement.is_unified_mem_node, incl. a node's explicit
+        # `unified_mem` flag), so the resolver and the budgeter can never disagree about a node;
+        # it returns False when placement.py is too old to answer, which keeps the old behavior.
         dev = _pp.classify_device(
             has_gpu=True,
             is_hip="amd" in (getattr(best, "device_name", "") or "").lower()
                    or "radeon" in (getattr(best, "device_name", "") or "").lower(),
-            unified_memory=False)
+            unified_memory=self._is_unified_node(best))
         # Tell the resolver what the caller ALREADY chose so it defers instead of "deciding" a knob
         # that is not actually free — its contract is fill-if-unset. ONLY genuinely-set values go in:
         # take() treats anything outside (None, "", -1) as explicit, and False is outside it, so
@@ -376,7 +451,24 @@ class EngineLoadMixin:
             tie_word_embeddings=bool(getattr(spec, "tie_embeddings", False)),
             device_class=dev, free_vram_gb=free_gb, ctx=int(ctx or 4096),
             requested=_req)
-        advice.extend(why)
+        # Hand the caller the ADVICE-knob rationale so it reaches the ACTIVITY load log (the caller
+        # emits it as ONE entry). Not the whole `why`: resolve() answers ~11 lines per load and
+        # ACTIVITY is an 80-entry ring, so extending it wholesale would evict the load history the
+        # panel exists to show — the full rationale is printed to stdout below, which GET /logs
+        # serves unabridged. Selected by knob name (take() formats every line as "<knob>=<value> —
+        # <reason>", so the text before the first '=' IS the knob name):
+        #   * kv_slots / moe_offload are APPLIED — their own apply sites already log, and only when
+        #     they changed something, so repeating them here would double-log every load.
+        #   * speculative / draft_gpu always resolve False at this call site (it passes neither
+        #     has_draft_model nor has_mtp_head), so their lines carry no information.
+        #   * attn / prefix_min / cuda_graph have NO per-load knob to apply (see the docstring).
+        # "(explicit — resolver deferred)" lines are dropped too: the operator set that value, so
+        # reading it back at them is noise (this is what silences `quant`, always in _req).
+        for line in why:
+            if (str(line).split("=", 1)[0].strip() in ("quant", "kv_quant", "kv_offload",
+                                                       "head_quant")
+                    and "resolver deferred" not in str(line)):
+                advice.append(str(line))
         c = int(kv_slots or 1) if _c_gated else int(knobs.get("kv_slots", 1) or 1)
         if c > 1 and not _c_gated:
             log_activity(f"{friendly}: #perf-auto kv_slots=1 -> {c} on {best.hostname} "
@@ -876,6 +968,13 @@ class EngineLoadMixin:
                     print(f"[perf-auto] {friendly}: resolver failed ({_pexc!r}) — "
                           f"keeping caller knobs", flush=True)
                     log_activity(f"{friendly}: #perf-auto skipped ({type(_pexc).__name__})")
+                # The resolver's rationale is the thing that was missing when these settings had to
+                # be guessed, so it has to land in the ACTIVITY log NEXT TO the load it explains —
+                # stdout alone means correlating by timestamp across GET /logs. ONE entry (the ring
+                # is 80 deep): the ADVICE knobs only, which _perf_auto_knobs selected.
+                if _perf_adv:
+                    log_activity(f"{friendly}: #perf-auto advice (NOT applied — operator opt-in): "
+                                 + " | ".join(_perf_adv))
             else:
                 print(f"[perf-auto] {friendly}: skipped "
                       f"(perf_auto={ENGINE_CONFIG.get('perf_auto', True)}, "
@@ -2063,8 +2162,11 @@ class EngineLoadMixin:
                         continue
                     raise RuntimeError(
                         f"t2i offload needs ~{_OFFLOAD_VRAM_GB:.0f} GB free VRAM (transients) and "
-                        f"~{all_b / GB + 6.0:.0f} GB free RAM on the controller-co-located GPU node "
-                        "— it never evicts residents (that is its point); free some VRAM/RAM"
+                        f"~{all_b / GB + 6.0:.0f} GB free RAM on ONE eligible node — since "
+                        "#media-anywhere that is any node advertising can_t2i + the mediab64 wire "
+                        "cap, not only a worker on the controller's own box (the sibling raise "
+                        "below says the same) — and it never evicts residents (that is its point); "
+                        "free some VRAM/RAM"
                         + ("" if _offload_fallback else " or use the normal GPU load"))
                 # right after a restart/unload the heartbeat can still show the OLD vram_used —
                 # wait one stats refresh and re-check ONCE before declaring no room (bit us live:
@@ -3009,7 +3111,21 @@ class EngineLoadMixin:
             pend[rid] = fut
             lm.active = 1
             lm.t2music_req = rid            # status: lets the card find this render's progress
-            _dur = max(1.0, min(60.0, float(duration)))
+            # #t2music-cap: clamp to the ceiling the WORKER will actually honor, not a guess. The
+            # decoder's position table is finite (~2036 usable tokens at 50 Hz ≈ 40 s on stock
+            # MusicGen), so worker_t2music re-clamps to its own max_duration_s regardless — a flat
+            # 60 here just advertised ~20 s the render could never produce, and inflated the
+            # generation timeout below with it. The real number is model-dependent (max_tokens /
+            # frame_rate) and only the worker can compute it, so it is READ from the load reply's
+            # media info (the same field the dashboard's Duration input caps itself with). Absent
+            # (pre-#t2music-cap worker, or a model adopted without media info) it cannot be computed
+            # here — keep the old 60 s bound and let the worker's own clamp be the backstop.
+            _mx = (lm.media or {}).get("max_duration_s")
+            try:
+                _mx = float(_mx or 0.0)
+            except (TypeError, ValueError):
+                _mx = 0.0
+            _dur = max(1.0, min(_mx if _mx > 0 else 60.0, float(duration)))
             try:
                 await link.send({"type": "t2music_gen", "model_id": lm.target_id, "req_id": rid,
                                  "prompt": str(prompt or ""), "duration": _dur,

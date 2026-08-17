@@ -531,6 +531,26 @@ def build_registration(args: argparse.Namespace) -> dict:
         reg["has_cc"] = bool(_cc) and os.path.exists(_pyh)
     except Exception:
         reg["has_cc"] = True     # probe itself broke -> don't slander the node (same as #einops-probe)
+    # #sm-probe: the third leg of "can this node reach a fused int4 kernel" (has_triton/has_cc are
+    # the other two) — the CUDA COMPUTE CAPABILITY. worker_quant gates the torch tinygemm int4 path
+    # on `torch.cuda.get_device_capability(dev) >= (8, 0)` (worker_quant.py ~727); a pre-Ampere card
+    # fails it and every int4 linear falls to the naive path that rematerializes the whole bf16
+    # weight per forward — so on those cards int4 is a MEMORY tier and never a speed tier, which is
+    # exactly what perf_profile's CUDA_LEGACY class exists to say. It could not say it: nothing in
+    # the fleet ever reported a capability, so classify_device() always saw capability=None and
+    # called every CUDA node modern, leaving CUDA_LEGACY unreachable. Reported as [major, minor]
+    # because JSON has no tuples, and OMITTED (not null) when unknown so a worker predating this
+    # field keeps the resolver's "assume modern" default rather than being slandered as legacy.
+    # NOT reported on ROCm: torch there returns the gfx arch pair (gfx1151 -> (11, 5)), which is not
+    # an SM version — classify_device tests is_hip first and HIP has the project's own Triton w4a16
+    # kernel, so the number could only mislead. Guarded by _using_gpu so a --device cpu worker on a
+    # GPU box advertises no capability for a GPU it will not touch.
+    if _using_gpu(args):
+        with contextlib.suppress(Exception):
+            import torch as _torch_cc
+            if not getattr(_torch_cc.version, "hip", None):
+                _sm = _torch_cc.cuda.get_device_capability(_torch_cc.cuda.current_device())
+                reg["compute_cap"] = [int(_sm[0]), int(_sm[1])]
     reg["can_stt"] = _has("transformers") and _has("soundfile")   # #stt-serve: Whisper ASR leaf
     # #t2music-serve: MusicGen ships inside transformers and needs NO torchaudio (soundfile writes
     # the WAV) — so any Whisper-capable worker is also MusicGen-capable. Runs on AMD/NVIDIA/CPU.

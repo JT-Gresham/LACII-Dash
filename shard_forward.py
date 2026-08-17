@@ -17,6 +17,31 @@ class _ForwardSuperseded(RuntimeError):
     controller ignores it. #fwd-cancel."""
 
 
+def _layer_takes_no_mask(layer) -> bool:
+    """#gpt-oss-sliding-mask: may the hybrid branch hand THIS decoder layer attention_mask=None —
+    i.e. is it LINEAR attention (fixed recurrent + short-conv state, no causal mask to apply)?
+
+    The mask-skip used to test `layer.layer_type == "full_attention"` and pass None for everything
+    else. That is the SAME two-state conflation shard_build's `_kv_layer_mask` was just corrected
+    for (#gpt-oss-sliding-kv): `self._hybrid` is set by `any(t != "full_attention" for t in
+    cfg.layer_types)`, so it is True for SLIDING-WINDOW archs (gpt-oss, Gemma-4) as well as for
+    linear-attention ones — and a `sliding_attention` layer is still ordinary softmax attention that
+    MUST see a causal mask. Handing it None is a NON-CAUSAL prefill; shard_build's #gpt-oss-sliding
+    note names exactly that outcome as far worse than the over-wide window the plain causal mask
+    gives it. Three states, matching shard_build: full (mask) / bounded-window (mask, over-wide —
+    the windowed mask is reachable only under the `_per_type` gate) / linear (None).
+
+    Deliberately the same substring sniff as shard_build._is_linear_attn_type and
+    engine_gen._linear_attn_arch, kept local so this worker-side module stays a dependency-free leaf;
+    substring-based so a future `linear_*` spelling is caught by default and the sniffs cannot drift.
+
+    A layer with NO `.layer_type` reads as not-linear and keeps today's plain causal mask, which is
+    what gpt-oss (spells it `.attention_type`) and #kimi-linear (no cfg.layer_types at all, layers
+    carry `.is_linear_attn`) already receive today — both unchanged by this predicate. Kimi is NOT
+    switched to None here: that would be an unmeasured behaviour change to a path that serves."""
+    return "linear" in str(getattr(layer, "layer_type", "") or "").lower()
+
+
 _PREALLOC_KV_CLS = None   # #kv-prealloc: classes built ONCE on first use (transformers import deferred)
 
 
@@ -648,10 +673,12 @@ class ShardForwardMixin:
                                     position_embeddings=_posemb_for(dev, _lts[_ls + _li]),
                                     shared_kv_states=_skv, cache_position=cache_position)
                     elif self._hybrid:
-                        # Per-layer-type mask: full-attn gets the causal mask; linear-attn
-                        # (Gated-DeltaNet) gets None (text-only, no padding). The qwen layer
-                        # has no cache_position param (it tracks position via the cache).
-                        m = mask if getattr(layer, "layer_type", "full_attention") == "full_attention" else None
+                        # Per-layer-type mask: every SOFTMAX layer (full_attention AND
+                        # sliding_attention) gets the causal mask; only linear-attn
+                        # (Gated-DeltaNet) gets None (text-only, no padding) — see
+                        # _layer_takes_no_mask. The qwen layer has no cache_position param
+                        # (it tracks position via the cache).
+                        m = None if _layer_takes_no_mask(layer) else mask
                         out = layer(h_, attention_mask=m, position_ids=pos,
                                     past_key_values=self.kv, use_cache=True,
                                     position_embeddings=pos_emb)
@@ -790,7 +817,7 @@ class ShardForwardMixin:
                                 position_embeddings=_pe_t[_lts[_ls + _li]],
                                 shared_kv_states=_skv, cache_position=cpos_)
                 elif self._hybrid:
-                    m = mask_ if getattr(layer, "layer_type", "full_attention") == "full_attention" else None
+                    m = None if _layer_takes_no_mask(layer) else mask_
                     out = layer(h_, attention_mask=m, position_ids=pos_,
                                 past_key_values=self.kv, use_cache=True,
                                 position_embeddings=pe_)
