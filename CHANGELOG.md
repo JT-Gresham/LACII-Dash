@@ -4,7 +4,45 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — two silent-corruption P0s, found by auditing this session's own work (0.3.21 / 0.3.28)
+## 2026-08-17 (latest) — a fix that was inert, and a rule that re-forked within hours (0.3.23 / 0.3.30)
+
+Three of these four are consequences of **this session's own changes**, found by chasing the
+follow-ups the waves generated rather than by anything failing.
+
+### Fixed
+
+- **`#sm-probe` was INERT.** The worker reported `compute_cap` and the dashboard read it, but
+  `server.py` had no such field — `Registry.add` whitelist-parses registration, so the key was
+  dropped at the registry boundary and every consumer's `getattr` fell to `None`.
+  `perf_profile` returns `CUDA_LEGACY` only when handed a capability, so that class stayed
+  unreachable and a pre-Ampere card kept classifying `CUDA_MODERN` — while failing worker_quant's
+  `>= (8,0)` gate and silently running the naive int4 path at **5–20× slower**.
+
+  Two links of a three-link chain were built and the third did nothing. Now carried at all three
+  sites, and the **load-time** resolver passes `capability` too (only the dry-run path did).
+  Absent stays UNKNOWN → CUDA_MODERN; absent must never read as old.
+  **Verified live**: beast `[8, 9]`, Furnace `[12, 0]`.
+
+- **The MoE tier rule had already re-forked.** `POST /load` kept a 32-line inline copy while the
+  P2 wave added `_moe_tier_downgrade` to engine_load — the same per-branch duplication that
+  produced this session's router-corruption bug, recreated within hours of fixing it. Collapsed,
+  after proving the two bodies agreed across the full cross-product of inputs.
+
+- **`load_faster` mapped `kv_quant 'none' -> ''`**, and `load()` reads empty as "inherit the global
+  default" — so a model explicitly resident at `kv_quant=none` came back from a hitless re-place
+  with a different KV cache, from an operation that promises to change only placement.
+
+- **`android/` carried byte-identical copies of both P0s** (unguarded int8 router walk; two-state
+  KV mask, worse there — its non-full-attention arm charged a literal `0`). Latent in that tree,
+  but latent is exactly how the main-tree router bug survived for months.
+
+### Known-open
+
+int8 shard caches are compiled but never **served** — `use_cache` is int4/int2-only at three sites;
+`_install_cached` grew its int8 branch here, the two gate sites remain. A cache installed but not
+selected is harmless; the reverse is not.
+
+## 2026-08-17 — two silent-corruption P0s, found by auditing this session's own work (0.3.21 / 0.3.28)
 
 ### Fixed
 
