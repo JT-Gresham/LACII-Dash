@@ -4,7 +4,45 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — a fix that was inert, and a rule that re-forked within hours (0.3.23 / 0.3.30)
+## 2026-08-17 (latest) — int8 caches are SERVED, not just compiled (0.3.24 / 0.3.31)
+
+### Added
+
+- **int8 shard caches are now selected at load.** They have been *compilable* since 0.3.20, but
+  `use_cache` was gated to int4/int2 on **both** the controller and the worker — so nothing ever
+  selected one, the load re-quantized anyway, and the cache sat on disk as dead weight.
+
+  Every hop was traced before either gate opened, because this session shipped three fixes that did
+  nothing when a value was dropped at an unchecked boundary: compile → manifest → verify → transport
+  → gate → install. The worker gate mattered independently: without it the controller's
+  `cache: "int8"` frame died at the worker boundary and `use_cache` could never be true.
+
+  **Scoped to DENSE models, and the scope is load-bearing.** An int8 MoE cache cannot exist today
+  (all four pack entry points refuse it), but the shape one *would* have is the single failure
+  `_install_cached` cannot detect: `pack_unit_tensors` gates `is_expert3d` to int4, so routed
+  experts would be written **bf16 passthrough**, install cleanly as plain Parameters, trip neither
+  the 3D refusal nor the meta guard, and bring the shard up with bf16 experts against an int8 plan.
+
+  The eligibility rule lives in **one** place (`_cache_serve_tier`), computed once above the retry
+  loop so its two read sites cannot drift; the worker deliberately keeps no copy, since it cannot
+  see the checkpoint's weight map and a second copy is exactly what drifts.
+
+### Fixed
+
+- **`docs/GGUF.md` described the behaviour this session replaced** — "rejects a split GGUF early"
+  and "single-file quants only" were both inverted. Rewritten from current source, with the one
+  genuinely open unknown kept as a **caveat** rather than papered over: whether the fleet's
+  installed transformers can read a split set end to end was never determined.
+- `routes_shards`' int8-MoE refusal wording was half-false, and `/pack_probe` lacked the up-front
+  gate `/compile_dist` has — an int8 MoE probe failed as a 504 that reads like a node fault.
+- **`FWD_FAIL_BENIGN` classified a benign superseded forward by substring-matching an exception
+  class name.** Renaming `_ForwardSuperseded` would silently disable it, and routine orphan cleanup
+  would count as node faults — feeding the wedge detector added earlier today, which can escalate to
+  restarting a healthy node holding a resident model.
+- `android/shards.py` carried the unfixed `_is_tied` plain-key probe, which serves the **embedding
+  matrix as the LM head** for a quantized-head checkpoint.
+
+## 2026-08-17 — a fix that was inert, and a rule that re-forked within hours (0.3.23 / 0.3.30)
 
 Three of these four are consequences of **this session's own changes**, found by chasing the
 follow-ups the waves generated rather than by anything failing.
