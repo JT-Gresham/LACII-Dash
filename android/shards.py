@@ -799,6 +799,36 @@ _TP_COL = (".self_attn.q_proj.", ".self_attn.k_proj.", ".self_attn.v_proj.",
 _TP_ROW = (".self_attn.o_proj.", ".mlp.down_proj.")
 
 
+def _tp_unshardable_moe(out_name: str) -> bool:
+    """#tp-moe-replicate: is this a decoder-layer MoE weight that _tp_kind_and_slice classifies as
+    REPLICATED but that a real TP split would have to shard?
+
+    The classifier above matches LITERAL substrings '.mlp.gate_proj.' / '.mlp.down_proj.' etc. A
+    per-expert MoE weight is named '...mlp.experts.3.gate_proj.weight' and a fused one
+    '...mlp.experts.gate_up_proj' — NEITHER contains '.mlp.gate_proj.', so both fall through to the
+    `return None, 0, 0` default and get served WHOLE to every rank. Same for the shared expert
+    ('...mlp.shared_expert.up_proj.weight'). On a big MoE the experts are ~90% of the bytes, so TP
+    would shard the 10% that is attention and replicate everything that matters — the exact opposite
+    of what the caller asked for.
+
+    Today this is latent, not active: the worker cannot get that far. client.py's
+    _tp_make_structure_ / _tp_shard_model_ walk `L.mlp.gate_proj` unconditionally, and a MoE block
+    (Qwen3MoeSparseMoeBlock, Mixtral's block_sparse_moe) has no such attribute — so TP + MoE dies
+    with an AttributeError on the worker before /weights_tp is ever asked for a slice. That guard is
+    incidental (an attribute that happens not to exist in another file), not deliberate: the day
+    anyone teaches _tp_make_structure_ about experts without teaching THIS function about them, the
+    silent full-size serve starts working. Refuse here, where the wrong classification is made.
+
+    The router/gate ('...mlp.gate.weight', [n_experts, hidden]) is CORRECTLY replicated — it is not
+    on the parallel dim — and must not match; it carries no '.experts.'/'.shared_expert' marker.
+    Scale sidecars are excluded so a quant-format branch above still owns its own refusal."""
+    if ".layers." not in out_name:
+        return False
+    if ".experts." not in out_name and ".shared_expert" not in out_name:
+        return False
+    return not _is_fp8_meta_name(out_name)
+
+
 def _tp_kind_and_slice(out_name: str, geo: dict):
     """(kind, off, length) for a served tensor's parallel-dim slice, from THIS rank's geo. kind in
     {'col','row',None}; None -> replicated (serve whole). q/o -> q slice, k/v -> kv slice,
@@ -843,10 +873,13 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
     wm = _weight_map(model_dir)
     prefix = _text_prefix(wm)
     fp8_block = _fp8_block_size(model_dir)   # fold fp8 weight_scale_inv -> bf16 before TP slicing
-    if _nvfp4_group_size(model_dir) is not None:
-        raise NotImplementedError(
-            "nvfp4 checkpoints are not supported in tensor-parallel mode yet — load nvfp4 in "
-            "pipeline/proportional mode (the dequant-then-TP-slice path is a follow-up)")
+    # nvfp4 rides the SAME dequant-then-slice route as fp8, and deliberately shares the slicing code
+    # rather than re-deriving it: the packed weight is expanded to bf16 [out_features, in_features]
+    # FIRST, then handed to the very same _tp_kind_and_slice/_tp_slice_tensor the fp8 and plain-bf16
+    # tensors go through. That is the whole safety argument — a per-quant-format slicing rule is
+    # exactly how you end up with a model that loads, checksums fine, and generates garbage, so
+    # there is no nvfp4-specific notion of "which axis" anywhere below.
+    nvfp4_group = _nvfp4_group_size(model_dir)
     names = _selected_names(wm, start, end, has_embed, has_head, tied, prefix)
     out_pairs: list[tuple[str, str]] = []         # (output_name 'model.*', source_name)
     if has_embed:
@@ -864,21 +897,73 @@ def _build_weight_tp_blob(model_dir: str, start: int, end: int, has_embed: bool,
     by_file: dict[str, list[tuple[str, str]]] = {}
     for out_name, src_name in out_pairs:
         by_file.setdefault(wm[src_name], []).append((out_name, src_name))
+    def _companion(fh, name: str):
+        """A quantized weight's sidecar tensor (fp8 weight_scale_inv; nvfp4 weight_scale /
+        weight_global_scale). Prefer the already-open shard — a weight and its scale normally live
+        together — but follow the weight map, because a big checkpoint can land them in different
+        files. None if the checkpoint does not carry it at all."""
+        if name in fh.keys():
+            return fh.get_tensor(name)
+        if name in wm:
+            with safe_open(wm[name], framework="pt") as sfh:
+                return sfh.get_tensor(name)
+        return None
+
     sd: dict = {}
     for fn, pairs in by_file.items():
         with safe_open(fn, framework="pt") as fh:
             for out_name, src_name in pairs:
-                kind, off, length = _tp_kind_and_slice(out_name, geo)
                 t = fh.get_tensor(src_name)
                 if fp8_block is not None and t.dtype == torch.float8_e4m3fn:   # fp8 -> bf16, then slice
-                    sname = _fp8_scale_name(src_name)
-                    sc = fh.get_tensor(sname) if sname in fh.keys() else None
-                    if sc is None and sname in wm:
-                        with safe_open(wm[sname], framework="pt") as sfh:
-                            sc = sfh.get_tensor(sname)
+                    sc = _companion(fh, _fp8_scale_name(src_name))
                     if sc is not None:
                         t = _dequant_fp8_to_bf16(t, sc, fp8_block)
+                elif nvfp4_group is not None and src_name.endswith(".weight_packed"):
+                    # nvfp4 -> bf16 BEFORE slicing, mirroring _plan_weight_stream's pipeline branch
+                    # exactly (same helper, same logical shape derivation), then rename
+                    # '...weight_packed' -> '...weight' because the worker's TP structure has a
+                    # plain bf16 Linear slot and nothing named '*_packed'. The rename happens BEFORE
+                    # classification below so col/row detection and the '.bias' test see the final
+                    # name. Everything after this line is quant-format-blind.
+                    if t.dtype != torch.uint8 or t.ndim != 2:
+                        # Refuse instead of half-handling it: the packed layout this decoder knows is
+                        # 2D uint8 [out, in//2] (two E2M1 codes per byte). A 3D fused-MoE packed
+                        # tensor or a different dtype would silently unpack to the wrong shape, and
+                        # a wrong-shaped bf16 still slices and still loads.
+                        raise NotImplementedError(
+                            f"nvfp4 '{src_name}': packed weight is {t.dtype} ndim={t.ndim}, but the "
+                            "dequantizer only knows 2D uint8 [out, in//2]. A fused 3D MoE expert "
+                            "tensor (or any other packed layout) is unimplemented on the TP path.")
+                    sc = _companion(fh, _nvfp4_scale_name(src_name))
+                    gs = _companion(fh, _nvfp4_global_scale_name(src_name))
+                    if sc is None or gs is None:
+                        # The fp8 branch above tolerates a missing scale (it just serves the raw
+                        # tensor). nvfp4 must NOT: falling through would emit a U8 '*.weight_packed'
+                        # key the worker has no slot for, i.e. a missing '.weight' + an unexpected
+                        # key on a load_state_dict(assign=True) that does not check.
+                        raise KeyError(
+                            f"nvfp4 '{src_name}' is missing its scale sidecar(s) "
+                            f"(weight_scale={'ok' if sc is not None else 'MISSING'}, "
+                            f"weight_global_scale={'ok' if gs is not None else 'MISSING'}) — "
+                            "cannot dequantize, and serving the packed bytes would be garbage.")
+                    t = _dequant_nvfp4_to_bf16(t, sc, gs, nvfp4_group,
+                                               [int(t.shape[0]), int(t.shape[1]) * 2])
+                    out_name = out_name.replace(".weight_packed", ".weight")
+                kind, off, length = _tp_kind_and_slice(out_name, geo)
                 if kind is None:                  # replicated: embed/norm/head/layernorm/rotary
+                    if _tp_unshardable_moe(out_name):
+                        # #tp-moe-replicate. Checked HERE rather than up-front so the quant-format
+                        # refusals above (a fused 3D packed expert is rejected by the nvfp4 ndim
+                        # guard) keep reporting their own, more specific reason. Nothing has been
+                        # written or freed at this point — this path only builds an in-memory dict —
+                        # so the refusal costs the caller one wasted tensor read, not state.
+                        raise NotImplementedError(
+                            f"tensor-parallel serve of a MoE expert weight ('{out_name}') is "
+                            "unimplemented: _tp_kind_and_slice matches literal '.mlp.<proj>.' "
+                            "names and does not recognise per-expert/fused expert names, so this "
+                            "rank would receive the WHOLE tensor instead of its 1/tp slice — every "
+                            "rank holding the full expert stack, which is most of the model. "
+                            f"Refusing rather than replicating (tp_size={tp_size}).")
                     sd[out_name] = t.clone() if out_name == "lm_head.weight" and tied else t
                     continue
                 if out_name.endswith(".bias"):

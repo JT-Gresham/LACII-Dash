@@ -34,11 +34,21 @@ class WorkerLoadMixin:
         # ('' = leave alone, 'int8' = pack the head int8 beside an int4 body, 'bf16' = force
         # bf16). Absent on an old controller -> '' -> byte-identical to before.
         head_quant = (a.get("head_quant", "") or "").strip().lower()
-        # #shard-cache Inc 2 (serve-from-cache): controller flags '' | 'int4' | 'int2'. When set,
-        # fetch PRE-PACKED layer units (cache=<quant> on /weights) and install them directly — no
-        # bf16 stream, no per-layer re-quant. Pipeline only (the controller never sets it for TP);
-        # gated to the matching quant so a stale flag can never install a cross-tier cache.
-        cache = (a.get("cache", "") or "") if quant in ("int4", "int2") else ""
+        # #shard-cache Inc 2 (serve-from-cache): controller flags '' | 'int4' | 'int2' | 'int8'.
+        # When set, fetch PRE-PACKED layer units (cache=<quant> on /weights) and install them
+        # directly — no bf16 stream, no per-layer re-quant. Pipeline only (the controller never
+        # sets it for TP); gated to the matching quant so a stale flag can never install a
+        # cross-tier cache.
+        # #moe-int8: int8 joins the list. The cache and the cold load are the same bytes for a
+        # dense int8 model — shard_compile.pack_linear_int8 IS worker_quant._pack8_expert (what
+        # `_quantize_linear` calls), the head unit packs lm_head exactly as the cold `kind ==
+        # "head"` branch does, and shard_build._install_cached builds QuantLinear from
+        # qweight+scale with no zero point (`need_zero = quant != "int8"`), refusing a unit that
+        # carries one. Whether an int8 cache is ELIGIBLE at all (dense yes, MoE no) is decided on
+        # the CONTROLLER, in engine_load._cache_serve_tier: it needs the checkpoint's weight map,
+        # which lives on the controller's disk, and one place to state the rule is the point.
+        # This stays a pure tier list — a second copy of the MoE rule here is what drifts.
+        cache = (a.get("cache", "") or "") if quant in ("int4", "int2", "int8") else ""
         if tp_size <= 1:
             # DEFAULT PATH: stream each slice ONE LAYER AT A TIME straight into RAM bytes, then
             # st_load -> HEAP tensors (m4c25). NO temp files anywhere. The old path staged each slice

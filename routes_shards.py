@@ -29,6 +29,72 @@ def _ld_bytes(target, n: int) -> None:
         pass
 
 
+def _dir_pack_refusal(mdir: str, wm: dict, quant: str) -> str:
+    """The compile-side refusals that are properties of the model DIRECTORY, for the two routes
+    that reach the shared packer WITHOUT going through `compile_shards`. Returns the refusal text,
+    or "" when this (directory, quant) pair is distributable.
+
+    `shard_compile._refuse_unpackable` already carries every refusal decidable from a unit's own
+    tensors, so all four packer callers share those (/pack_probe's reference pack, /compile_dist's
+    local fallback, the worker's `handle_pack`, compile_shards' `_write_unit`). TWO of
+    compile_shards' guards are NOT decidable there and — as `_refuse_unpackable`'s own docstring
+    says — cannot move into the packer: they read config.json / the weight map, while the packer
+    only ever sees the already-bf16 tensors `/weights` has dequantized on the way out.
+      * a raw MXFP4 snapshot (`_mxfp4_quantized`): experts are '_blocks'/'_scales' pairs.
+      * an fp8/nvfp4-source MoE whose experts are FUSED 3D: no 3D serve-dequant exists.
+    So they belong at the ENTRY POINTS that skip compile_shards, which is here. The worker's
+    `handle_pack` is covered transitively, not by luck: the ONLY producers of a 'pack' control
+    frame are /pack_probe and /compile_dist below (grep '"type": "pack"' — client.py's match is the
+    worker-side handler), so every frame a worker packs has already passed this gate.
+
+    The MoE-at-non-int4 rule is here rather than left to the packer for two reasons. It is what
+    makes these routes answer the SAME as /compile_shards (the per-path drift this file keeps
+    re-growing), and the packer cannot see all of it: a MiniMax-M2-style checkpoint that keeps its
+    experts as per-expert 2D Linears has them inside `lin2d`, so `_refuse_unpackable` passes them
+    and an int8 probe would report byte_identical=True for a cache compile_shards refuses.
+
+    ONE helper, called from both routes — not a copy per route. Reads a couple of small JSON/index
+    files, so callers run it in a thread."""
+    import shards as _sh
+    if _sh._mxfp4_quantized(mdir):
+        return ("MXFP4 checkpoint (gpt-oss) cannot be shard-compiled in place: its expert weights "
+                "are packed '_blocks'/'_scales' pairs with no serve-time dequant here. Add the "
+                "model normally — model_store converts it to bf16 once via mxfp4_convert.py — and "
+                "compile THAT directory instead (same refusal as /compile_shards)")
+    if not _sh._has_moe_experts(wm):
+        return ""
+    if quant != "int4":
+        if quant == "int2":
+            _why = ("int2 is the GPTQ-CALIBRATED tier (compile_shards routes it to "
+                    "gptq_pack.compile_int2_gptq) and gptq_pack is dense-only — its sequential "
+                    "per-layer Hessian is built from dense activations, while a routed expert only "
+                    "ever sees the tokens routed to it. An RTN 3D int2 expert packer would be the "
+                    "WRONG artifact, not a missing one")
+        else:
+            _why = ("the int8 3D expert packer EXISTS now (worker_quant._pack8_3d / "
+                    "Packed8Tensor3D, whose per-expert math is _pack8_expert — shard_compile."
+                    "pack_linear_int8's bit-for-bit twin), so an int8 MoE COLD LOAD does quantize "
+                    "its experts and the old 'no int8 3D-expert quantizer' is half wrong. What "
+                    "still blocks the CACHE is downstream of the packer: pack_unit_tensors gates "
+                    "is_expert3d to int4 in BOTH its scope and name-heuristic branches, so the "
+                    "experts (~90% of a big MoE) would be written bf16 while the cold load "
+                    "quantizes them — a cache that diverges from the load it exists to replace — "
+                    "and shard_build._install_cached refuses a 3D expert tensor in a non-int4 "
+                    "cache outright ('only int4 has a 3D-expert format'). A 3D int8 branch in the "
+                    "packer AND a 3D int8 holder in the installer both have to land first. Dense "
+                    "int8 caches are unaffected: those compile and serve today")
+        return f"MoE shard-cache compile supports int4 only: {_why}"
+    if _sh._fp8_block_size(mdir) is not None or _sh._nvfp4_group_size(mdir) is not None:
+        # compressed-tensors quantizes nn.Linear modules, so a quantized MoE normally stores its
+        # experts PER-EXPERT and /weights dequantizes each 2D tensor to bf16 as usual — that case
+        # IS supported. Only a fused-3D quantized expert tensor would need a 3D serve-dequant.
+        if not any(".experts." in s and s.split(".experts.", 1)[1][:1].isdigit() for s in wm):
+            return ("fused-3D fp8/nvfp4-source MoE shard compile not supported (no 3D "
+                    "serve-dequant path); per-expert quantized MoE is supported (same refusal as "
+                    "/compile_shards)")
+    return ""
+
+
 def register(app):
 
     @app.get("/shard_status")           # #shard-cache: which quants are pre-compiled per model
@@ -118,6 +184,13 @@ def register(app):
         _moe_fused = any(s.endswith(".gate_up_proj") or s.endswith(".down_proj") for s in wm)
         _need_skel = _is_moe and not _moe_fused
         _skel = scope[2] if (scope and _need_skel) else None
+        # Same UP-FRONT gate /compile_dist gets (they must agree — a probe that says "identical"
+        # for a combination the compile refuses is worse than no probe). Without it an int8 MoE
+        # probe dispatched a frame, the worker's packer raised `_refuse_unpackable`, and the error
+        # came back as a 504 "remote pack failed" — a NODE-fault shape for an operator mistake.
+        _refuse = await asyncio.to_thread(_dir_pack_refusal, mdir, wm, quant)
+        if _refuse:
+            return JSONResponse({"ok": False, "error": _refuse}, status_code=400)
         req_id = f"pk-{int(time.time()*1000)}-{layer}"
         unit = f"L{int(layer):04d}.safetensors"
         fut = asyncio.get_event_loop().create_future()
@@ -198,13 +271,19 @@ def register(app):
         # but transformers 5.x builds the model FUSED-3D) needs the worker to fuse per-expert->3D via
         # `_fuse_moe_experts` against a meta skeleton (built from /modelmeta) — we flag `fuse` in the
         # pack frame so the worker builds it, and pass the local skeleton to the local-fallback pack.
-        # int8 MoE still has no 3D-expert quantizer -> reject (matches /compile_shards).
+        # MoE is still int4-only, but NOT for the reason this comment used to give: the int8 3D
+        # expert packer shipped (worker_quant._pack8_3d / Packed8Tensor3D), so "no int8 3D-expert
+        # quantizer" is now false. What blocks it is the CACHE packer's missing 3D int8 branch plus
+        # _install_cached's refusal of a 3D tensor in a non-int4 cache — `_dir_pack_refusal` carries
+        # the current wording, shared with /pack_probe so the two routes cannot drift apart again,
+        # and also the two DIRECTORY-level refusals (raw MXFP4, fused-3D fp8/nvfp4 MoE) that this
+        # route used to skip by calling pack_unit_tensors directly.
         _is_moe = bool(await asyncio.to_thread(_sh._has_moe_experts, wm))
         _moe_fused = any(s.endswith(".gate_up_proj") or s.endswith(".down_proj") for s in wm)
         _need_skel = _is_moe and not _moe_fused          # per-expert checkpoint -> fuse at pack time
-        if _is_moe and quant != "int4":
-            return JSONResponse({"ok": False, "error": "MoE distributed compile supports int4 only "
-                                 "(no int8 3D-expert quantizer) — use int4"}, status_code=400)
+        _refuse = await asyncio.to_thread(_dir_pack_refusal, mdir, wm, quant)
+        if _refuse:
+            return JSONResponse({"ok": False, "error": _refuse}, status_code=400)
         ckey = f"{friendly}::{quant}"
         if ckey in engine.compiling:
             return JSONResponse({"ok": False, "error": f"{_ollama_name(friendly)} {quant} already compiling"},

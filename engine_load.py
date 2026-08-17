@@ -229,6 +229,63 @@ class EngineLoadMixin:
                          f"({_moe_exc}) — honoring {quant} as requested")
         return quant
 
+    async def _cache_serve_tier(self, friendly: str, model_dir: str, quant: str) -> str:
+        """#shard-cache Inc 2 / #moe-int8: WHICH tier this load may SERVE FROM a shard cache, or ""
+        for "stream bf16 and quantize cold". Says nothing about whether a cache actually exists —
+        `_shard_cache_ok` answers that; this answers whether serving one at `quant` would be
+        EQUIVALENT to a cold load.
+
+        ONE helper, called ONCE per load, because the answer is read in two places (the hoisted
+        #cache-reserve decision and the dispatch-time vanish re-check) and a per-branch copy of a
+        rule is this project's dominant failure mode.
+
+        int4 / int2: yes, unconditionally — the existing behaviour.
+
+        int8: yes for DENSE models only (#moe-int8 follow-up). shard_compile has packed an int8
+        cache all along (`pack_linear_int8` is the same three statements as worker_quant
+        `_pack8_expert`, which is what `_quantize_linear` — the cold int8 path — calls), the head
+        unit packs `lm_head.weight` exactly as the cold `kind == "head"` branch does, and
+        `shard_build._install_cached` grew the int8 install (`need_zero = quant != "int8"`, so it
+        builds QuantLinear from qweight+scale with no zero point, and refuses a unit that carries
+        one). What was missing was any path that SELECTED such a cache: this gate and worker_load's
+        were int4/int2, so every int8 compile was write-only — hours of CPU and tens of GB that
+        every load then ignored and re-quantized.
+
+        MoE is scoped OUT rather than left to the installer. All four pack entry points already
+        refuse int8 MoE (compile_shards' `_moe` guard, `_refuse_unpackable`'s fused-3D check, and
+        `routes_shards._dir_pack_refusal` for /pack_probe + /compile_dist, which the worker's
+        handle_pack inherits — those are the only producers of a 'pack' frame), so no such cache
+        can exist today. But the shape it WOULD have is the one failure `_install_cached` cannot
+        see: `pack_unit_tensors` gates `is_expert3d` to int4, so the routed experts (~90% of a big
+        MoE) would be written as bf16 PASSTHROUGH — they install cleanly as plain Parameters, trip
+        neither the 3D-in-a-non-int4-cache refusal nor the meta guard, and the shard silently comes
+        up bf16-experts against an int8 plan. A tier list here that outlives one of those four
+        refusals is exactly the drift that keeps re-forking in this repo, so the serve side states
+        the rule itself.
+
+        Any doubt -> "" (stream bf16). Deliberately the OPPOSITE default to `_moe_tier_downgrade`,
+        which honours the request when the weight map is unreadable: there, refusing would break a
+        load that would have worked; here, refusing only costs a re-quantize."""
+        if quant in ("int4", "int2"):
+            return quant
+        if quant != "int8":
+            return ""
+        if not model_dir:
+            return ""
+        try:
+            import shards as _sh
+            _wm = await asyncio.to_thread(_sh._weight_map, model_dir)
+            if await asyncio.to_thread(_sh._has_moe_experts, _wm):
+                log_activity(f"{_ollama_name(friendly)}: int8 MoE — NOT serving from a shard cache "
+                             "(the packer has no 3D int8 expert branch, so a cached MoE's experts "
+                             "would be bf16 while a cold load packs them); streaming bf16")
+                return ""
+        except Exception as _cs_exc:
+            log_activity(f"{_ollama_name(friendly)}: int8 dense/MoE check failed ({_cs_exc!r}) "
+                         "-> bf16 stream (a re-quantize is the safe side of this doubt)")
+            return ""
+        return "int8"
+
     async def _precompile_int4(self, friendly: str, quant: str, tp: int) -> None:
         """#cache-on-first-load: for an int4 load with NO shard cache yet, BUILD it first
         (blocks until written) so THIS load — and every future load — serves the small pre-packed
@@ -1141,16 +1198,19 @@ class EngineLoadMixin:
             # not know and charged the co-located controller box the FULL bf16-stream reserve on
             # EVERY load. Hoisting is ~free (_shard_cache_ok memoizes on manifest mtime+size;
             # quant/model_dir are known here) and also spares the eviction-retry loop the
-            # re-checks. Conservative default: any doubt (no cache, check error, quant is
-            # none/int8) keeps the full bf16 reserve. Re-verified at dispatch (vanish guard).
+            # re-checks. Conservative default: any doubt (no cache, check error, a tier with no
+            # equivalent cache) keeps the full bf16 reserve. Re-verified at dispatch (vanish guard).
+            # #moe-int8: WHICH tiers may serve from a cache is `_cache_serve_tier`'s to say, decided
+            # ONCE here and re-read by the dispatch re-check below — one rule, not a copy per branch.
+            _cache_tier = await self._cache_serve_tier(friendly, model_dir, quant)
             _cache_quant = ""
             _cache_read_gb = 0.0
-            if quant in ("int4", "int2"):
+            if _cache_tier:
                 try:
-                    if model_dir and await asyncio.to_thread(_shard_cache_ok, model_dir, quant):
-                        _cache_quant = quant
+                    if model_dir and await asyncio.to_thread(_shard_cache_ok, model_dir, _cache_tier):
+                        _cache_quant = _cache_tier
 
-                        def _cache_tree_bytes(_d=os.path.join(model_dir, "_shards", quant)):
+                        def _cache_tree_bytes(_d=os.path.join(model_dir, "_shards", _cache_tier)):
                             _t = 0
                             for _r, _ds, _fs in os.walk(_d):
                                 for _f in _fs:
@@ -1492,9 +1552,12 @@ class EngineLoadMixin:
                                 # Connections panel attributes to the client
                                 "requested_by": _card0.get("requested_by", "")}
                 # #shard-cache Inc 2 (serve-from-cache): a VERIFIED cache makes every worker fetch
-                # PRE-PACKED int4/int2 layers (cache=int4) instead of streaming the full bf16 +
+                # PRE-PACKED layers (cache=<tier>) instead of streaming the full bf16 +
                 # re-quantizing — the big win for MoE/large loads (~18 GB cache vs ~70 GB bf16).
-                # int4 + pipeline only: TP slices weights non-contiguously (its own dispatch path,
+                # Which TIERS are eligible is `_cache_serve_tier`'s answer, taken once above and
+                # re-read here as `_cache_tier` (int4/int2 always; int8 dense-only, #moe-int8) —
+                # NOT a second tier list that can drift from the first.
+                # Pipeline only: TP slices weights non-contiguously (its own dispatch path,
                 # never reaches here). The controller falls back to bf16 PER UNIT if a cache file
                 # is missing, and an old worker that ignores the `cache` key streams bf16 — safe.
                 # #cache-reserve (audit #16): the decision itself (_cache_quant) is HOISTED above
@@ -1507,11 +1570,12 @@ class EngineLoadMixin:
                 # already re-enters cleanly from here). A cache that APPEARED since planning
                 # (a concurrent /compile_shards finished) is adopted as-is — the plan reserved
                 # MORE than needed, which is safe.
-                if quant in ("int4", "int2"):
+                if _cache_tier:
                     _now_cached = ""
                     try:
-                        if model_dir and await asyncio.to_thread(_shard_cache_ok, model_dir, quant):
-                            _now_cached = quant
+                        if model_dir and await asyncio.to_thread(_shard_cache_ok, model_dir,
+                                                                 _cache_tier):
+                            _now_cached = _cache_tier
                     except Exception as _ce:
                         log_activity(f"{friendly}: shard-cache re-check failed ({_ce!r}) "
                                      f"-> bf16 stream")
@@ -1599,7 +1663,7 @@ class EngineLoadMixin:
                         "device": "cpu" if cpu_only else nd.load_device(),
                         "gpu_budget_gb": round(_gpu_budget_gb, 3),   # #95: committed-aware GPU cap for this stage
                         "moe_offload": moe_offload,  # #moe-offload: split MoE layers (attn->GPU, experts->CPU RAM)
-                        "cache": _cache_quant,       # #shard-cache Inc 2: '' | 'int4' | 'int2' -> fetch pre-packed cache
+                        "cache": _cache_quant,       # #shard-cache Inc 2: '' | 'int4' | 'int2' | 'int8' (dense) -> pre-packed
                         "quant": quant,              # 'none' | 'int8' | 'int4' | 'int2' (load-time choice)
                         "kv_quant": kv_quant,        # #172 TurboQuant KV preset (none|turbo2|turbo3|turbo4)
                         "kv_offload": kv_offload,    # #kv-offload: KV cache in system RAM (OffloadedCache)

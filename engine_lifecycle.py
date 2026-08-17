@@ -34,8 +34,83 @@ FWD_FAIL_SPREAD_S = 30.0
 # newer request asks an orphaned forward to yield (per-slot reclaim, #fwd-cancel). The worker's
 # generic stage-error catch turns it into an ordinary error frame, so it arrives here looking
 # exactly like a compute failure. Counting it would make every successful orphan cleanup look like
-# node brokenness — the single most likely source of a false restart. Filtered by name.
-FWD_FAIL_BENIGN = ("_ForwardSuperseded",)
+# node brokenness — the single most likely source of a false restart.
+#
+# WHY THIS IS STILL A TEXT MATCH, AND WHAT MAKES IT SAFE. The exception type does not survive the
+# process boundary in any other form. The full chain, hop by hop:
+#   shard_forward raises _ForwardSuperseded("forward superseded by a newer request")
+#     -> worker_net's inbound catch FORMATS it — {"kind": "error", "error": f"{exc!r} | " + frames}
+#     -> intermediate stages relay that header VERBATIM (worker_net "propagate upstream error")
+#     -> the controller's _on_data reads hdr["error"] and hands the STRING to note_stage_failure.
+# There is no type, code or flag anywhere on that wire, and adding one means changing both sides
+# across a rolling update. So the discrimination stays textual and is hardened instead:
+#   * TWO INDEPENDENT MARKERS — the class name (all ``repr`` on an exception prints is
+#     ``type(exc).__name__``, so moving or re-namespacing the class changes nothing here; only a
+#     RENAME does) AND the raise-site message, which a rename does not touch. Either one alone
+#     keeps the filter working, so no single edit silently disables it.
+#   * A ONE-SHOT SELF-CHECK (_fwd_benign_markers) that says so IN ACTIVITY if the name we match on
+#     has stopped being the name shard_forward raises — fail loud rather than quietly reclassifying
+#     every orphan cleanup as a node fault and feeding false evidence to #wedge-detect.
+# NOT filtered, deliberately: the other orphan-path raise, "shard busy with a prior (orphaned)
+# forward — re-prefill required". That one means the orphan REFUSED to yield within the grace and
+# a live request died on it — the fast-failing-shard shape this detector exists to catch, with
+# worker-restart named as its backstop in shard_forward. See the note at the filter call site for
+# the one case that raise conflates.
+FWD_FAIL_BENIGN = ("_ForwardSuperseded", "superseded by a newer request")
+_FWD_BENIGN_CACHE = None   # resolved markers, computed once on first stage failure (never at import)
+
+
+def _fwd_benign_markers() -> tuple:
+    """FWD_FAIL_BENIGN, verified ONCE against shard_forward itself, extended if it has drifted.
+
+    The failure mode this guards is silent: rename the exception and the substring stops matching,
+    every #fwd-cancel orphan cleanup starts counting as a node fault, and #wedge-detect accumulates
+    false evidence toward evicting/restarting a healthy box holding a large resident model. So when
+    the name has moved we LOG IT (and match the live name for this run) instead of failing quietly.
+
+    HONEST SCOPE. shard_forward is a WORKER module and is NOT in the controller's EXTRA_UPDATE_FILES,
+    so the copy importable here is this checkout's, not necessarily the build a remote worker is
+    running. This therefore catches the rename AT THE SOURCE — which is when it is fixable — and
+    attests to nothing about what any particular worker emits. On a controller-only install the
+    module may not be importable at all; that is normal, not drift, and is not logged.
+
+    Called from note_stage_failure (i.e. after state.bind), never at import time — log_activity and
+    the rest of this module's globals do not exist yet at import. Never raises: any surprise leaves
+    the static markers in force, which is exactly today's behaviour.
+    """
+    global _FWD_BENIGN_CACHE
+    if _FWD_BENIGN_CACHE is not None:
+        return _FWD_BENIGN_CACHE
+    markers = tuple(FWD_FAIL_BENIGN)
+    try:
+        import shard_forward as _sf   # worker-side leaf: stdlib-only at import, no side effects
+    except Exception:
+        _FWD_BENIGN_CACHE = markers   # controller-only install: nothing here to check against
+        return _FWD_BENIGN_CACHE
+    try:
+        _cls = getattr(_sf, "_ForwardSuperseded", None)
+        if _cls is None:
+            # Renamed or reworked — find it by MEANING rather than spelling. Deliberately narrow
+            # (name/doc must talk about superseding): sweeping up every exception class in that
+            # module would quietly widen the benign set to include a future genuine-FAULT class.
+            _cls = next((v for v in vars(_sf).values()
+                         if isinstance(v, type) and issubclass(v, BaseException)
+                         and "supersede" in (v.__name__ + " " + (v.__doc__ or "")).lower()), None)
+        if _cls is None:
+            log_activity("wedge-detect: shard_forward exposes no superseded-forward exception — the "
+                         f"benign filter still matches {FWD_FAIL_BENIGN[0]!r}; if #fwd-cancel was "
+                         "reworked, orphan cleanup may now be counted as node faults (check "
+                         "FWD_FAIL_BENIGN in engine_lifecycle.py)")
+        elif not any(_b in _cls.__name__ for _b in FWD_FAIL_BENIGN):
+            markers += (_cls.__name__,)
+            log_activity(f"wedge-detect: shard_forward's superseded-forward exception is now "
+                         f"{_cls.__name__}, not {FWD_FAIL_BENIGN[0]} — the benign filter no longer "
+                         f"matches it by name; matching {_cls.__name__} for this run (the raise-site "
+                         "message marker still applies). Update FWD_FAIL_BENIGN in engine_lifecycle.py")
+    except Exception:
+        pass
+    _FWD_BENIGN_CACHE = markers
+    return _FWD_BENIGN_CACHE
 
 
 class EngineLifecycleMixin:
@@ -69,7 +144,15 @@ class EngineLifecycleMixin:
             _thr = FWD_FAIL_WEDGE_N
         if _thr <= 0:
             return None
-        if any(_b in (err or "") for _b in FWD_FAIL_BENIGN):
+        # #fwd-cancel cleanup is not a fault — see FWD_FAIL_BENIGN for why this is a text match and
+        # what tells us if it goes stale. The sibling raise, "shard busy with a prior (orphaned)
+        # forward — re-prefill required", is NOT filtered: it is a live request killed by an orphan
+        # that would not yield, which is the fast-fail wedge shape this detector was built for. It
+        # does conflate one healthy case — with kv_slots>1 a forward that finds ANOTHER slot's
+        # (healthy, sibling) forward holding the lock waits the same grace and raises the same
+        # sentence — but the two are indistinguishable from here: shard_forward raises one string
+        # for both. Splitting that raise at the source is the prerequisite for filtering it.
+        if any(_b in (err or "") for _b in _fwd_benign_markers()):
             return None
         if node_id is None:
             m = self.models.get(friendly) if friendly else None
