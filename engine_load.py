@@ -2239,7 +2239,7 @@ class EngineLoadMixin:
         _ctrl_host = socket.gethostname()
         self._place_filter(
             [n for n in registry.alive_sorted()
-             if n.can_infer and n.vram_total_gb > 0 and n.placement_enabled
+             if n.can_infer and n.vram_total_gb > 0
              and self._media_node_ok(n, "can_t2i")],
             pin_host, exclude_nodes, "t2i (image) model")
         if reg_key in self.models:
@@ -2252,14 +2252,12 @@ class EngineLoadMixin:
             # co-located = same box as the controller: hostname match (the robust signal —
             # a standalone worker may register its LAN IP, e.g. om3nbox's 192.168.x) or a
             # loopback/this-box data endpoint.
-            # #media-node-optout (audit #28): skip a node whose NODE_CONFIG has BOTH tiers
-            # disabled (fully opted out) — same rule as the t2a filter (see _load_t2a_locked
-            # for the furnace incident that motivated it). That note said this was
-            # "precautionary here; it becomes load-bearing the day t2i goes remote" — that day
-            # is now, since a remote can_t2i node is a real candidate below.
+            # #node-optout: the both-tiers-disabled exclusion is NOT spelled here any more — it
+            # lives on Node.placement_enabled and is applied by _place_filter below, so an
+            # opted-out node reaches that call and can be named as the REASON a pin failed.
+            # Pre-filtering it here instead made the pin error say only "not an eligible node".
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and n.vram_total_gb > 0
-                    and n.placement_enabled
                     and self._media_node_ok(n, "can_t2i")]
             cand = self._place_filter(cand, pin_host, exclude_nodes, "t2i (image) model")
             # In-flight loads' reservations count as USED (they're streaming toward that size —
@@ -2560,7 +2558,6 @@ class EngineLoadMixin:
         self._place_filter(
             [n for n in registry.alive_sorted()
              if n.can_infer and (cpu_only or n.vram_total_gb > 0)
-             and n.placement_enabled
              and (n.hostname == _ch or str(n.data_host).startswith(("127.", "::1"))
                   or str(n.data_host) in _LOCAL_IPS or getattr(n, "can_t2a", False))],
             pin_host, exclude_nodes, "t2a (ACE-Step) model")
@@ -2578,18 +2575,14 @@ class EngineLoadMixin:
             # #media-anywhere: serve on the co-located GPU OR any REMOTE GPU whose worker
             # advertised the acestep runtime (can_t2a) — the checkpoint streams to it via
             # snapshot_download and the WAV returns as base64 over the link, so no shared FS.
-            # #media-node-optout (audit #28): honor the dashboard's per-node tier toggles like
-            # the LLM planner does (its usable<=0 skip flows from eff_ram/eff_vram) — a node
-            # with BOTH tiers disabled in NODE_CONFIG is fully opted out and must not receive
-            # renders. This filter used to key off RAW vram_total_gb + can_t2a only, and the
-            # can_t2a-first sort below made the om3nbox pool's ONLY acestep node ALWAYS win —
-            # so music kept routing to furnace (RTX 5090, user-declared OFF-LIMITS, both tiers
-            # off) and OOM'd it. A SINGLE disabled tier still admits the node (tier toggles are
-            # placement knobs — RAM off = "GPU-only" still means the GPU is usable); only the
-            # both-off state excludes. Default (no NODE_CONFIG entry) is both-on -> unchanged.
+            # #node-optout: the tier check is applied by _place_filter below (Node.
+            # placement_enabled), not inline here — the can_t2a-first sort would otherwise let an
+            # off-limits box win outright, which is how music kept routing to furnace (RTX 5090,
+            # user-declared OFF-LIMITS, both tiers off) and OOM'd it. A SINGLE disabled tier still
+            # admits the node: tier toggles are placement knobs (RAM off = "GPU-only" still means
+            # the GPU is usable); only the both-off state is an opt-out.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and (cpu_only or n.vram_total_gb > 0)
-                    and n.placement_enabled
                     and (_is_colo(n) or getattr(n, "can_t2a", False))]
             cand = self._place_filter(cand, pin_host, exclude_nodes, "t2a (ACE-Step) model")
             # in-flight loads' reservations count as USED (same discipline as the t2i/LLM planners)
@@ -2891,13 +2884,13 @@ class EngineLoadMixin:
         # worker advertising the Whisper runtime (can_stt; it fetches from HF). Prefer, in order,
         # a can_stt node, then a co-located one, then the most VRAM — so a remote GPU with the
         # runtime beats a co-located CPU box, but a co-located node still serves with no can_stt.
-        # #media-node-optout: honor the dashboard's per-node tier toggles exactly like the t2a
-        # filter (audit #28) — a node with BOTH tiers disabled in NODE_CONFIG is fully opted out
+        # #node-optout: applied by _place_filter below via Node.placement_enabled — a node with
+        # BOTH tiers disabled in NODE_CONFIG is fully opted out
         # and must NOT receive transcriptions. This is what keeps stt OFF furnace (RTX 5090,
         # user-declared OFF-LIMITS, both tiers off) even though it advertises can_stt. A single
         # disabled tier still admits the node; default (no NODE_CONFIG entry) is both-on -> unchanged.
         cand = [n for n in registry.alive_sorted()
-                if n.can_infer and n.placement_enabled
+                if n.can_infer
                 and (_is_colo(n) or getattr(n, "can_stt", False))]
         if not cand:
             raise RuntimeError("no worker can serve the stt (Whisper) model — need a co-located "
@@ -2992,10 +2985,10 @@ class EngineLoadMixin:
                     or str(n.data_host) in _LOCAL_IPS)
         # Candidates: a co-located worker (reads the model dir off shared disk) OR any worker
         # advertising the MusicGen runtime (can_t2music; it fetches from HF). Honor the per-node tier
-        # toggles (audit #28) — a node with BOTH tiers disabled is opted out (keeps t2music off
+        # toggles via _place_filter — a node with BOTH tiers disabled is opted out (keeps t2music off
         # furnace). Prefer a can_t2music node, then co-located, then most VRAM.
         cand = [n for n in registry.alive_sorted()
-                if n.can_infer and n.placement_enabled
+                if n.can_infer
                 and (_is_colo(n) or getattr(n, "can_t2music", False))]
         if not cand:
             raise RuntimeError("no worker can serve the t2music (MusicGen) model — need a co-located "

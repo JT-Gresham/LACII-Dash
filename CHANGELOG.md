@@ -4,7 +4,7 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — a disabled node still got work, and a refusal blamed the wrong resource (0.3.26 / 0.3.31)
+## 2026-08-17 (latest) — a disabled node still got work, and a refusal blamed the wrong resource (0.3.27 / 0.3.31)
 
 ### Fixed
 
@@ -44,6 +44,15 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   pickers consulting it. Written this way because a per-path test passes happily while the paths
   disagree — which is the state this file was already in. It found the `_load_impl` and
   `_load_tp_locked` sites on its first run.
+
+  Verified live against the deployed controller with `beast` genuinely opted out: an LLM pinned
+  there is refused, and so is a media load. That first live run also showed the fix was still one
+  step short — the media leaves were *also* still filtering on `placement_enabled` themselves, so
+  an opted-out node never reached `_place_filter` and the pin error could only say *"not an
+  eligible node"* instead of naming the opt-out. Those redundant leaf copies are now removed, which
+  is what the "collapse to one helper" was supposed to mean in the first place: `_place_filter` is
+  the sole applier for the media paths, and the parity test gained an assertion that it still
+  applies the rule, since dropping that one call would now silently disarm all five leaves at once.
 
 - **An ACE-Step refusal named VRAM when RAM was the constraint.** The RAM-offload recipe has *two*
   independent budgets — transient VRAM for the DiT hop, and system RAM for the resting weights —

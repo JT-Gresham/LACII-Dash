@@ -82,6 +82,18 @@ for fn in sorted(f for f in os.listdir(ROOT) if f.endswith(".py")):
                 f"{fn}:{line}: re-spells the opt-out rule inline ({m.group(0)!r}) — "
                 f"use `.placement_enabled` so there stays exactly one definition")
 
+# ------------------------------------------- 2b. _place_filter must actually APPLY the rule
+# The leaves no longer pre-filter on placement_enabled (so that an opted-out node survives long
+# enough for _place_filter to name it as the reason a pin failed). That makes _place_filter the
+# ONLY thing standing between a media load and an off-limits node — if this call is ever dropped
+# during a refactor, all five media leaves silently lose the rule at once.
+_pf = re.search(r"def _place_filter\(.*?(?=\n    def )", _src("engine_load.py"), re.S)
+if _pf is None:
+    failures.append("engine_load.py: _place_filter is gone — the media leaves depend on it")
+elif "placement_enabled" not in _pf.group(0):
+    failures.append("engine_load.py: _place_filter no longer applies placement_enabled — every "
+                    "media leaf lost the opt-out rule with it (they do not check it themselves)")
+
 # ---------------------------------------------------------------- 3. every load dispatch is gated
 # Each load in engine_load.py sends {"type": "load", ...} on a link. That link must come from
 # _load_link (which checks the opt-out), never from a bare links.get.
