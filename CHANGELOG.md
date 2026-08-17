@@ -4,7 +4,88 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — int8 caches are SERVED, not just compiled (0.3.24 / 0.3.31)
+## 2026-08-17 (latest) — three arch facts reached the perf resolver DEAD (0.3.25 / 0.3.31)
+
+### Fixed
+
+- **`perf_profile.resolve()` was told nothing true about the architecture.** All three of its arch
+  facts were structurally always their default at **both** call sites (`engine_load`'s
+  `_perf_auto_knobs`, `routes_dashboard`'s `/optimize_knobs`):
+
+  - `is_hybrid` and `is_multimodal` were read as `getattr(spec, "layer_types", None)` /
+    `getattr(spec, "is_multimodal", False)` against a `ModelSpec` dataclass that declared
+    **neither field**. Nothing anywhere attached one, so both were always `None`/`False`.
+  - `full_attention_layers` was never passed by **any** caller, so a hybrid's KV was sized over
+    every layer including the ones holding fixed-size recurrent state.
+
+  The resolver's *"multimodal/hybrid arch → clamp `kv_slots` to 1"* branch could therefore never
+  fire, and `kv_slots` is an **applied** knob. Proven live before the fix, against the deployed
+  controller: `qwen2.5-vl:7b` resolved to **`kv_slots=3`** with the rationale *"keeps interleaved
+  conversations' prefixes warm"* — byte-identical treatment to the plain-text `qwen2.5:7b-instruct`
+  — reserving 3× full-ctx KV to buy prefix reuse that `#prefix-kv` gates off for VLMs. The defect
+  stayed invisible because the big hybrids clamp to 1 for an unrelated reason (no spare VRAM);
+  only a *small* multimodal model exposes it.
+
+  Fixed by giving `ModelSpec` the facts as real fields (`layer_types`, `is_multimodal`), populated
+  in `model_store._spec_from_config` from the config it already parses, and exposing `is_hybrid` /
+  `full_attention_layers` as **single-implementation** properties both call sites read.
+
+  `is_hybrid` and `full_attention_layers` answer different questions and deliberately use different
+  predicates — conflating them is the bug the pair exists to prevent. A **sliding-window** layer is
+  hybrid (no prefix reuse) but still grows a ctx-scaled KV, so it counts toward
+  `full_attention_layers`; charging those zero is precisely what funded gpt-oss's 12-of-24 and
+  Gemma-4's 20-of-24 sliding layers at 0 bytes earlier this session. Only genuinely KV-less kinds
+  are excluded, and an **unrecognised** kind counts — a new arch must over-reserve (a refused
+  placement), never under-reserve (a decode OOM).
+
+- **`kv_layer_frac` was derived only from `linear_attn_config.kda_layers`** — the `layer_types`
+  branch of the same rule did not exist. So every hybrid that declares itself the transformers
+  way (qwen3-next, qwen3.6-35b-a3b, Gemma-4, gpt-oss) planned KV over **every** layer while the
+  worker's `_kv_layer_mask` reserved only the layers that really grow one. Measured on the real
+  Qwen3.6-35B-A3B checkpoint: `layer_types` is **30 linear_attention + 10 full_attention of 40**,
+  so the controller sized KV at 4× the worker's reservation and refused placements that fit.
+
+- **A hard-coded `MODEL_SPECS` entry short-circuits the config**, so a fact missing there is
+  missing for good — `resolve_spec` returns `MODEL_SPECS[id]` without ever reading `config.json`.
+  The `Qwen/Qwen3.6-35B-A3B` entry declared neither fact and was wrong about both; its own comment
+  said *"the checkpoint is multimodal"* while the spec said otherwise. Corrected **from the real
+  checkpoint**, not from the comment: `kv_layer_frac=10/40`, `is_multimodal=True`. Encoded as the
+  fraction rather than a fabricated per-layer `layer_types` order, because only the counts are
+  consumed and inventing an order would be data nobody measured.
+
+- **The first draft of this fix introduced the exact drift it was written to prevent**, and the
+  adversarial verifier caught it. The controller's KV-less predicate started as a frozenset naming
+  `mamba`/`recurrent`/`gated_deltanet`/`short_conv`/`conv` as well — **six of seven strings the
+  worker's `shard_build._is_linear_attn_type` does not recognise**, since that gate is
+  `"linear" in layer_type.lower()` and its docstring states it is *"deliberately NARROW"* and kept
+  substring-based *"so the two sniffs cannot drift apart."* The planner would have funded such a
+  layer at **zero** while the worker reserved a full ctx-scaled KV — a decode-time OOM. Replaced
+  with the worker's predicate character-for-character. The controller may over-reserve relative to
+  the worker; it must never under-reserve.
+
+- **`/plan`'s kv_quant hybrid gate was left duplicated, deliberately.** It reads `config.json`
+  directly rather than `spec.is_hybrid` because it must stay conservative when the config is
+  *unreadable* — a case where the spec falls back to the built-in dense table and would look
+  non-hybrid. That is not a pure dedup, so it was not done; instead the new test asserts the two
+  implementations **agree** on every config both can read.
+
+### Added
+
+- **`scratch_perf_facts_test.py` — a regression gate for the whole bug class, not just this bug.**
+  It deliberately does *not* test `resolve()`: a test that calls the resolver passes the flag
+  itself and so can never see a dead input. It tests the **wiring** — (1) an AST scan failing any
+  `getattr(spec, X, default)` naming a non-field of `ModelSpec`; (2) a coverage gate requiring every
+  arch-fact parameter `resolve()` declares to be passed by every call site, which is what catches a
+  fact dead by **omission** (`full_attention_layers`) that no getattr scan can see; (3) behaviour
+  across dense / sliding / linear / kda / unknown-kind shapes; (4) the `/plan`-gate parity check;
+  (5) `is_multimodal` detection; (6) `kv_layer_frac` derived from `layer_types`; (7) the built-in
+  table's arch facts, with every other entry asserted still dense so planning is bit-identical;
+  and (8) the parity check that caught the frozenset defect above — it **extracts the worker's
+  `_is_linear_attn_type` from `shard_build.py` by AST and runs both predicates over a shared
+  vocabulary of layer-type spellings**, rather than asserting a hand-copied expectation, so the
+  two cannot drift without this failing. 63 checks, no torch, no fleet.
+
+## 2026-08-17 — int8 caches are SERVED, not just compiled (0.3.24 / 0.3.31)
 
 ### Added
 

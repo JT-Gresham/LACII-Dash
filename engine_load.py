@@ -504,7 +504,6 @@ class EngineLoadMixin:
             _req["moe_offload"] = True
         if head_quant:
             _req["head_quant"] = head_quant
-        _lt = getattr(spec, "layer_types", None)
         knobs, why = _pp.resolve(
             params_b=float(getattr(spec, "meas_params", 0) or 0) / 1e9
                      or float(spec.total_weight_bytes) / 2e9,
@@ -515,8 +514,14 @@ class EngineLoadMixin:
                     num_kv_heads=spec.num_kv_heads, head_dim=spec.head_dim,
                     intermediate_size=spec.intermediate_size,
                     attn_bias=bool(getattr(spec, "attn_bias", True))),
-            is_hybrid=bool(_lt) and any(t != "full_attention" for t in (_lt or [])),
-            is_multimodal=bool(getattr(spec, "is_multimodal", False)),
+            # #perf-facts: ONE implementation of each, on the spec. These were
+            # getattr(spec, "layer_types"/"is_multimodal", <default>) against a ModelSpec that
+            # declared neither field, so both were always the default and the resolver's
+            # hybrid/multimodal kv_slots clamp was unreachable. full_attention_layers was never
+            # passed by any caller either, so a hybrid's KV was sized over EVERY layer.
+            is_hybrid=spec.is_hybrid,
+            full_attention_layers=spec.full_attention_layers,
+            is_multimodal=bool(spec.is_multimodal),
             arch=str(getattr(spec, "arch", "") or ""),
             # section 4b only suggests an int8 lm_head where one EXISTS: a tied head aliases
             # embed_tokens, so without this the log proposed quantizing a matrix that is not

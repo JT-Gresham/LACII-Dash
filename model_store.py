@@ -49,7 +49,7 @@ import sys
 import time
 from typing import Optional
 
-from placement import ModelSpec
+from placement import ModelSpec, _is_kvless_layer_type
 # Three PURE safetensors-header helpers (no server state) live in shards.py; the storage
 # helpers below use them to inspect a downloaded model's weight map / text prefix / head key.
 from shards import _weight_map, _text_prefix, _head_key
@@ -934,12 +934,42 @@ def _spec_from_config(model_dir: str, name: str) -> Optional[ModelSpec]:
         _nkda = len({int(v) for v in (_lac.get("kda_layers") or [])})
         if layers > 0 and 0 < _nkda < layers:
             kv_layer_frac = (layers - _nkda) / float(layers)
+    # #perf-facts: carry the two arch facts perf_profile.resolve() asks for on every load. Read
+    # from the MERGED config, so a composite checkpoint's text_config.layer_types wins — that is
+    # where Gemma-4 / qwen3-next / gpt-oss declare their per-layer kinds. is_multimodal is the
+    # _composite markers MINUS bare text_config: a nested text config alone (a plain LM whose
+    # dims sit one level down) carries no tower and is not multimodal.
+    _lt = c.get("layer_types")
+    layer_types = (tuple(str(t) for t in _lt)
+                   if isinstance(_lt, (list, tuple)) and _lt else None)
+    is_multimodal = any(c.get(k) is not None for k in
+                        ("vision_config", "audio_config", "thinker_config",
+                         "talker_config", "token2wav_config"))
+    # The layer_types BRANCH of the rule the kda block above implements. Until 2026-08-17
+    # kv_layer_frac was derived ONLY from linear_attn_config.kda_layers, so every hybrid that
+    # declares itself the transformers way instead (qwen3-next, qwen3.6-35b-a3b, Gemma-4,
+    # gpt-oss) planned KV over EVERY layer while the worker's _kv_layer_mask reserved only the
+    # layers that really grow one. Measured on Qwen3.6-35B-A3B: layer_types is 30
+    # linear_attention + 10 full_attention of 40, so the controller sized KV 4x the worker's
+    # reservation and refused placements that fit.
+    #
+    # SLIDING-WINDOW LAYERS COUNT. Their KV is bounded by the window, not zero, and charging
+    # them zero is what funded gpt-oss's 12-of-24 and Gemma-4's 20-of-24 sliding layers at 0
+    # bytes earlier this session. Only genuinely KV-less kinds are excluded and an unrecognised
+    # kind counts — the same _is_kvless_layer_type that ModelSpec.full_attention_layers and the
+    # WORKER's shard_build._is_linear_attn_type use, so fraction, layer count and the real
+    # reservation can never disagree.
+    if layer_types and layers > 0 and len(layer_types) == layers:
+        _nkv = sum(1 for t in layer_types if not _is_kvless_layer_type(t))
+        if 0 < _nkv < layers:
+            kv_layer_frac = _nkv / float(layers)
     return ModelSpec(name, hidden, layers, heads, kv, head_dim, inter, vocab,
                      tie_embeddings=bool(c.get("tie_word_embeddings", False)),
                      arch=str(c.get("model_type") or "llama"),
                      attn_bias=bool(c.get("attention_bias", c.get("qkv_bias", False))),
                      max_ctx=max_ctx, is_embedding=is_embedding,
-                     kv_layer_frac=kv_layer_frac)
+                     kv_layer_frac=kv_layer_frac,
+                     layer_types=layer_types, is_multimodal=is_multimodal)
 
 
 # ---------------------------------------------------------------------------

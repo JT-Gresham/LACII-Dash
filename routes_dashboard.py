@@ -242,7 +242,6 @@ def register(app):
                                   is_hip=("amd" in _dn or "radeon" in _dn),
                                   capability=_cap,
                                   unified_memory=False)
-        _lt = getattr(spec, "layer_types", None)
         knobs, why = _pp.resolve(
             params_b=(float(getattr(spec, "meas_params", 0) or 0) / 1e9
                       or float(spec.total_weight_bytes) / 2e9),
@@ -253,8 +252,10 @@ def register(app):
                     num_kv_heads=spec.num_kv_heads, head_dim=spec.head_dim,
                     intermediate_size=spec.intermediate_size,
                     attn_bias=bool(getattr(spec, "attn_bias", True))),
-            is_hybrid=bool(_lt) and any(t != "full_attention" for t in (_lt or [])),
-            is_multimodal=bool(getattr(spec, "is_multimodal", False)),
+            # #perf-facts: same single implementation /load uses — see ModelSpec.is_hybrid.
+            is_hybrid=spec.is_hybrid,
+            full_attention_layers=spec.full_attention_layers,
+            is_multimodal=bool(spec.is_multimodal),
             arch=str(getattr(spec, "arch", "") or ""),
             tie_word_embeddings=bool(getattr(spec, "tie_embeddings", False)),
             device_class=dev, free_vram_gb=free_v, free_ram_gb=float(best.eff_ram_gb or 0.0),

@@ -24,6 +24,25 @@ WEIGHT_DTYPE_BYTES = 2
 KV_DTYPE_BYTES = 2
 DEFAULT_CTX = 8192
 
+def _is_kvless_layer_type(layer_type) -> bool:
+    """Does this layer_types entry hold FIXED-SIZE state instead of a ctx-scaled K/V?
+
+    ⚠⚠ This MUST stay character-identical to the worker's `shard_build._is_linear_attn_type`.
+    The worker is the ENFORCER — it builds the real cache and its `kv_reserve_probe` fails a
+    stage cleanly — so the controller may over-reserve relative to it but must NEVER
+    under-reserve. A first draft of this used a frozenset naming `mamba`/`recurrent`/
+    `gated_deltanet`/`short_conv`/`conv` as well; six of those seven strings do not contain
+    "linear", so the planner would have funded such a layer at ZERO while the worker reserved a
+    full ctx-scaled KV for it. That is a decode-time OOM, and it would have been introduced by
+    the very change meant to stop this kind of drift.
+
+    Substring, not a set, for the reason the worker documents: a future `linear_*` variant is
+    then caught by both sniffs by default rather than by one of them. Deliberately NARROW —
+    every other non-`full_attention` kind is still softmax attention holding K/V,
+    `sliding_attention` above all (bounded by the window, not absent).
+    """
+    return "linear" in str(layer_type).lower()
+
 
 @dataclass
 class ModelSpec:
@@ -68,6 +87,17 @@ class ModelSpec:
     # exact per-layer enforcer that fails a stage cleanly and triggers a replan. 1.0 = every
     # existing model, bit-identical.
     kv_layer_frac: float = 1.0
+    # #perf-facts: two arch facts perf_profile.resolve() asks for on every load and every
+    # /optimize_knobs. Until 2026-08-17 BOTH call sites read them off the spec with
+    # getattr(spec, "layer_types", None) / getattr(spec, "is_multimodal", False) — and ModelSpec
+    # declared NEITHER field, so both were structurally ALWAYS the default. The resolver's
+    # "multimodal/hybrid arch -> clamp kv_slots to 1" branch (perf_profile.py:211) could
+    # therefore never fire, and kv_slots is an APPLIED knob: a VLM could be auto-assigned C=2/3,
+    # reserving 2-3x full-ctx KV for prefix reuse that #prefix-kv gates off for exactly those
+    # arches. Carried as real fields so there is ONE place that knows, populated by
+    # model_store.spec_from_config from the config it already parses.
+    layer_types: Optional[tuple] = None   # transformers' per-layer attention kinds, as declared
+    is_multimodal: bool = False           # checkpoint carries a vision/audio/talker tower
 
     @property
     def per_layer_weight_bytes(self) -> int:
@@ -160,6 +190,46 @@ class ModelSpec:
             return self
         return replace(self, kv_slots=slots)
 
+    # NOTE: is_hybrid and full_attention_layers answer DIFFERENT questions and deliberately use
+    # DIFFERENT predicates. Conflating them is the bug this pair exists to prevent — a
+    # sliding-window layer is hybrid (no prefix reuse) but DOES grow a ctx-scaled KV.
+    @property
+    def is_hybrid(self) -> bool:
+        """Does this arch deviate from uniform full-attention on every layer?
+
+        Broad by design: ANY non-full_attention entry counts (sliding-window Gemma-4 / gpt-oss /
+        Mistral just as much as linear-attention qwen3-next), plus the fla-style archs that
+        declare their linear layers via linear_attn_config instead of layer_types — those reach
+        us as kv_layer_frac < 1.0 (model_store.spec_from_config computes it from kda_layers).
+
+        This is the predicate for "#prefix-kv is gated off here", which is why it must catch
+        sliding-window: those arches are gated off prefix reuse too. It is NOT the predicate for
+        "which layers grow a KV" — see full_attention_layers.
+        """
+        if any(str(t) != "full_attention" for t in (self.layer_types or ())):
+            return True
+        return float(self.kv_layer_frac or 1.0) < 1.0
+
+    @property
+    def full_attention_layers(self) -> int:
+        """How many layers grow a KV cache that SCALES WITH CONTEXT.
+
+        Narrow by design, and CONSERVATIVE in the only direction that is safe: a layer kind we
+        do not recognise counts as full KV, so a new arch over-reserves (a refused placement)
+        rather than under-reserves (a decode OOM). Sliding-window layers COUNT — their KV is
+        bounded by the window, not zero, and charging them zero is precisely the mistake that
+        funded gpt-oss's 12-of-24 and Gemma-4's 20-of-24 sliding layers at 0 bytes.
+
+        Only genuinely KV-less layers are excluded, via the worker's own predicate — see
+        _is_kvless_layer_type for why that identity is load-bearing. Falls back to kv_layer_frac
+        (the fla/kda path, which has no layer_types at all) and to num_layers for every dense
+        model, bit-identically.
+        """
+        lt = self.layer_types or ()
+        if len(lt) == self.num_layers:   # trust it only when it describes THIS model's depth
+            return sum(1 for t in lt if not _is_kvless_layer_type(t))
+        return max(0, int(round(self.num_layers * float(self.kv_layer_frac or 1.0))))
+
 
 MODEL_SPECS: dict[str, ModelSpec] = {
     "Qwen/Qwen2.5-0.5B-Instruct": ModelSpec(
@@ -197,9 +267,18 @@ MODEL_SPECS: dict[str, ModelSpec] = {
     # the dense-formula fallback only — planner MEASURES real per-layer bytes). GQA 16/2,
     # head_dim 256 (independent of hidden), no attn bias, untied, native ctx 262144. The
     # checkpoint is multimodal; client loads only the text LM (language_model.* remap).
+    # ⚠ A hard-coded entry SHORT-CIRCUITS the config: resolve_spec returns MODEL_SPECS[id] without
+    # ever reading config.json, so any arch fact missing here is missing for good. This entry said
+    # nothing about either, and both were wrong — READ FROM THE REAL CHECKPOINT 2026-08-17:
+    # text_config.layer_types is 30 linear_attention + 10 full_attention of 40, and the top level
+    # carries vision_config/image_token_id/video_token_id. So the planner charged KV on 4x the
+    # layers that grow one, and perf_profile was told the model was neither hybrid nor multimodal.
+    # kv_layer_frac (not layer_types) is the honest encoding: only the COUNTS are consumed, and
+    # fabricating a per-layer order here would be data nobody measured.
     "Qwen/Qwen3.6-35B-A3B": ModelSpec(
         "Qwen3.6-35B-A3B", 2048, 40, 16, 2, 256, 512, 248320,
-        tie_embeddings=False, arch="qwen3_5_moe", attn_bias=False, max_ctx=262144),
+        tie_embeddings=False, arch="qwen3_5_moe", attn_bias=False, max_ctx=262144,
+        kv_layer_frac=10 / 40, is_multimodal=True),
 }
 
 
