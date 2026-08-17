@@ -4,7 +4,60 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — three arch facts reached the perf resolver DEAD (0.3.25 / 0.3.31)
+## 2026-08-17 (latest) — a disabled node still got work, and a refusal blamed the wrong resource (0.3.26 / 0.3.31)
+
+### Fixed
+
+- **A node with BOTH memory tiers disabled was still receiving work.** Turning RAM *and* VRAM off
+  for a host in the node config is not a placement hint — it is the operator declaring that host
+  off limits. That rule existed as **six inline copies** of `(n.ram_enabled or n.vram_enabled)` in
+  the media leaves of `engine_load.py`, and the two placement paths written *after* those copies
+  never got one at all:
+
+  - `media_encode.py` — the vision-tower encode picker. It selects a node, streams the tower
+    weights to it and runs the encode there, and it sorts candidates by **most free VRAM** — so an
+    off-limits box was not merely eligible, it was usually the one that **won**.
+  - `routes_shards.py` — the `/compile_shards` candidate list. A distributed pack streams the
+    source weights to the worker and quantizes them in *its* RAM, which is the resource being
+    withheld.
+
+  Fixed by collapsing every copy onto a single definition, `Node.placement_enabled` (server.py),
+  applied once for all callers inside `_place_filter`. Added `engine_load._load_link` as a
+  **dispatch-side backstop**: every load already reached for `self.links.get(node.node_id)` and
+  raised on `None`, so the check went in beside the lookup that all 8 load dispatches share
+  (5 media leaves + embedding + the pipeline LLM path in `_load_impl` + the TP mesh in
+  `_load_tp_locked`). The primary gate is still the filter; the backstop exists because a filter is
+  something a caller must *remember* to apply, which is precisely what the two paths above did not.
+
+  Scope is placement only. Unload, teardown, restart, reaping, vram-trim and generation against a
+  model **already resident** on the node deliberately keep their plain `links.get` — disabling a
+  node has to let it *drain*, and refusing teardown would strand whatever is on it.
+
+  The pipeline and TP paths were not reachable in practice (`eff_ram_gb`/`eff_vram_gb` both return
+  `0.0` for a disabled tier, so the node offers no capacity and never wins a stage) — but that is a
+  *budget* argument that holds only for planners which size against `eff_*`, and says nothing about
+  a pin, an adopt, or the next planner. They are now explicit.
+
+  `scratch_node_optout_parity_test.py` asserts the **structural** property rather than per-path
+  behaviour: exactly one definition of the rule, no file re-spelling it inline, every `"type":
+  "load"` dispatch bound through `_load_link`, teardown *not* bound through it, and the two later
+  pickers consulting it. Written this way because a per-path test passes happily while the paths
+  disagree — which is the state this file was already in. It found the `_load_impl` and
+  `_load_tp_locked` sites on its first run.
+
+- **An ACE-Step refusal named VRAM when RAM was the constraint.** The RAM-offload recipe has *two*
+  independent budgets — transient VRAM for the DiT hop, and system RAM for the resting weights —
+  but every failure message quoted `_need_gb()`, which is the **VRAM** figure. So a node that
+  passed the VRAM test and failed the RAM one was reported as *"no GPU has ~8.0 GB free for the
+  music model"*. Observed on `amdcomp`: 11.32 GB of free VRAM on an idle GPU, refused because it
+  was **0.13 GB short of system RAM** (two KVM guests and Jellyfin held ~20 GB of its 31 GB). The
+  message pointed at the one resource that was not the problem, and read as a phantom shortage.
+
+  Each candidate now records which budget it actually missed, and the failure reports the binding
+  resource with need-vs-have per node, sorted by **smallest gap** — the near-miss node is the one
+  worth freeing 200 MB on. No safety margin was changed: the shortfall was real, only misreported.
+
+## 2026-08-17 — three arch facts reached the perf resolver DEAD (0.3.25 / 0.3.31)
 
 ### Fixed
 

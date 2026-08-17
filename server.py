@@ -66,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.25"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.26"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -808,6 +808,31 @@ class Node:
     @property
     def vram_enabled(self) -> bool:
         return NODE_CONFIG.get(self.hostname, {}).get("vram", True)
+
+    @property
+    def placement_enabled(self) -> bool:
+        """#node-optout: may the controller place NEW work on this node at all?
+
+        BOTH tiers off in NODE_CONFIG is not a placement hint — it is the operator declaring the
+        node OFF LIMITS ("its denied in the server config … the node should flat out refuse anything
+        to be loaded, doesnt matter"). A SINGLE disabled tier still admits the node, because one
+        tier off is an ordinary placement knob: RAM off means "GPU-only", VRAM off means "CPU-only",
+        and `load_device()` below already turns each into a device directive. Only the both-off
+        state is an opt-out. Default (no NODE_CONFIG entry) is both-on -> unchanged.
+
+        THIS PROPERTY IS THE ONLY COPY OF THAT RULE. It used to be written inline as
+        `(n.ram_enabled or n.vram_enabled)` at six media-placement sites in engine_load.py, and the
+        sites that were written later — the vision-tower encode picker (media_encode.py) and the
+        /compile_shards candidate list (routes_shards.py) — never got a copy at all, so both would
+        still hand work to an opted-out node. Per-branch copies of an invariant are this codebase's
+        dominant failure mode; route every new placement decision through here rather than
+        re-spelling the condition, and see engine_load._load_link for the dispatch-side backstop
+        that catches a planner which forgets entirely.
+
+        Scope is PLACEMENT ONLY. Teardown, generation against a model already resident here,
+        heartbeat, reaping and restart must all keep working — otherwise disabling a node would
+        strand whatever is on it instead of letting it drain."""
+        return self.ram_enabled or self.vram_enabled
 
     @property
     def eff_ram_gb(self) -> float:

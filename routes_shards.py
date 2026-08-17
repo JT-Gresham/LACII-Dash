@@ -291,15 +291,26 @@ def register(app):
         n_layers = await asyncio.to_thread(_sh._model_num_layers, mdir)
         out_dir = os.path.join(_sc._shard_cache_root(mdir), quant)
         await asyncio.to_thread(lambda: os.makedirs(out_dir, exist_ok=True))
-        caps = [n for n in registry.alive_sorted() if n.can_infer and engine.links.get(n.node_id)]
+        # #node-optout: both memory tiers disabled = the operator declared the node off limits, and
+        # a distributed pack is exactly the kind of work that must respect that — it streams the
+        # source weights to the worker and quantizes them in ITS RAM, which is the resource being
+        # withheld. This list predates the media placement filters and never carried the check.
+        caps = [n for n in registry.alive_sorted()
+                if n.can_infer and n.placement_enabled and engine.links.get(n.node_id)]
         # #compile-picker: node= pins the pack to ONE worker (the dashboard's "a specific node"
         # choice) — useful to keep a compile off busy boxes, or to drive it from the one machine
         # with the RAM headroom. Empty = fan out across the whole fleet (the default).
         if node:
+            _off = [n.hostname for n in registry.alive_sorted()
+                    if n.hostname == node and not n.placement_enabled]
             caps = [n for n in caps if n.hostname == node]
             if not caps:
-                return JSONResponse({"ok": False, "error": f"no alive, linked worker named '{node}'"},
-                                    status_code=404)
+                # Name the opt-out explicitly: "no alive, linked worker" would send the operator
+                # chasing a dead node when in fact they disabled this one on purpose.
+                _err = (f"node '{node}' has BOTH memory tiers disabled in the node config — it is "
+                        f"opted out of placement and will not accept a compile" if _off
+                        else f"no alive, linked worker named '{node}'")
+                return JSONResponse({"ok": False, "error": _err}, status_code=404)
         engine.compiling[ckey] = {"model": friendly, "display_model": _ollama_name(friendly), "target": tgt,
                                   "ready": 0, "total": n_layers + 2, "stages_total": max(1, len(caps)),
                                   "stages_ready": 0, "basis": f"distributed {quant} compile "

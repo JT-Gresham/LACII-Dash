@@ -65,8 +65,16 @@ def _vision_node_forward(target_id: str, pv, grid):
     loop = getattr(engine, "_loop", None)
     if loop is None:
         return None
+    # #node-optout: a node with BOTH memory tiers disabled is opted out of placement entirely, and
+    # that includes this — the tower weights stream to the chosen worker and the encode runs there,
+    # so it is real work on real VRAM, not a lookup. This picker was written after the media
+    # placement filters and never got the check, so an off-limits box (both tiers off) was still a
+    # candidate here, and being sorted by MOST FREE VRAM it was usually the box that WON. Falling
+    # out of the list is safe: no candidate means the tower simply encodes locally, which is the
+    # same path taken when no node has a link.
     cands = [n for n in registry.alive_sorted()
-             if n.can_infer and n.vram_total_gb > 0 and engine.links.get(n.node_id) is not None]
+             if n.can_infer and n.vram_total_gb > 0 and n.placement_enabled
+             and engine.links.get(n.node_id) is not None]
     if not cands:
         return None
     cands.sort(key=lambda n: -float(getattr(n, "vram_total_gb", 0) or 0))

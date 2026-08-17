@@ -1617,9 +1617,12 @@ class EngineLoadMixin:
                         next_host, next_port = nxt.data_host, nxt.data_port
                     else:
                         next_host, next_port = None, ARGS.data_port  # -> controller
-                    link = self.links.get(st.node_id)
-                    if link is None:
-                        raise RuntimeError(f"no control link to {st.node_id}")
+                    # #node-optout: the LLM planner normally keeps an opted-out node out of the
+                    # plan implicitly — eff_ram_gb/eff_vram_gb both return 0.0 for a disabled tier,
+                    # so it offers no capacity and never wins a stage. That is a BUDGET argument,
+                    # though, not a refusal: it holds only for paths that size against eff_*, and
+                    # says nothing about a pin, an adopt, or a future planner. Make it explicit.
+                    link = self._load_link(nd, friendly)
                     # #loopback-nexthop: a worker CO-LOCATED with the controller advertises a
                     # LOOPBACK data_host (fastest for the controller's own stage0 dials) — but
                     # handed verbatim to a REMOTE stage as its next hop, "127.0.0.1:50200" dials
@@ -1967,20 +1970,70 @@ class EngineLoadMixin:
         The single-node leaves were each written as "find a capable node" and never revisited as
         placement grew pin / replica / federation semantics, so all three constraints were silently
         absent. An unsatisfiable pin RAISES naming the survivors: quietly placing elsewhere is the
-        failure mode that let this hide, because a wrong-but-working placement looks fine."""
+        failure mode that let this hide, because a wrong-but-working placement looks fine.
+
+        #node-optout: the both-tiers-off exclusion is applied HERE, once, for every caller. It was
+        previously six inline `(n.ram_enabled or n.vram_enabled)` copies in the leaf filters just
+        above each call to this function — the copies agreed today, but that is the shape that has
+        already drifted repeatedly in this file, so the condition now lives on Node.placement_enabled
+        and is spelled exactly once. An opted-out node is reported SEPARATELY from the other
+        rejections below, because "no eligible node" reads as a capability problem and sends the
+        operator hunting for a missing runtime when the real answer is that they switched the node
+        off themselves."""
+        _optout = [x.hostname for x in cand if not x.placement_enabled]
+        cand = [x for x in cand if x.placement_enabled]
         cand = [x for x in cand if not _peer_claimed_host(x.hostname)]
         if exclude_nodes:
             cand = [x for x in cand if x.node_id not in exclude_nodes]
         if pin_host:
             _p = [x for x in cand if x.hostname == pin_host]
             if not _p:
+                _why = (f" — '{pin_host}' has BOTH memory tiers disabled in the node config, so it "
+                        f"is opted out of placement entirely" if pin_host in _optout else "")
                 raise RuntimeError(
                     f"{what} pinned to '{pin_host}', which is not an eligible node for it "
-                    f"(candidates: {', '.join(x.hostname for x in cand) or 'none'})")
+                    f"(candidates: {', '.join(x.hostname for x in cand) or 'none'}){_why}")
             return _p
         if not cand:
-            raise RuntimeError(f"no eligible node for the {what} after peer-claim/replica filtering")
+            _why = (f"; opted out via the node config (both tiers disabled): {', '.join(_optout)}"
+                    if _optout else "")
+            raise RuntimeError(
+                f"no eligible node for the {what} after peer-claim/replica filtering{_why}")
         return cand
+
+    def _load_link(self, node, what: str = "model", reg_key: str = ""):
+        """#node-optout: the control link to `node` for the purpose of PLACING WORK ON IT.
+
+        Every load in this file already reached for `self.links.get(node.node_id)` and raised on
+        None; this adds the one check that idiom was missing and makes the pair reusable. It is a
+        BACKSTOP, not the primary gate — `_place_filter` should have excluded an opted-out node long
+        before we get here. It exists because the primary gate is a filter the caller has to
+        remember to apply, and two placement paths written after that filter (the vision-tower
+        encode picker and the /compile_shards candidate list) never applied it. A planner that
+        forgets can now at worst fail the load loudly instead of quietly using a node the operator
+        declared off limits.
+
+        Deliberately NOT used for: generation against a model already resident on the node
+        (*_gen / transcribe), unload, teardown, restart, reap or vram-trim. Disabling a node must
+        let it DRAIN, so teardown paths keep their plain `links.get`. Refusing those would strand
+        whatever is already there — the opposite of what the operator asked for.
+
+        `reg_key` reproduces the cleanup every call site already did by hand before raising: a load
+        that dies here must not leave a phantom entry in self.loadings, or the dashboard shows a
+        load in flight forever and #load-queue refuses the next one."""
+        def _fail(msg: str):
+            if reg_key:
+                self.loadings.pop(reg_key, None)
+            return RuntimeError(msg)
+        if not node.placement_enabled:
+            raise _fail(
+                f"node '{node.hostname}' has BOTH memory tiers disabled in the node config — it is "
+                f"opted out of placement and will not accept {what}. Re-enable RAM and/or VRAM "
+                f"for it on the dashboard's Nodes tab to use it again.")
+        link = self.links.get(node.node_id)
+        if link is None:
+            raise _fail(f"no control link to {node.node_id}")
+        return link
 
     def _embed_candidates(self, pin_host: str = "", exclude_nodes: Optional[set] = None) -> list:
         """#embed-pin: the nodes this embedding model may legally land on, or raise saying why not.
@@ -2043,10 +2096,10 @@ class EngineLoadMixin:
                         "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
                         # #connections: keep the requester across the rebuild (panel attribution)
                         "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
-        link = self.links.get(node.node_id)
-        if link is None:
-            self.loadings.pop(reg_key, None)
-            raise RuntimeError(f"no control link to {node.node_id}")
+        # #node-optout: the link lookup every load already did, plus the off-limits check it never
+        # did (see _load_link). Backstop only — _place_filter has normally excluded the node long
+        # before here; this catches a placement path that forgets the filter entirely.
+        link = self._load_link(node, friendly, reg_key)
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         link.pending_loads[target_id] = fut   # #1: key by model (co-node loads race)
@@ -2186,7 +2239,7 @@ class EngineLoadMixin:
         _ctrl_host = socket.gethostname()
         self._place_filter(
             [n for n in registry.alive_sorted()
-             if n.can_infer and n.vram_total_gb > 0 and (n.ram_enabled or n.vram_enabled)
+             if n.can_infer and n.vram_total_gb > 0 and n.placement_enabled
              and self._media_node_ok(n, "can_t2i")],
             pin_host, exclude_nodes, "t2i (image) model")
         if reg_key in self.models:
@@ -2206,7 +2259,7 @@ class EngineLoadMixin:
             # is now, since a remote can_t2i node is a real candidate below.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and n.vram_total_gb > 0
-                    and (n.ram_enabled or n.vram_enabled)
+                    and n.placement_enabled
                     and self._media_node_ok(n, "can_t2i")]
             cand = self._place_filter(cand, pin_host, exclude_nodes, "t2i (image) model")
             # In-flight loads' reservations count as USED (they're streaming toward that size —
@@ -2317,10 +2370,10 @@ class EngineLoadMixin:
         self._reservations[reg_key] = {node.node_id: {
             "ram": int((all_b + 6 * GB) if offload else 2 * GB),
             "vram": int((_OFFLOAD_VRAM_GB if offload else (_est_gb(edge) + _MARGIN_GB)) * GB)}}
-        link = self.links.get(node.node_id)
-        if link is None:
-            self.loadings.pop(reg_key, None)
-            raise RuntimeError(f"no control link to {node.node_id}")
+        # #node-optout: the link lookup every load already did, plus the off-limits check it never
+        # did (see _load_link). Backstop only — _place_filter has normally excluded the node long
+        # before here; this catches a placement path that forgets the filter entirely.
+        link = self._load_link(node, friendly, reg_key)
         loop = asyncio.get_event_loop()
         fut = loop.create_future()
         link.pending_loads[target_id] = fut
@@ -2507,7 +2560,7 @@ class EngineLoadMixin:
         self._place_filter(
             [n for n in registry.alive_sorted()
              if n.can_infer and (cpu_only or n.vram_total_gb > 0)
-             and (n.ram_enabled or n.vram_enabled)
+             and n.placement_enabled
              and (n.hostname == _ch or str(n.data_host).startswith(("127.", "::1"))
                   or str(n.data_host) in _LOCAL_IPS or getattr(n, "can_t2a", False))],
             pin_host, exclude_nodes, "t2a (ACE-Step) model")
@@ -2536,7 +2589,7 @@ class EngineLoadMixin:
             # both-off state excludes. Default (no NODE_CONFIG entry) is both-on -> unchanged.
             cand = [n for n in registry.alive_sorted()
                     if n.can_infer and (cpu_only or n.vram_total_gb > 0)
-                    and (n.ram_enabled or n.vram_enabled)
+                    and n.placement_enabled
                     and (_is_colo(n) or getattr(n, "can_t2a", False))]
             cand = self._place_filter(cand, pin_host, exclude_nodes, "t2a (ACE-Step) model")
             # in-flight loads' reservations count as USED (same discipline as the t2i/LLM planners)
@@ -2549,27 +2602,59 @@ class EngineLoadMixin:
             # (no network transfer), then most-free VRAM. So a co-located box WITHOUT acestep
             # (can_t2a False) is a last resort, never picked ahead of a capable remote GPU that
             # would otherwise fail the load with no failover.
+            # #t2a-shortfall: record WHICH resource each candidate ran out of. The offload recipe
+            # has TWO independent budgets — transient VRAM and RAM for the resting weights — and
+            # every failure message here used to name VRAM only, quoting _need_gb(). So a node that
+            # passed the VRAM test and failed on RAM was reported as "no GPU has ~8.0 GB free",
+            # against an idle GPU with 11 GB free. That is an actively misleading error: it points
+            # the operator at the one resource that was NOT the problem (observed on amdcomp,
+            # 2026-08-17 — 11.3 GB free VRAM, refused because it was 0.13 GB short of RAM while two
+            # KVM guests held 20 GB). Report the binding resource, the number needed and the number
+            # actually free, per node.
+            _short: list[tuple[str, str, float, float]] = []   # (host, resource, need_gb, have_gb)
+
+            def _free_ram(x) -> float:
+                return (x.free_mem_gb or 0) - _res_ram_b.get(x.node_id, 0) / GB
+
+            def _shortfall_text() -> str:
+                """Per-node 'what was missing' for the failure messages. Worst-first is useless
+                here — the operator wants the node that came CLOSEST, because that is the one worth
+                freeing 200 MB on — so sort by smallest gap."""
+                if not _short:
+                    return ""
+                rows = sorted(_short, key=lambda r: (r[2] - r[3]))
+                return " — " + "; ".join(
+                    f"{h} short {need - have:.2f} GB of {res} (needs {need:.1f}, has {have:.1f})"
+                    for h, res, need, have in rows)
+
             for n in sorted(cand, key=lambda _n: (bool(getattr(_n, "can_t2a", False)),
                                                    _is_colo(_n), _t2a_free(_n)), reverse=True):
                 if cpu_only:
                     # #t2a-cpu: budget against RAM only (VRAM ignored) — whole pipeline + margin in RAM.
-                    if ((n.free_mem_gb or 0) - _res_ram_b.get(n.node_id, 0) / GB) \
-                            >= all_b / GB + _MARGIN_GB:
+                    _need_ram = all_b / GB + _MARGIN_GB
+                    if _free_ram(n) >= _need_ram:
                         node = n
                         break
+                    _short.append((n.hostname, "RAM", _need_ram, _free_ram(n)))
                     continue
                 free = _t2a_free(n)
                 if offload:
                     # never evicts (its point): needs only the transient VRAM + RAM for the weights
-                    if free >= _T2A_OFFLOAD_VRAM_GB and \
-                            ((n.free_mem_gb or 0) - _res_ram_b.get(n.node_id, 0) / GB) \
-                            >= all_b / GB + 4.0:
+                    _need_ram = all_b / GB + 4.0
+                    if free >= _T2A_OFFLOAD_VRAM_GB and _free_ram(n) >= _need_ram:
                         node = n
                         break
+                    # VRAM is checked first, so it is the binding one only when it actually failed;
+                    # otherwise the node had the GPU room and RAM is what stopped it.
+                    if free < _T2A_OFFLOAD_VRAM_GB:
+                        _short.append((n.hostname, "VRAM", _T2A_OFFLOAD_VRAM_GB, free))
+                    else:
+                        _short.append((n.hostname, "RAM", _need_ram, _free_ram(n)))
                     continue
                 if free >= _need_gb():
                     node = n
                     break
+                _short.append((n.hostname, "VRAM", _need_gb(), free))
             if node is not None:
                 break
             if cpu_only:
@@ -2582,6 +2667,7 @@ class EngineLoadMixin:
                     f"no worker has ~{all_b / GB + _MARGIN_GB:.1f} GB free RAM plus the acestep "
                     f"runtime for CPU-only t2a "
                     f"({'no capable worker connected' if not cand else 'all workers too full'})"
+                    f"{_shortfall_text()}"
                     " — CPU-only music is EXPERIMENTAL and extremely slow; the normal path is a GPU")
             victim = (self._lru_evictable()
                       if (not offload and bool(ENGINE_CONFIG.get("auto_unload", True))) else None)
@@ -2605,9 +2691,15 @@ class EngineLoadMixin:
                     offload = True
                     _refreshed = False
                     continue
+                # Lead with the resource that actually bound. Saying "no GPU has ~8.0 GB free"
+                # while the GPU sat idle with 11 GB free is what made this look like a phantom
+                # VRAM shortage rather than the RAM shortage it was.
+                _binding = ({r[1] for r in _short} or {"VRAM"})
+                _res = "VRAM or RAM" if len(_binding) > 1 else next(iter(_binding))
                 raise RuntimeError(
-                    f"no GPU has ~{_need_gb():.1f} GB free for the music model "
+                    f"no node has enough free {_res} for the music model "
                     f"({'no capable GPU worker connected' if not cand else 'and nothing evictable'})"
+                    f"{_shortfall_text()}"
                     " — t2a serves on the co-located GPU or any worker advertising the acestep "
                     "runtime (can_t2a)"
                     + (f"; or use offload (t2i_offload=1): ~{_T2A_OFFLOAD_VRAM_GB:.0f} GB transient "
@@ -2629,10 +2721,10 @@ class EngineLoadMixin:
                    else int((all_b + 4 * GB) if offload else 2 * GB),
             "vram": 0 if cpu_only
                     else int((_T2A_OFFLOAD_VRAM_GB if offload else _need_gb()) * GB)}}
-        link = self.links.get(node.node_id)
-        if link is None:
-            self.loadings.pop(reg_key, None)
-            raise RuntimeError(f"no control link to {node.node_id}")
+        # #node-optout: the link lookup every load already did, plus the off-limits check it never
+        # did (see _load_link). Backstop only — _place_filter has normally excluded the node long
+        # before here; this catches a placement path that forgets the filter entirely.
+        link = self._load_link(node, friendly, reg_key)
         fut = asyncio.get_event_loop().create_future()
         link.pending_loads[target_id] = fut
         await link.send({"type": "load", "kind": "t2a", "model_id": target_id,
@@ -2725,10 +2817,10 @@ class EngineLoadMixin:
                         "warnings": [], "node_ids": [node.node_id],
                         "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
                         "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
-        link = self.links.get(node.node_id)
-        if link is None:
-            self.loadings.pop(reg_key, None)
-            raise RuntimeError(f"no control link to {node.node_id}")
+        # #node-optout: the link lookup every load already did, plus the off-limits check it never
+        # did (see _load_link). Backstop only — _place_filter has normally excluded the node long
+        # before here; this catches a placement path that forgets the filter entirely.
+        link = self._load_link(node, friendly, reg_key)
         fut = asyncio.get_event_loop().create_future()
         link.pending_loads[target_id] = fut
         await link.send({"type": "load", "kind": "tts", "model_id": target_id,
@@ -2805,7 +2897,7 @@ class EngineLoadMixin:
         # user-declared OFF-LIMITS, both tiers off) even though it advertises can_stt. A single
         # disabled tier still admits the node; default (no NODE_CONFIG entry) is both-on -> unchanged.
         cand = [n for n in registry.alive_sorted()
-                if n.can_infer and (n.ram_enabled or n.vram_enabled)
+                if n.can_infer and n.placement_enabled
                 and (_is_colo(n) or getattr(n, "can_stt", False))]
         if not cand:
             raise RuntimeError("no worker can serve the stt (Whisper) model — need a co-located "
@@ -2829,10 +2921,10 @@ class EngineLoadMixin:
                         "warnings": [], "node_ids": [node.node_id],
                         "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
                         "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
-        link = self.links.get(node.node_id)
-        if link is None:
-            self.loadings.pop(reg_key, None)
-            raise RuntimeError(f"no control link to {node.node_id}")
+        # #node-optout: the link lookup every load already did, plus the off-limits check it never
+        # did (see _load_link). Backstop only — _place_filter has normally excluded the node long
+        # before here; this catches a placement path that forgets the filter entirely.
+        link = self._load_link(node, friendly, reg_key)
         fut = asyncio.get_event_loop().create_future()
         link.pending_loads[target_id] = fut
         await link.send({"type": "load", "kind": "stt", "model_id": target_id,
@@ -2903,7 +2995,7 @@ class EngineLoadMixin:
         # toggles (audit #28) — a node with BOTH tiers disabled is opted out (keeps t2music off
         # furnace). Prefer a can_t2music node, then co-located, then most VRAM.
         cand = [n for n in registry.alive_sorted()
-                if n.can_infer and (n.ram_enabled or n.vram_enabled)
+                if n.can_infer and n.placement_enabled
                 and (_is_colo(n) or getattr(n, "can_t2music", False))]
         if not cand:
             raise RuntimeError("no worker can serve the t2music (MusicGen) model — need a co-located "
@@ -2928,10 +3020,10 @@ class EngineLoadMixin:
                         "warnings": [], "node_ids": [node.node_id],
                         "started": (self.loadings.get(reg_key) or {}).get("started") or time.time(),
                         "requested_by": (self.loadings.get(reg_key) or {}).get("requested_by", "")}
-        link = self.links.get(node.node_id)
-        if link is None:
-            self.loadings.pop(reg_key, None)
-            raise RuntimeError(f"no control link to {node.node_id}")
+        # #node-optout: the link lookup every load already did, plus the off-limits check it never
+        # did (see _load_link). Backstop only — _place_filter has normally excluded the node long
+        # before here; this catches a placement path that forgets the filter entirely.
+        link = self._load_link(node, friendly, reg_key)
         fut = asyncio.get_event_loop().create_future()
         link.pending_loads[target_id] = fut
         await link.send({"type": "load", "kind": "t2music", "model_id": target_id,
@@ -3520,9 +3612,10 @@ class EngineLoadMixin:
         loop = asyncio.get_event_loop()
         futs: dict[str, asyncio.Future] = {}
         for rank, n in enumerate(tp_nodes):
-            link = self.links.get(n.node_id)
-            if link is None:
-                raise RuntimeError(f"no control link to {n.node_id}")
+            # #node-optout: same explicit refusal as the pipeline path above — a TP mesh spreads
+            # one model across every rank, so an opted-out node joining the mesh would pull the
+            # whole model onto hardware the operator withdrew.
+            link = self._load_link(n, friendly)
             n.stage, n.tp_rank, n.tp_size = 0, rank, tp
             n.layer_start, n.layer_end = 0, L
             n.load_state = "loading"
