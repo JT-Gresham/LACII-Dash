@@ -4,7 +4,48 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-18 (latest) — a forced update could restart onto a half-propagated set (0.3.30 / 0.3.31)
+## 2026-08-18 (latest) — the self-update now fetches ONE commit, not "whatever the CDN has" (0.3.31 / 0.3.31)
+
+### Fixed
+
+- **`#sha-pin`: a self-update cycle now pins every fetch to a single commit SHA.** 0.3.30 stopped a
+  half-propagated set from being *restarted into*, but it could still be *staged* — and staged
+  files load on the next restart from any cause, so the hazard was deferred rather than removed.
+
+  `raw.githubusercontent` serves a **commit SHA** as a ref just as happily as a branch, and a
+  SHA-pinned URL is immutable and content-addressed. So the updater resolves the branch tip once
+  per cycle (unauthenticated GitHub API — the repo is public, no token in the source; ~4 calls/hour
+  against a 60/hour limit) and fetches every file at *that* SHA. Per-file skew is then not
+  detected-and-refused, it is **impossible**: every file names the same commit.
+
+  Falling back to the branch ref when the SHA cannot be resolved is deliberate. The API is a new
+  dependency and must not be able to block deploys by itself (rate limit, outage, a mirror serving
+  raw but not the API). The fallback is exactly the old behaviour, still protected by 0.3.30's
+  VERSION-bump restart gate — weaker, but not a regression, and it **says so in the log** instead
+  of silently degrading.
+
+  Verified end-to-end against real GitHub rather than assumed, because a resolver that always
+  returned `None` would leave the feature inert behind its own fallback and look identical in a
+  code review: the resolved SHA matches `git rev-parse origin/main` exactly, and the SHA-pinned
+  fetch returns the expected bytes.
+
+  `wire.repo_raw_url()` was deliberately **not** given a `ref` parameter. `wire.py` is shared with
+  `client.py` and ships in both update lists, so widening its signature would let a new caller meet
+  an old `wire.py` on a half-updated box — precisely the cross-file skew being eliminated. The
+  pinned template is built controller-side instead.
+
+  The self-update test now asserts every fetch in a cycle carried the same resolved SHA, recorded
+  **eagerly per call** — the restart path ends in `os._exit(42)`, which runs no `finally` and no
+  `atexit`, so a deferred write is lost in exactly the scenario that matters most. Mutation-checked:
+  dropping the pin fails the assertion while leaving restart/staging correct.
+
+- **Still open, and now the only remaining half:** the WORKER updater (`worker_update.py`) fetches
+  from the branch ref the same way. Its restart is already correctly VERSION-gated with no `force`
+  override, so it cannot restart into a mix — but it can still stage one. Same `#sha-pin` fix
+  applies; deliberately not bundled here so the controller change can be verified in production
+  first rather than moving 14 workers on the same push.
+
+## 2026-08-18 — a forced update could restart onto a half-propagated set (0.3.30 / 0.3.31)
 
 ### Fixed
 

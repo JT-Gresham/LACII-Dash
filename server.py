@@ -66,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.30"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.31"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -119,13 +119,53 @@ def _ver_ordinal(v: str):
     return [(0, int(t)) if t.isdigit() else (1, t) for t in re.findall(r"\d+|\D+", v or "")]
 
 
-def _fetch_repo_file(fname: str):
+def _repo_raw_url_at(ref: str) -> str:
+    """#sha-pin: the raw-URL template for ONE immutable commit, built HERE rather than by adding a
+    parameter to wire.repo_raw_url(). wire.py is shared with client.py and ships in BOTH update
+    file lists, so widening its signature would mean a new caller could meet an old wire.py on a
+    half-updated box — creating exactly the cross-file version skew this function exists to end."""
+    cfg = wire.load_config()
+    return f"https://raw.githubusercontent.com/{cfg['update_repo']}/{ref}/{{f}}"
+
+
+def _resolve_repo_sha():
+    """#sha-pin: the commit SHA the update branch currently points at, or None.
+
+    raw.githubusercontent propagates a push PER FILE, so fetching N files from a BRANCH ref can
+    return a mix of two commits — that is what restarted om3nbox onto a caller whose dependency was
+    still the previous version (#mixed-set). A raw URL also accepts a COMMIT SHA, and a SHA-pinned
+    URL is immutable and content-addressed: resolve the tip once, fetch every file at that SHA, and
+    per-file skew cannot happen because every file names the same commit.
+
+    Unauthenticated GitHub API (the repo is public, #public-release: no token in the source). The
+    rate limit is 60/hr per IP and the poll is every 15 min, so this is ~4/hr. Any failure -> None,
+    and the caller falls back to the branch ref rather than refusing to update at all."""
+    import json as _json
+    import urllib.request
+    try:
+        cfg = wire.load_config()
+        url = f"https://api.github.com/repos/{cfg['update_repo']}/commits/{cfg['update_branch']}"
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.sha",
+                                                   "User-Agent": "infinitemodel-selfupdate"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read().decode("utf-8", "replace").strip()
+        # Accept=...sha returns the bare SHA; be tolerant of a JSON body if that header is ignored.
+        if len(body) == 40 and all(c in "0123456789abcdef" for c in body.lower()):
+            return body
+        return (_json.loads(body) or {}).get("sha") or None
+    except Exception:
+        return None
+
+
+def _fetch_repo_file(fname: str, ref: str = ""):
     # Self-update fetches each file's latest bytes from the PUBLIC GitHub repo's raw endpoint
     # (wire.repo_raw_url, owner/branch from config.json) — NO auth/token, so no secret is in the source
     # (#public-release). Any failure -> returns None (fail-closed; the node keeps running current code).
+    # #sha-pin: `ref` pins the fetch to one commit so a cycle cannot mix two (see _resolve_repo_sha).
     import urllib.request
     try:
-        with urllib.request.urlopen(wire.repo_raw_url().format(f=fname), timeout=30) as r:
+        tmpl = _repo_raw_url_at(ref) if ref else wire.repo_raw_url()
+        with urllib.request.urlopen(tmpl.format(f=fname), timeout=30) as r:
             return r.read()
     except Exception:
         return None
@@ -277,11 +317,28 @@ def _self_update_check(fname: str, is_idle, force: bool = False,
     is the separate, deliberate lever for installing an OLDER VERSION."""
     here = os.path.dirname(os.path.abspath(__file__))
 
+    # #sha-pin: resolve the branch tip ONCE and fetch every file of this cycle at that commit, so
+    # the set cannot be a mix of two pushes (#mixed-set: raw.githubusercontent propagates per file,
+    # which is what restarted om3nbox onto a caller whose dependency was still the older version).
+    # A SHA-pinned raw URL is immutable, so this removes the skew rather than detecting it.
+    #
+    # Falling back to the branch ref when the SHA cannot be resolved is deliberate: the GitHub API
+    # is a NEW dependency and it must not be able to block deploys on its own (rate limit, outage,
+    # an air-gapped mirror that serves raw but not the API). The fallback is exactly the old
+    # behaviour, which is still protected by the VERSION-bump restart gate below — weaker, but not
+    # a regression, and it says so in the log rather than silently degrading.
+    pin = _resolve_repo_sha()
+    if pin:
+        print(f"[update] fetching at commit {pin[:12]} (#sha-pin: one commit, no per-file skew)")
+    else:
+        print("[update] could not resolve the branch tip SHA - falling back to the branch ref; "
+              "this cycle CAN see per-file CDN skew (the VERSION-bump restart gate still applies)")
+
     def _fetch_retried(fn: str):
         """One repo file, bounded-retried with backoff (#3: give the raw CDN time to propagate a
         freshly-added file). None when it still won't come down."""
         for attempt in range(SELF_UPDATE_FETCH_TRIES):
-            remote = _fetch_repo_file(fn)
+            remote = _fetch_repo_file(fn, pin)
             if remote is not None and len(remote) >= 5:
                 return remote
             if attempt + 1 < SELF_UPDATE_FETCH_TRIES:

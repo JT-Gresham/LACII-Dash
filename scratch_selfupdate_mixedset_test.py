@@ -34,7 +34,19 @@ PRIMARY = %(primary)r
 EXTRA   = %(extra)r
 server.VERSION = %(running)r
 
-def fake_fetch(fn):
+FAKE_SHA = "b" * 40
+server._resolve_repo_sha = lambda: FAKE_SHA
+REFS = []
+
+def fake_fetch(fn, ref=""):
+    # #sha-pin: record the ref every fetch used — the whole point is that ONE cycle pins ONE commit.
+    # Written EAGERLY on each call, not in a finally: the restart path ends in os._exit(42), which
+    # runs no finally blocks and no atexit hooks, so a deferred write is simply lost in exactly the
+    # scenario that matters most (the successful deploy).
+    REFS.append((fn, ref))
+    bad = sum(1 for _, r in REFS if r != FAKE_SHA)
+    with open(os.path.join(%(tmp)r, "_refs.txt"), "w") as _fh:
+        _fh.write(f"{len(REFS)} {bad}\n")
     # Every OTHER file in EXTRA_UPDATE_FILES must fetch successfully and unchanged, or the cycle
     # aborts on a fetch failure (4 tries x backoff) instead of exercising the decision under test.
     if fn == "server.py":
@@ -73,11 +85,19 @@ def run(name, running, primary_ver, extra_body, force, expect_restart, expect_st
         staged_now = open(os.path.join(tmp, "placement.py"), "rb").read()
         staged = (staged_now == extra) and (extra != local_extra)
 
-        ok = (restarted == expect_restart) and (staged == expect_staged)
+        # #sha-pin: every fetch of the cycle must have carried the SAME resolved commit.
+        pinned_ok = True
+        try:
+            n, bad = open(os.path.join(tmp, "_refs.txt")).read().split()
+            pinned_ok = int(n) > 0 and int(bad) == 0
+        except Exception:
+            pinned_ok = False
+        ok = (restarted == expect_restart) and (staged == expect_staged) and pinned_ok
         print(f"{'PASS' if ok else 'FAIL'}  {name}")
         if not ok:
             print(f"        restart: got {restarted} want {expect_restart}")
             print(f"        staged : got {staged} want {expect_staged}")
+            print(f"        pinned : {pinned_ok} (every fetch used the resolved SHA)")
             print(f"        rc={p.returncode} out={p.stdout.strip()[-300:]!r} err={p.stderr.strip()[-300:]!r}")
         return ok
     finally:
@@ -119,4 +139,4 @@ if not all(results):
     print("\nFAIL — #mixed-set self-update behaviour")
     sys.exit(1)
 print("\nPASS — forced update restarts ONLY on a VERSION bump; staging still converges a "
-      "half-updated box; downgrade still refused")
+      "half-updated box; downgrade still refused; every fetch of a cycle used ONE pinned commit")
