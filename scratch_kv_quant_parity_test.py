@@ -5,10 +5,10 @@ WHY THIS SHAPE. Two separate hazards, and only one of them is about the future:
 
   1. Was the collapse LOSSLESS? A "cleanup" that silently changes which footprint a model plans at
      is worse than the duplication it removes. So the old behaviour is not re-typed from memory —
-     it is PINNED TO HEAD'S ACTUAL BYTES: the test greps the pre-change formula out of
-     `git show HEAD:routes_dashboard.py` and fails if the expression it re-implements is not
+     it is PINNED TO A FIXED PRE-CHANGE COMMIT'S ACTUAL BYTES: the test greps that formula out of
+     `git show <pre-collapse commit>:routes_dashboard.py` and fails if the expression it re-implements is not
      literally the one that shipped. If someone edits the helper and updates the expectation to
-     match, the HEAD pin still disagrees and the test still fails.
+     match, the pinned commit still disagrees and the test still fails.
 
   2. Can the two planners drift apart AGAIN? That is the defect being fixed: /plan sized packed KV
      while engine_load sized the same load at bf16, so Preview said "fits" and /load raised
@@ -35,8 +35,17 @@ def _spec(**kw) -> ModelSpec:
     return ModelSpec(**base)
 
 
-# ---------------------------------------------------------------- 0. pin "old" to HEAD's bytes
-HEAD_SRC = subprocess.run(["git", "show", "HEAD:routes_dashboard.py"],
+# ---------------------------------------------------------------- 0. pin "old" to a FIXED commit
+# b006ec2 is the last commit that still contains /plan's inline sizing — the parent of adf8011,
+# which collapsed it into ModelSpec.for_kv_quant.
+#
+# This deliberately does NOT say "HEAD". It did at first, which was wrong in a way worth recording:
+# HEAD is a MOVING target, so the moment the collapse itself was committed the pin pointed at the
+# post-change file and could no longer find the code it exists to compare against. The test caught
+# that itself and refused to pass — which is the behaviour wanted from a pin, but the pin still had
+# to become immutable to be worth anything.
+PRE_COLLAPSE = "b006ec2"
+PRE_SRC = subprocess.run(["git", "show", f"{PRE_COLLAPSE}:routes_dashboard.py"],
                           capture_output=True, text=True, check=True).stdout
 PINNED = [
     "_pt = _kq.kv_quant_bytes_per_token_per_layer(_kvq, spec.num_kv_heads, spec.head_dim)",
@@ -45,15 +54,15 @@ PINNED = [
     "kv_layer_frac=float(spec.kv_layer_frac or 1.0) * _r",
 ]
 for frag in PINNED:
-    if frag not in HEAD_SRC:
-        failures.append(f"HEAD pin lost: {frag!r} is not in HEAD:routes_dashboard.py — this test "
+    if frag not in PRE_SRC:
+        failures.append(f"pin lost: {frag!r} is not in {PRE_COLLAPSE}:routes_dashboard.py — this test "
                         f"can no longer prove the collapse was lossless; re-pin it deliberately")
 
 # The old hybrid predicate, likewise pinned.
 for frag in ('any(t != "full_attention" for t in _lt)',
              '_lac.get("kda_layers")'):
-    if frag not in HEAD_SRC:
-        failures.append(f"HEAD pin lost (hybrid predicate): {frag!r}")
+    if frag not in PRE_SRC:
+        failures.append(f"pin lost (hybrid predicate): {frag!r} not in {PRE_COLLAPSE}")
 
 
 def old_ratio(spec: ModelSpec, kvq: str):
@@ -148,4 +157,4 @@ if failures:
         print("  -", f)
     sys.exit(1)
 print(f"PASS — for_kv_quant is a pure dedup over {checked} (arch x preset) combinations, pinned to "
-      f"HEAD's formula; is_hybrid matches the old gate; both planners route through one helper")
+      f"{PRE_COLLAPSE}'s formula; is_hybrid matches the old gate; both planners use one helper")
