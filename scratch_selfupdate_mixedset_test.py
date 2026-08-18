@@ -1,0 +1,122 @@
+"""#mixed-set — a forced /update must never RESTART onto a primary whose VERSION did not move.
+
+WHY. The raw CDN propagates per file, so a fetch minutes after a push can return a NEW extra beside
+a STALE primary — a set that is not any commit that ever existed. Every guard already in
+_self_update_check passed that case (the primary was not OLDER, it was EQUAL; the bytes parsed; the
+staging read back clean) and `force` then restarted into it. Live hit 2026-08-18: om3nbox took the
+0.3.29 routes_dashboard.py and engine_load.py — both calling ModelSpec.for_kv_quant — beside the
+0.3.28 placement.py that does not define it, and came up 500-ing AttributeError on every /plan.
+
+This drives the REAL _self_update_check against a throwaway copy of the tree (so `here` /
+os.path.dirname(__file__) can never be the live repo), with _fetch_repo_file monkeypatched to serve
+whatever the scenario needs, and reads the restart decision off the process exit code (42 = restart).
+
+The second scenario is the one that keeps the fix honest: staging must still HAPPEN on an unbumped
+primary, because writing the newer extras is how a half-updated box CONVERGES when the lagging
+files arrive. A "fix" that refuses to write them would strand the box in exactly the inconsistent
+state being escaped, needing a fresh VERSION bump to get out.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO = os.path.dirname(os.path.abspath(__file__))
+
+DRIVER = r'''
+import os, sys, types
+sys.path.insert(0, %(tmp)r)
+os.environ.setdefault("INFINITEMODEL_NO_AUTOSTART", "1")
+import server
+
+PRIMARY = %(primary)r
+EXTRA   = %(extra)r
+server.VERSION = %(running)r
+
+def fake_fetch(fn):
+    # Every OTHER file in EXTRA_UPDATE_FILES must fetch successfully and unchanged, or the cycle
+    # aborts on a fetch failure (4 tries x backoff) instead of exercising the decision under test.
+    if fn == "server.py":
+        return PRIMARY
+    if fn == "placement.py":
+        return EXTRA
+    try:
+        with open(os.path.join(%(tmp)r, fn), "rb") as fh:
+            return fh.read()
+    except Exception:
+        return b"# absent locally\n"
+server._fetch_repo_file = fake_fetch
+server._self_update_check("server.py", lambda: True, force=%(force)r)
+print("NO_RESTART")
+sys.exit(0)
+'''
+
+def run(name, running, primary_ver, extra_body, force, expect_restart, expect_staged):
+    tmp = tempfile.mkdtemp(prefix="imupd_")
+    try:
+        for fn in os.listdir(REPO):
+            if fn.endswith((".py", ".txt", ".json")):
+                shutil.copy2(os.path.join(REPO, fn), os.path.join(tmp, fn))
+        # A minimal but REAL primary: it must parse, carry a VERSION, and declare the fetch list.
+        primary = (f'VERSION = "{primary_ver}"\n'
+                   'EXTRA_UPDATE_FILES: list[str] = ["placement.py"]\n').encode()
+        with open(os.path.join(tmp, "placement.py"), "rb") as fh:
+            local_extra = fh.read()
+        extra = extra_body if extra_body is not None else local_extra
+
+        drv = DRIVER % {"tmp": tmp, "primary": primary, "extra": extra,
+                        "running": running, "force": force}
+        p = subprocess.run([sys.executable, "-c", drv], capture_output=True, text=True, timeout=180)
+        restarted = (p.returncode == 42)
+
+        staged_now = open(os.path.join(tmp, "placement.py"), "rb").read()
+        staged = (staged_now == extra) and (extra != local_extra)
+
+        ok = (restarted == expect_restart) and (staged == expect_staged)
+        print(f"{'PASS' if ok else 'FAIL'}  {name}")
+        if not ok:
+            print(f"        restart: got {restarted} want {expect_restart}")
+            print(f"        staged : got {staged} want {expect_staged}")
+            print(f"        rc={p.returncode} out={p.stdout.strip()[-300:]!r} err={p.stderr.strip()[-300:]!r}")
+        return ok
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+NEW_EXTRA = b"# propagated ahead of the primary\nX = 1\n"
+results = []
+
+# 1. THE BUG: stale primary (same VERSION) + a newer extra, forced.
+#    Must NOT restart — but must still stage, so the box converges when the primary lands.
+results.append(run("mixed set, forced -> stage but DO NOT restart",
+                   running="0.3.28", primary_ver="0.3.28", extra_body=NEW_EXTRA,
+                   force=True, expect_restart=False, expect_staged=True))
+
+# 2. Same, unforced (the pre-existing #4 path) — unchanged behaviour.
+results.append(run("mixed set, unforced -> stage, no restart",
+                   running="0.3.28", primary_ver="0.3.28", extra_body=NEW_EXTRA,
+                   force=False, expect_restart=False, expect_staged=True))
+
+# 3. A REAL deploy: VERSION moved. Must still restart, or the fleet can never update.
+results.append(run("clean deploy (VERSION bumped) -> RESTART",
+                   running="0.3.28", primary_ver="0.3.29", extra_body=NEW_EXTRA,
+                   force=True, expect_restart=True, expect_staged=True))
+
+# 4. Downgrade must still be refused outright: nothing staged, no restart.
+results.append(run("older primary -> refuse, nothing written",
+                   running="0.3.29", primary_ver="0.3.28", extra_body=NEW_EXTRA,
+                   force=True, expect_restart=False, expect_staged=False))
+
+# 5. Extra unchanged, primary content differs but VERSION does not move (the fake primary always
+#    differs from the real local server.py, so this is "primary churn without a bump", NOT "nothing
+#    changed"). Must stage nothing new and must not restart.
+results.append(run("primary differs but VERSION static -> no restart",
+                   running="0.3.28", primary_ver="0.3.28", extra_body=None,
+                   force=True, expect_restart=False, expect_staged=False))
+
+if not all(results):
+    print("\nFAIL — #mixed-set self-update behaviour")
+    sys.exit(1)
+print("\nPASS — forced update restarts ONLY on a VERSION bump; staging still converges a "
+      "half-updated box; downgrade still refused")

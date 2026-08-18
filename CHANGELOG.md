@@ -4,7 +4,49 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — the Preview and the live load planner disagreed about KV (0.3.29 / 0.3.31)
+## 2026-08-18 (latest) — a forced update could restart onto a half-propagated set (0.3.30 / 0.3.31)
+
+### Fixed
+
+- **`POST /update?force=1` could restart a controller onto a file set that never existed as a
+  commit.** `raw.githubusercontent` propagates a push **per file**, so a fetch minutes later can
+  return a NEW extra beside a STALE primary. Every guard already in `_self_update_check` passed
+  that case — the primary was not *older*, it was **equal**; the bytes parsed; the staged copies
+  read back clean — and `force` then restarted anyway, because the restart rule keyed off `force`
+  rather than off what actually came down.
+
+  **Hit live while deploying 0.3.29.** `om3nbox` sits at a different physical site behind its own
+  WAN edge, and I had polled *MOBILE's* CDN edge for the marker before triggering the deploy — not
+  om3nbox's. It fetched the 0.3.29 `routes_dashboard.py` and `engine_load.py`, both of which call
+  the new `ModelSpec.for_kv_quant`, beside the 0.3.28 `placement.py` that does not **define** it.
+  The controller came back up 500-ing `AttributeError: 'ModelSpec' object has no attribute
+  'for_kv_quant'` on every `/plan` and every LLM load. It recovered on the third retry once its
+  edge caught up, but it should never have restarted into that state.
+
+  A VERSION bump is the only evidence available at that point that the fetched files are one
+  commit, so it now gates the restart **unconditionally** — `force` no longer overrides it.
+
+  Staging deliberately still happens on an unbumped primary: writing the newer extras is how a
+  half-updated box **converges** when the lagging files arrive. The first fix attempted here
+  refused to write them at all, which is worse — it strands the box in exactly the inconsistent
+  state being escaped and needs a fresh VERSION bump to escape it. Cost of the change: a commit
+  that edits an extra without bumping VERSION no longer deploys on its own. Every deploy in this
+  project bumps VERSION, so that is a non-event.
+
+  Residual risk, stated rather than papered over: the staged files are on disk, so a restart from
+  some *other* cause before the primary catches up still loads the mix. Closing that needs per-file
+  commit identity — a manifest of expected hashes carried in the primary — which is a design
+  change, not a guard. What is fixed is that a routine deploy no longer *causes* that restart.
+
+  `scratch_selfupdate_mixedset_test.py` drives the **real** `_self_update_check` against a
+  throwaway copy of the tree (so `os.path.dirname(__file__)` can never be the live repo), with the
+  fetcher stubbed per scenario, and reads the decision off the process exit code (42 = restart):
+  mixed-set forced → stage but do **not** restart; mixed-set unforced → unchanged; **clean deploy
+  → still restarts** (the case that keeps the fix honest); downgrade → still refused, nothing
+  written. Verified non-vacuous by restoring the old condition, which fails the first scenario with
+  `rc=42`.
+
+## 2026-08-17 — the Preview and the live load planner disagreed about KV (0.3.29 / 0.3.31)
 
 ### Fixed
 

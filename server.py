@@ -66,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.29"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.30"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -406,8 +406,29 @@ def _self_update_check(fname: str, is_idle, force: bool = False,
         return
     for tmp, path in staged:
         os.replace(tmp, path)
-    if not force and not version_bumped:
-        print(f"[update] {changed} staged on disk (VERSION {VERSION} unchanged) - NOT restarting (#4)")
+    # #mixed-set (2026-08-18): `force` used to override this, and that is what turned a
+    # half-propagated fetch into a dead controller. The raw CDN propagates PER FILE, so a fetch
+    # minutes after a push can hand back a NEW extra beside a STALE primary — a set that is not any
+    # commit that ever existed. Live hit: om3nbox (own WAN edge, different site) took the 0.3.29
+    # routes_dashboard.py and engine_load.py, both of which call ModelSpec.for_kv_quant, beside the
+    # 0.3.28 placement.py that does not DEFINE it. Every existing guard passed — the primary was not
+    # OLDER, it was EQUAL; the bytes parsed; the staging read back clean — and then force restarted
+    # into the mix. It came up 500-ing AttributeError on every /plan and every LLM load.
+    #
+    # A VERSION bump is the only evidence available here that the fetched files are ONE commit, so
+    # it now gates the RESTART unconditionally. Staging still happens: writing the newer extras is
+    # how a partially-updated box CONVERGES once the lagging files arrive. Refusing to write them
+    # instead would strand the box in exactly the inconsistent state we are trying to leave, and
+    # would need a fresh VERSION bump to escape — worse than the disease.
+    #
+    # Residual risk, unchanged and deliberate: the staged files are on disk, so a restart from some
+    # OTHER cause before the primary catches up still loads the mix. Closing that needs per-file
+    # commit identity (a manifest of expected hashes in the primary), which is a real design change,
+    # not a guard. What is fixed is that a routine deploy no longer CAUSES that restart.
+    if not version_bumped:
+        print(f"[update] {changed} staged on disk (VERSION {VERSION} unchanged"
+              f"{' - forced, but a forced update does NOT restart onto an unbumped primary' if force else ''}"
+              f") - NOT restarting (#4/#mixed-set)")
         return
     print(f"[update] {changed} newer on repo (VERSION {VERSION} -> {remote_ver or '?'}) - restarting")
     os._exit(42)                                 # supervisor relaunches on the new code
