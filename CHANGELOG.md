@@ -4,7 +4,26 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-18 (latest) — the self-update now fetches ONE commit, not "whatever the CDN has" (0.3.31 / 0.3.31)
+## 2026-08-18 (latest) — the self-update fetches ONE commit, and says which (0.3.32 / 0.3.31)
+
+### Added
+
+- **`GET /code_manifest` now reports `last_update`** — `{ref, mode, at}`: the commit the last
+  self-update cycle fetched from, whether it was `pinned` to a SHA or fell back to the `branch`
+  ref, and when (UTC, matching `#utc-logs`).
+
+  Added because verifying `#sha-pin` in production turned up a real observability gap: the updater
+  prints its progress to stdout and **`GET /logs` does not capture stdout** — *zero* `[update]`
+  lines ever reach it. So there was no HTTP-visible answer to "which commit did this box pull?",
+  which is exactly the question the om3nbox incident hours earlier had to answer by hand-diffing
+  per-file `sha1`s. `mode: "branch"` is now the visible signal that a box's cycle could still have
+  seen per-file CDN skew.
+
+  The record is a dict **mutated in place, never rebound** — `routes_diag` receives it by reference
+  through `state.bind()`, so rebinding would leave that leaf holding a stale object. Verified by
+  binding it and asserting a mutation propagates, rather than assuming it does.
+
+## 2026-08-18 — the self-update now fetches ONE commit, not "whatever the CDN has" (0.3.31 / 0.3.31)
 
 ### Fixed
 

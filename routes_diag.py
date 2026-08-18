@@ -65,7 +65,15 @@ def register(app):
                 if grep:
                     rec["grep_hit"] = grep.encode("utf-8", "replace") in norm
                 out[fn] = rec
+            # #sha-pin: which commit the last self-update cycle actually fetched from, and
+            # whether it was pinned to a SHA or fell back to the branch ref. The updater prints
+            # that to stdout and GET /logs does NOT capture stdout (zero "[update]" lines ever
+            # reach it), so without this there is no HTTP-visible answer to "which commit did this
+            # box pull?" — during the 2026-08-18 om3nbox incident that had to be reconstructed by
+            # hand-diffing per-file sha1s. mode="branch" is the signal that this box's cycle could
+            # still have seen per-file CDN skew.
             return {"ok": True, "running_version": VERSION, "code_date": CODE_DATE,
+                    "last_update": dict(LAST_UPDATE_PIN),
                     "grep": grep or None, "files": out}
         return JSONResponse(await asyncio.to_thread(_run))
 

@@ -66,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.31"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.32"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -117,6 +117,15 @@ def _ver_ordinal(v: str):
     and m4bz < m4c0. Type-tagged tuples keep int/str comparisons well-defined at any divergence."""
     import re
     return [(0, int(t)) if t.isdigit() else (1, t) for t in re.findall(r"\d+|\D+", v or "")]
+
+
+# #sha-pin observability: what the LAST self-update cycle actually fetched from. The updater's
+# own progress goes to stdout, and GET /logs does NOT capture stdout — zero "[update]" lines ever
+# reach it — so during the 2026-08-18 om3nbox incident there was no HTTP-visible answer to "which
+# commit did this box pull?", and the diagnosis needed a hand comparison of per-file sha1s. This is
+# that answer, surfaced by GET /code_manifest. MUTATED in place, never rebound: routes_diag binds
+# the object by reference (state.bind), so a rebind here would leave that leaf holding the old dict.
+LAST_UPDATE_PIN: dict = {"ref": "", "mode": "never", "at": ""}
 
 
 def _repo_raw_url_at(ref: str) -> str:
@@ -328,6 +337,10 @@ def _self_update_check(fname: str, is_idle, force: bool = False,
     # behaviour, which is still protected by the VERSION-bump restart gate below — weaker, but not
     # a regression, and it says so in the log rather than silently degrading.
     pin = _resolve_repo_sha()
+    # UTC to match #utc-logs (the print shim above stamps UTC+Z); a local-time field here would be
+    # hours off from the log lines an operator is correlating it against.
+    LAST_UPDATE_PIN.update(ref=pin or "", mode=("pinned" if pin else "branch"),
+                           at=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
     if pin:
         print(f"[update] fetching at commit {pin[:12]} (#sha-pin: one commit, no per-file skew)")
     else:
