@@ -42,13 +42,51 @@ def _ver_ordinal(v: str):
     return [(0, int(t)) if t.isdigit() else (1, t) for t in re.findall(r"\d+|\D+", v or "")]
 
 
-def _fetch_repo_file(fname: str):
+def _repo_raw_url_at(ref: str) -> str:
+    """#sha-pin: raw-URL template for ONE immutable commit, built HERE rather than by widening
+    wire.repo_raw_url(). wire.py is shared with server.py and ships in BOTH update lists, so a new
+    signature could meet an old wire.py on a half-updated box — the exact skew this ends."""
+    cfg = load_config()
+    return f"https://raw.githubusercontent.com/{cfg['update_repo']}/{ref}/{{f}}"
+
+
+def _resolve_repo_sha():
+    """#sha-pin: the commit the update branch points at, or None.
+
+    raw.githubusercontent propagates a push PER FILE, so fetching N files from a BRANCH ref can
+    return a mix of two commits. A raw URL also accepts a COMMIT SHA, and a SHA-pinned URL is
+    immutable: resolve the tip once, fetch every file at it, and skew becomes impossible rather
+    than merely refused. (Controller side hit this live on 2026-08-18 — new callers landed beside
+    a dependency that was still the previous version.)
+
+    Unauthenticated GitHub API (public repo, #public-release: no token in the source). None on any
+    failure, and the caller falls back to the branch ref: a worker on a network that reaches
+    raw.githubusercontent but not api.github.com must still be able to update at all."""
+    import json as _json
+    import urllib.request
+    try:
+        cfg = load_config()
+        url = f"https://api.github.com/repos/{cfg['update_repo']}/commits/{cfg['update_branch']}"
+        req = urllib.request.Request(url, headers={"Accept": "application/vnd.github.sha",
+                                                   "User-Agent": "infinitemodel-selfupdate"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read().decode("utf-8", "replace").strip()
+        if len(body) == 40 and all(c in "0123456789abcdef" for c in body.lower()):
+            return body
+        return (_json.loads(body) or {}).get("sha") or None
+    except Exception:
+        return None
+
+
+def _fetch_repo_file(fname: str, ref: str = ""):
     # Self-update fetches each file's latest bytes from the PUBLIC GitHub repo's raw endpoint
     # (repo_raw_url, owner/branch from config.json) — NO auth/token, so no secret is in the source
     # (#public-release). Any failure -> returns None (fail-closed; the worker keeps running).
+    # #sha-pin: `ref` pins the fetch to one commit so a cycle cannot mix two.
     import urllib.request
     try:
-        with urllib.request.urlopen(repo_raw_url().format(f=fname), timeout=30) as r:
+        tmpl = _repo_raw_url_at(ref) if ref else repo_raw_url()
+        with urllib.request.urlopen(tmpl.format(f=fname), timeout=30) as r:
             return r.read()
     except Exception:
         return None
@@ -65,11 +103,18 @@ def _self_update_check(fname: str, is_idle) -> None:
     half-updated set) and retry next poll."""
     here = os.path.dirname(os.path.abspath(__file__))
     files = [fname] + [f for f in EXTRA_UPDATE_FILES if f != fname]
+    # #sha-pin: resolve the branch tip ONCE and fetch this whole cycle at that commit, so the set
+    # cannot be a mix of two pushes. Falling back to the branch ref is deliberate — a worker whose
+    # network reaches raw.githubusercontent but not api.github.com must still be able to update.
+    pin = _resolve_repo_sha()
+    print(f"[update] fetching at commit {pin[:12]} (#sha-pin)" if pin else
+          "[update] could not resolve the branch tip SHA - falling back to the branch ref; "
+          "this cycle CAN see per-file CDN skew")
     fetched: dict = {}
     for fn in files:
         remote = None
         for attempt in range(SELF_UPDATE_FETCH_TRIES):   # #3: retry — give the raw CDN time to propagate
-            remote = _fetch_repo_file(fn)
+            remote = _fetch_repo_file(fn, pin)
             if remote is not None and len(remote) >= 5:
                 break
             if attempt + 1 < SELF_UPDATE_FETCH_TRIES:
@@ -110,11 +155,43 @@ def _self_update_check(fname: str, is_idle) -> None:
               f"ignoring (CDN lag / local ahead); re-check next poll")
         return
     version_bumped = bool(remote_ver) and remote_ver != VERSION
-    for fn in changed:                           # write all .new first, then atomic-replace each
-        path = os.path.join(here, fn)
-        tmp = path + ".new"
-        with open(tmp, "wb") as fh:
-            fh.write(fetched[fn])
+    # #stale-bytes: PARSE what we are about to write before any of it lands. The controller has had
+    # this since its own truncation incidents; the worker never did, and it is worse off — a .py
+    # that does not parse puts the box in a supervisor crash-loop with no local operator, and a
+    # wedged worker is far more awkward to reach than a wedged controller. A partially-transferred
+    # object or an error page served with a 200 also just "differs", so byte-difference alone was
+    # never evidence the bytes were usable. Non-code payloads (calib_corpus.txt) have no structure
+    # to check; only the CHANGED files are parsed, since the rest are what we are already running.
+    import ast as _ast
+    for fn in changed:
+        if not fn.endswith(".py"):
+            continue
+        try:
+            _ast.parse((fetched[fn] or b"").decode("utf-8", "replace"), filename=fn)
+        except Exception as exc:                 # noqa: BLE001
+            print(f"[update] fetched {fn} does not parse ({exc}) - truncated/partial copy off the "
+                  f"raw CDN; NOTHING applied, retry next poll")
+            return
+    staged = []
+    try:
+        for fn in changed:                       # stage all, read each back, only then replace
+            path = os.path.join(here, fn)
+            tmp = path + ".new"
+            staged.append((tmp, path))           # recorded BEFORE the write so a failure still cleans up
+            with open(tmp, "wb") as fh:
+                fh.write(fetched[fn])
+                fh.flush()
+                os.fsync(fh.fileno())
+            with open(tmp, "rb") as fh:
+                if fh.read() != fetched[fn]:
+                    raise IOError(f"staged {fn} does not match what was fetched (short write)")
+    except Exception as exc:                     # noqa: BLE001
+        for tmp, _ in staged:
+            with contextlib.suppress(Exception):
+                os.remove(tmp)
+        print(f"[update] could not stage {changed}: {exc!r}; nothing applied, retry next poll")
+        return
+    for tmp, path in staged:
         os.replace(tmp, path)
     if not version_bumped:
         print(f"[update] {changed} staged on disk (VERSION {VERSION} unchanged) - NOT restarting (#4)")

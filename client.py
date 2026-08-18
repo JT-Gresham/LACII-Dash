@@ -47,7 +47,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.31"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.32"  # version tag only; full changelog -> CHANGELOG.md
 # #stage0-stale-reconnect: if this worker hasn't forwarded a frame to a model's NEXT hop for this
 # long, the (idle) next-hop socket may have gone silently half-open -> drop it at the next PREFILL
 # (reset=True) so _send_next lazy-reconnects FRESH. Only checked at prefill, never per decode token,
@@ -1408,6 +1408,17 @@ async def session(args: argparse.Namespace, reg: dict, worker: Worker,
                     with contextlib.suppress(Exception):
                         await reply({"type": "restarting", "node_id": node_id})
                     if msg.get("update"):
+                        # #sha-pin / #mixed-set: this exit(42) is UNCONDITIONAL, so whatever the
+                        # check just staged is what the worker comes back on — the same shape as the
+                        # controller bug of 2026-08-18, where a forced /update restarted onto a set
+                        # the version gate had explicitly declined to activate. It is safe here
+                        # because the cycle now fetches every file at ONE resolved commit, so a
+                        # staged set is coherent by construction and coming back on it is exactly
+                        # what "restart + update" was asked to do. Residual, deliberate: if the
+                        # commit SHA could not be resolved the cycle falls back to the branch ref
+                        # and CAN stage a mix — it says so in the log, and _self_update_check now
+                        # ast.parses every changed file first, so the common corruption (a
+                        # truncated/partial copy) is refused rather than restarted into.
                         with contextlib.suppress(Exception):
                             await asyncio.to_thread(_self_update_check, "client.py", (lambda: True))
                     os._exit(42)

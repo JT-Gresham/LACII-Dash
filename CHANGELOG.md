@@ -4,7 +4,36 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-18 (latest) — the restart gate was INERT on the path it was written for (0.3.33 / 0.3.31)
+## 2026-08-18 (latest) — the workers get #sha-pin, and the byte checks the controller already had (0.3.33 / 0.3.32)
+
+### Fixed
+
+- **`#sha-pin` on the worker updater.** `worker_update.py` fetched from the branch ref, so it could
+  stage a set mixed from two pushes exactly as the controller could. It now resolves the branch tip
+  once per cycle and fetches every file at that commit. Branch fallback is kept and logged, because
+  a worker whose network reaches `raw.githubusercontent` but not `api.github.com` must still be
+  able to update at all.
+
+- **The worker never verified the bytes it was about to write.** The controller has parsed fetched
+  files since its own truncation incidents; the worker did not, and it is worse off — a `.py` that
+  does not parse puts the box in a supervisor crash-loop with no local operator, and a wedged
+  worker is far more awkward to reach than a wedged controller. Changed `.py` files are now
+  `ast.parse`d before anything lands, and the write is staged to `.new`, `fsync`ed and **read back**
+  before the replace pass, matching the controller's short-write guard.
+
+- **`restart` + `update:true` exits unconditionally** — the same shape as the controller bug fixed
+  in 0.3.33, where a forced update restarted onto a set the version gate had declined to activate.
+  It is safe on the worker *because* the cycle now fetches one commit, so a staged set is coherent
+  by construction and coming back on it is precisely what "restart + update" asked for. Documented
+  at the call site rather than papered over. Residual, deliberate: on the branch fallback a mix is
+  still possible, but the `ast.parse` above refuses the common corruption instead of restarting
+  into it.
+
+  Verified the new helpers actually resolve through `state.bind()` and hit the network — a
+  `load_config` that failed to bind would have made the pin fall back to the branch **silently**,
+  leaving the whole change inert behind its own fallback.
+
+## 2026-08-18 — the restart gate was INERT on the path it was written for (0.3.33 / 0.3.31)
 
 ### Fixed
 
