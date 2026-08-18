@@ -4,7 +4,50 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-17 (latest) — a disabled node still got work, and a refusal blamed the wrong resource (0.3.28 / 0.3.31)
+## 2026-08-17 (latest) — the Preview and the live load planner disagreed about KV (0.3.29 / 0.3.31)
+
+### Fixed
+
+- **`/plan` sized a TurboQuant load's KV the way the worker really reserves it; the LIVE load
+  planner still sized the same load at bf16.** `engine_load` baked only `kv_slots` into the spec
+  (`for_kv_slots`), never the packed-KV ratio, so in the narrow band where packed KV fits and bf16
+  does not, the Preview said *"fits"* and `POST /load` then raised `CapacityError` on identical
+  numbers — while the worker's `kv_reserve_probe` reserved the packed figure and would have been
+  fine. Two planners, one model, three different answers. The gap was flagged in a code comment
+  when the Preview was fixed (*"the fix is a shared `ModelSpec.for_kv_quant` applied at BOTH
+  sites"*) and is now closed.
+
+  Both planners call one **`ModelSpec.for_kv_quant()`**, which returns the re-sized spec *and* a
+  note when a preset was refused. The ratio is baked into `kv_layer_frac` because that is the one
+  knob scaling `kv_bytes_per_layer` for every controller-side consumer at once, so a fit and the
+  figures printed beside it cannot disagree. Applied at the live planner, at `/plan`, and at the
+  **adopt** path — an adopted model whose workers hold a packed cache was having its coexistence
+  reserve over-counted at bf16 for the life of the adoption.
+
+- **The hybrid gate lives inside that helper, not in its callers.** A hybrid / sliding-attention
+  arch never builds a TurboQuant cache, so sizing one claims a fit the worker then reserves at
+  bf16 and OOMs on. `/plan` owned the only copy of that rule and implemented it by **re-reading
+  `config.json` off disk** — because when it was written, `ModelSpec` carried no arch facts. It
+  does now (`layer_types`, from the same-day `#perf-facts` fix), so the re-read is gone and the
+  gate is `spec.is_hybrid`. Leaving the gate to callers is what produced the split above: the
+  caller holding the rule shrinks and the caller lacking it does not, which is worse than neither
+  shrinking. Net **−64 lines** in `routes_dashboard.py`.
+
+  Safe because every one of the 10 hard-coded `MODEL_SPECS` entries is a dense/full-attention arch
+  (Qwen2.5, Llama, Mixtral, OLMoE, Qwen3.6-MoE) — every genuine hybrid is a user-added model whose
+  spec comes from `_spec_from_config`, which populates `layer_types`. Checked rather than assumed.
+
+  `scratch_kv_quant_parity_test.py` proves the collapse was **lossless** rather than merely
+  plausible: it compares the helper against the old inline formula over **45** (arch × preset)
+  combinations, with the old formula **pinned to HEAD's actual bytes** — it greps the pre-change
+  expression out of `git show HEAD:routes_dashboard.py` and fails if what it re-implements is not
+  literally what shipped, so updating the expectation to match a changed helper cannot make it
+  pass. Verified non-vacuous by mutation: perturbing the ratio, removing the hybrid gate, and
+  making `/plan` stop calling the helper each fail it. The pre-existing `scratch_perf_facts_test`
+  independently confirms `spec.is_hybrid` equals the old config-driven gate across gemma4-sliding,
+  qwen3-next-linear, kimi-kda and a nested VLM config.
+
+## 2026-08-17 — a disabled node still got work, and a refusal blamed the wrong resource (0.3.28 / 0.3.31)
 
 ### Fixed
 

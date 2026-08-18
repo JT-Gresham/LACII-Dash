@@ -190,6 +190,52 @@ class ModelSpec:
             return self
         return replace(self, kv_slots=slots)
 
+    def for_kv_quant(self, kv_quant: str) -> tuple["ModelSpec", str]:
+        """#172 TurboQuant: return (spec sized for a packed KV cache, note if it was REFUSED).
+
+        Returns the ratio baked into `kv_layer_frac`, because that is the one knob scaling
+        kv_bytes_per_layer for EVERY controller-side consumer at once — plan_pipeline's required
+        bytes, _fit_ctx, _assess_placement's warnings and suggested_ctx, and the footprint table —
+        so a fit and the figures printed beside it cannot disagree.
+
+        WHY THIS IS A METHOD. It was written inline in /plan only, so the Preview sized KV the way
+        the worker really reserves it while the LIVE load planner still sized the same load at
+        bf16. In the narrow band where packed KV fits and bf16 does not, Preview said "fits" and
+        /load then raised CapacityError on the same numbers — the two planners disagreeing about
+        one model. Both now call this.
+
+        The hybrid gate is INSIDE the helper on purpose. It mirrors shard_build's
+        `_kvq_on = kv_quant != none and not self._hybrid`: a hybrid arch never builds a TurboQuant
+        cache, so sizing one claims a fit the worker then reserves at bf16 and OOMs on. Leaving
+        that gate to the callers is what produced the split above — the caller that has the rule
+        shrinks and the caller that lacks it does not, which is worse than neither shrinking.
+
+        `note` is non-empty exactly when a preset was asked for and refused, so the caller can say
+        WHY rather than silently planning something other than what was requested.
+        """
+        kvq = (kv_quant or "none").strip().lower()
+        if kvq not in ("turbo2", "turbo3", "turbo4"):
+            return self, ""       # 'none' and every unrecognised preset -> bf16, never a smaller plan
+        if self.is_hybrid:
+            return self, ("kv_quant ignored — a hybrid / sliding-attention arch never builds a "
+                          "TurboQuant cache, so the worker reserves KV at bf16")
+        try:
+            # Lazy: kv_quant.py is a controller leaf and placement.py is imported by the worker's
+            # planner path too. Ask it for the STORED bytes rather than assuming bits/16 — the
+            # indices are bit-packed to a byte boundary and each head carries an fp16 norm, so
+            # turbo3 is not 3/16. Same function the worker reserves with (shard_build).
+            import kv_quant as _kq
+            pt = _kq.kv_quant_bytes_per_token_per_layer(kvq, self.num_kv_heads, self.head_dim)
+        except Exception:   # noqa: BLE001 — sizing must never break planning; bf16 is conservative
+            return self, "kv_quant ignored — its sizing helper could not be loaded; KV sized at bf16"
+        bf = 2 * self.num_kv_heads * self.head_dim * KV_DTYPE_BYTES
+        if pt <= 0 or bf <= 0:
+            return self, "kv_quant ignored — sizing returned no packed figure; KV sized at bf16"
+        # + one bf16 dequant transient amortized over the layers: the worker holds one full-ctx
+        # bf16 layer per device owning any KV layer, and /status's #172 card counts it the same.
+        r = pt / bf + 1.0 / max(1, self.num_layers)
+        return replace(self, kv_layer_frac=float(self.kv_layer_frac or 1.0) * r), ""
+
     # NOTE: is_hybrid and full_attention_layers answer DIFFERENT questions and deliberately use
     # DIFFERENT predicates. Conflating them is the bug this pair exists to prevent — a
     # sliding-window layer is hybrid (no prefix reuse) but DOES grow a ctx-scaled KV.

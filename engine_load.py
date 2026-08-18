@@ -1149,6 +1149,16 @@ class EngineLoadMixin:
             # the pipeline planner — so plan_pipeline / _fit_ctx / the ctx guardrails /
             # colo_need / the /status kv_reserved card all reserve C x per-stream full-ctx KV.
             spec = spec.for_kv_slots(kv_slots)
+            # #172: bake the PACKED KV ratio in beside C, from the same helper /plan previews with
+            # (ModelSpec.for_kv_quant, which also owns the hybrid gate). Until now engine_load baked
+            # only kv_slots and sized a kv_quant load's KV at bf16, so in the narrow band where
+            # packed KV fits and bf16 does not, Preview said "fits" and this planner then raised
+            # CapacityError on the same model — the worker meanwhile reserving the packed figure via
+            # kv_reserve_probe. Two planners, one model, different answers.
+            spec, _kvq_note = spec.for_kv_quant(kv_quant)
+            if _kvq_note:
+                # Say it rather than silently planning something other than what was asked for.
+                log_activity(f"{_ollama_name(friendly)}: {_kvq_note}")
 
             # FIT-AS-MANY + NODE-SHARING (Inc 3a/3b): keep other resident models and place this
             # one wherever there's room — INCLUDING nodes already serving a model. Each node is
@@ -4542,6 +4552,11 @@ class EngineLoadMixin:
         # The adopted spec's KV accounting scales xC too (coexistence reserve honesty).
         _kvs = max(1, int(a0.get("kv_slots") or 1))
         spec = spec.for_kv_slots(_kvs)
+        # #172: same honesty argument as the xC line above — the adopted workers are holding a
+        # PACKED KV cache if the model was loaded with a preset, so the controller's coexistence
+        # reserve must account for it or it over-reserves for the life of the adoption and refuses
+        # placements that fit. Same helper as the live planner and /plan.
+        spec, _ = spec.for_kv_quant(a0.get("kv_quant") or "none")
         lm = LoadedModel(reg_key, target_id, spec, ctx, plan,
                          [s.node_id for s in stages], tok, eos, now,
                          quant=quant, kv_quant=(a0.get("kv_quant") or "none"),
