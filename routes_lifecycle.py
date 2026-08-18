@@ -1021,10 +1021,16 @@ def register(app):
             why = await _forced_update_outcome()
             if why:
                 engine.updating = False    # re-arm auto-load — this box is staying up on OLD code
-                log_activity(f"FORCED UPDATE ABORTED — nothing installed: {why}. Controller NOT "
-                             "restarted: it would have come back on the SAME code looking like a "
-                             "successful deploy. Models were already unloaded and re-auto-load on "
-                             "demand; POST /restart to bring the persisted set back now.")
+                # Wording is deliberately "did not restart" rather than "nothing installed": since
+                # #mixed-set, one of the outcomes reaching here is "files were STAGED but the
+                # primary's VERSION did not move", where something DID land on disk and simply was
+                # not activated. Claiming nothing installed would be false in exactly the situation
+                # an operator is trying to reason about. GET /code_manifest is the ground truth.
+                log_activity(f"FORCED UPDATE did NOT restart: {why}. The controller stays up on the "
+                             "code it is already running rather than bouncing onto an unverified or "
+                             "unbumped set. Models were already unloaded and re-auto-load on demand; "
+                             "POST /restart to bring the persisted set back now. GET /code_manifest "
+                             "is the ground truth for what is actually on disk.")
                 return
             os._exit(42)               # nothing left to swap -> plain relaunch
         asyncio.create_task(_go())

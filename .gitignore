@@ -114,3 +114,4 @@ _nvfp4_meastest.py
 _*.json
 # one-off API-response dumps (t.json was an 88 KB GitHub tree listing left from Jul 22)
 t.json
+.last_update.json

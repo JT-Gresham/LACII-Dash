@@ -4,7 +4,40 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-18 (latest) — the self-update fetches ONE commit, and says which (0.3.32 / 0.3.31)
+## 2026-08-18 (latest) — the restart gate was INERT on the path it was written for (0.3.33 / 0.3.31)
+
+### Fixed
+
+- **0.3.30's "never restart onto an unbumped primary" gate did nothing on a forced `/update`.**
+  Found while trying to prove `#sha-pin` fires in production, which is the only reason it was
+  found at all.
+
+  `routes_lifecycle`'s forced path ends in an unconditional `os._exit(42)` and decides whether to
+  skip it by scanning ACTIVITY for `"update REFUSED: "` — resting on an assumption that was true
+  when it was written: *the updater `exit(42)`s itself the moment it installs anything, so merely
+  returning means nothing landed.* Staging-without-restarting broke that assumption. The gate
+  announced its decision with `print()`, which that scan cannot see, so the route found no refusal
+  and **restarted the box onto the very set the gate had just declined to activate**.
+
+  The guard was therefore inert on precisely the path that caused the incident it was written for,
+  while its unit test passed — because that test exercised `_self_update_check` in isolation and
+  never asked whether the *caller* could see the decision. The test now asserts the contract: a
+  no-restart outcome must be visible to the forced-update route. Mutation-checked by reverting to
+  `print()`, which fails only that new assertion while restart/staging/pinning still look correct.
+
+  Route wording also corrected — it claimed "nothing installed", which since `#mixed-set` can be
+  false: files may have been staged and simply not activated.
+
+### Added
+
+- **`last_update` now survives the restart.** As first shipped it was blank exactly when wanted: a
+  successful deploy ends in `os._exit(42)` *inside* the update cycle, so the process holding the
+  in-memory record is the one that dies, and every fresh controller reported `mode: "never"`. The
+  only cycles it could describe were the ones that changed nothing. Persisted to
+  `.last_update.json` (gitignored) and reloaded at startup, so it answers the question that
+  actually matters: *which commit is the code I am running now from?*
+
+## 2026-08-18 — the self-update fetches ONE commit, and says which (0.3.32 / 0.3.31)
 
 ### Added
 

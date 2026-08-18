@@ -66,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.32"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.33"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -126,6 +126,31 @@ def _ver_ordinal(v: str):
 # that answer, surfaced by GET /code_manifest. MUTATED in place, never rebound: routes_diag binds
 # the object by reference (state.bind), so a rebind here would leave that leaf holding the old dict.
 LAST_UPDATE_PIN: dict = {"ref": "", "mode": "never", "at": ""}
+_LAST_UPDATE_PIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_update.json")
+
+
+def _load_update_pin() -> None:
+    """Restore LAST_UPDATE_PIN from disk at startup.
+
+    Without this the field is blank exactly when it is most wanted. A SUCCESSFUL deploy ends in
+    os._exit(42) inside the update cycle, so the process holding the in-memory record is the one
+    that dies — every fresh controller would report mode="never" and the only cycles it could ever
+    describe are the ones that changed nothing. Persisting makes it answer the real question:
+    "which commit is the code I am running now from?" — the question the 2026-08-18 om3nbox
+    incident had to answer by hand-diffing per-file sha1s."""
+    with contextlib.suppress(Exception):
+        with open(_LAST_UPDATE_PIN_FILE, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        if isinstance(rec, dict):
+            LAST_UPDATE_PIN.update({k: rec.get(k, "") for k in ("ref", "mode", "at")})
+
+
+def _save_update_pin() -> None:
+    # Best-effort: an unwritable dir must never break an update cycle, so failures are swallowed.
+    # The field simply reverts to describing only the current process, which is the old behaviour.
+    with contextlib.suppress(Exception):
+        with open(_LAST_UPDATE_PIN_FILE, "w", encoding="utf-8") as fh:
+            json.dump(LAST_UPDATE_PIN, fh)
 
 
 def _repo_raw_url_at(ref: str) -> str:
@@ -341,6 +366,7 @@ def _self_update_check(fname: str, is_idle, force: bool = False,
     # hours off from the log lines an operator is correlating it against.
     LAST_UPDATE_PIN.update(ref=pin or "", mode=("pinned" if pin else "branch"),
                            at=time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime()))
+    _save_update_pin()   # persist BEFORE any exit(42) below — a successful deploy never comes back
     if pin:
         print(f"[update] fetching at commit {pin[:12]} (#sha-pin: one commit, no per-file skew)")
     else:
@@ -496,9 +522,19 @@ def _self_update_check(fname: str, is_idle, force: bool = False,
     # commit identity (a manifest of expected hashes in the primary), which is a real design change,
     # not a guard. What is fixed is that a routine deploy no longer CAUSES that restart.
     if not version_bumped:
-        print(f"[update] {changed} staged on disk (VERSION {VERSION} unchanged"
-              f"{' - forced, but a forced update does NOT restart onto an unbumped primary' if force else ''}"
-              f") - NOT restarting (#4/#mixed-set)")
+        # #mixed-set: this MUST go through _update_refused, not print(). routes_lifecycle's forced
+        # path ends in an unconditional os._exit(42) and decides whether to skip it by scanning
+        # ACTIVITY for "update REFUSED: " — on the (previously true) assumption that this function
+        # exit(42)s itself the moment it installs anything, so merely RETURNING meant nothing
+        # landed. Staging-without-restarting broke that assumption: a print() here is invisible to
+        # that scan, the route would find no refusal, and it would restart the box onto the very
+        # set this branch just declined to activate. The gate would have been INERT on the exact
+        # path that caused the incident it was written for.
+        _update_refused(
+            f"staged {changed} to disk but {fname} VERSION is still {VERSION} - NOT restarting onto "
+            f"an unbumped primary{' (a forced update does not override this)' if force else ''}. "
+            f"The files are on disk and will apply once the primary's VERSION moves; this box keeps "
+            f"running {VERSION} until then")
         return
     print(f"[update] {changed} newer on repo (VERSION {VERSION} -> {remote_ver or '?'}) - restarting")
     os._exit(42)                                 # supervisor relaunches on the new code
@@ -3321,6 +3357,7 @@ def main() -> None:
     # m4c152 code-split: register server's namespace and inject it into the relocated Engine
     # mixin modules so their (verbatim) bodies resolve their former globals. Must run before
     # any engine method is exercised (self-test or serving). See state.py.
+    _load_update_pin()   # #sha-pin: restore the last fetched commit across the restart
     state.publish(globals())
     state.bind(engine_load, engine_gen, engine_lifecycle, control_plane, media_encode,
                routes_dashboard, routes_lifecycle, routes_api, routes_diag, serving,

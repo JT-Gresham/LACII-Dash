@@ -60,11 +60,19 @@ def fake_fetch(fn, ref=""):
         return b"# absent locally\n"
 server._fetch_repo_file = fake_fetch
 server._self_update_check("server.py", lambda: True, force=%(force)r)
+# routes_lifecycle's forced path skips its unconditional os._exit(42) ONLY when it finds an
+# "update REFUSED: " entry in ACTIVITY. Record whether one is there: a decision this function
+# makes but does not ANNOUNCE is a decision the caller overrides.
+_ref = any(str((e or {}).get("msg") or "").startswith("update REFUSED: ")
+           for e in list(getattr(server, "ACTIVITY", [])))
+with open(os.path.join(%(tmp)r, "_refused.txt"), "w") as _fh:
+    _fh.write("1" if _ref else "0")
 print("NO_RESTART")
 sys.exit(0)
 '''
 
-def run(name, running, primary_ver, extra_body, force, expect_restart, expect_staged):
+def run(name, running, primary_ver, extra_body, force, expect_restart, expect_staged,
+        expect_route_told=None):
     tmp = tempfile.mkdtemp(prefix="imupd_")
     try:
         for fn in os.listdir(REPO):
@@ -92,11 +100,21 @@ def run(name, running, primary_ver, extra_body, force, expect_restart, expect_st
             pinned_ok = int(n) > 0 and int(bad) == 0
         except Exception:
             pinned_ok = False
-        ok = (restarted == expect_restart) and (staged == expect_staged) and pinned_ok
+        # Did the updater ANNOUNCE its no-restart decision loudly enough for the forced-update
+        # route to see it? Without this the route restarts anyway and the gate is inert.
+        route_told = None
+        try:
+            route_told = open(os.path.join(tmp, "_refused.txt")).read().strip() == "1"
+        except Exception:
+            route_told = None
+        told_ok = (expect_route_told is None) or (route_told == expect_route_told)
+        ok = ((restarted == expect_restart) and (staged == expect_staged)
+              and pinned_ok and told_ok)
         print(f"{'PASS' if ok else 'FAIL'}  {name}")
         if not ok:
             print(f"        restart: got {restarted} want {expect_restart}")
             print(f"        staged : got {staged} want {expect_staged}")
+            print(f"        route_told: got {route_told} want {expect_route_told}")
             print(f"        pinned : {pinned_ok} (every fetch used the resolved SHA)")
             print(f"        rc={p.returncode} out={p.stdout.strip()[-300:]!r} err={p.stderr.strip()[-300:]!r}")
         return ok
@@ -111,12 +129,14 @@ results = []
 #    Must NOT restart — but must still stage, so the box converges when the primary lands.
 results.append(run("mixed set, forced -> stage but DO NOT restart",
                    running="0.3.28", primary_ver="0.3.28", extra_body=NEW_EXTRA,
-                   force=True, expect_restart=False, expect_staged=True))
+                   force=True, expect_restart=False, expect_staged=True,
+                   expect_route_told=True))
 
 # 2. Same, unforced (the pre-existing #4 path) — unchanged behaviour.
 results.append(run("mixed set, unforced -> stage, no restart",
                    running="0.3.28", primary_ver="0.3.28", extra_body=NEW_EXTRA,
-                   force=False, expect_restart=False, expect_staged=True))
+                   force=False, expect_restart=False, expect_staged=True,
+                   expect_route_told=True))
 
 # 3. A REAL deploy: VERSION moved. Must still restart, or the fleet can never update.
 results.append(run("clean deploy (VERSION bumped) -> RESTART",
@@ -126,7 +146,8 @@ results.append(run("clean deploy (VERSION bumped) -> RESTART",
 # 4. Downgrade must still be refused outright: nothing staged, no restart.
 results.append(run("older primary -> refuse, nothing written",
                    running="0.3.29", primary_ver="0.3.28", extra_body=NEW_EXTRA,
-                   force=True, expect_restart=False, expect_staged=False))
+                   force=True, expect_restart=False, expect_staged=False,
+                   expect_route_told=True))
 
 # 5. Extra unchanged, primary content differs but VERSION does not move (the fake primary always
 #    differs from the real local server.py, so this is "primary churn without a bump", NOT "nothing
