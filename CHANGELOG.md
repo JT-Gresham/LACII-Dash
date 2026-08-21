@@ -4,7 +4,36 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-18 (latest) — kv_quant now works on hybrid archs (0.3.34 / 0.3.33)
+## 2026-08-21 (latest) — the dashboard chat threw away reasoning and showed "(no output)" (0.3.35 / 0.3.33)
+
+### Fixed
+
+- **A reasoning model's whole turn could vanish into "(no output)".** Reported against
+  `qwen3.8-27b`: two ordinary questions, two blank replies. Nothing was wrong with the model, the
+  KV cache or `kv_quant` — reproduced on the API, the turn was healthy: `finish_reason=length`,
+  **0 chars of content and 847 chars of reasoning**. Three things combined:
+
+  1. `/api/chat` streams a thinking model's scratchpad on a **separate channel**
+     (`message.thinking`, serving.py). The dashboard chat read only `message.content` and
+     **discarded the thinking entirely** — the information was already arriving and was dropped.
+  2. The chat hardcoded `num_predict: 512`. That ceiling covers the *whole* turn, reasoning
+     included, and qwen3.8-27b spends roughly 850 characters of scratchpad before its first
+     content token — so it hit the cap having emitted no answer at all.
+  3. The renderer then did `content || '(no output)'`, which reads as a dead model rather than a
+     model that worked and had its work thrown away.
+
+  Now the reasoning channel is accumulated and rendered (dimmed, italic, labelled, kept out of the
+  message history posted back next turn), the cap is 4096, and a turn that ends with no content
+  says so explicitly and points at the Max-tokens knob instead of showing a bare "(no output)".
+
+  Note for API callers: the endpoint's own default is `num_predict` from the fleet config, falling
+  back to **256**. That is fine for a normal model and too small for a reasoning one — a
+  no-`max_tokens` request to a thinking model can legitimately return empty content with
+  `finish_reason=length` and the text in `reasoning_content`. Deliberately not changed here: it is
+  an operator-visible default on the Config tab, and raising it globally would change behaviour for
+  every model to fix a case specific to reasoning ones.
+
+## 2026-08-18 — kv_quant now works on hybrid archs (0.3.34 / 0.3.33)
 
 ### Added
 

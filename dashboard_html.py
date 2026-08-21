@@ -1786,6 +1786,14 @@ CHAT_HTML = r"""<!doctype html>
   #log{border:1px solid var(--border);border-radius:12px;background:var(--surface);padding:12px;height:58vh;overflow:auto;margin-bottom:10px}
   .msg{margin-bottom:10px} .who{font-size:11px;margin-bottom:2px} .who.u{color:var(--accent)} .who.a{color:var(--good)}
   .bub{white-space:pre-wrap;word-break:break-word;background:var(--bg);border-radius:8px;padding:8px 10px;font-size:13px}
+  /* Reasoning models stream their scratchpad on a SEPARATE channel (Ollama message.thinking).
+     It used to be dropped on the floor, so a turn that spent its whole budget thinking rendered
+     as "(no output)" and looked like a dead model. Dimmed + italic so it reads as working-out
+     rather than answer. */
+  .think{white-space:pre-wrap;word-break:break-word;border-left:2px solid var(--dim);opacity:.62;
+         font-style:italic;margin:0 0 4px 0;padding:4px 0 4px 8px;font-size:12px}
+  .thinkh{font-size:10px;color:var(--dim);letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px}
+  .capped{color:var(--warn);font-size:12px;margin-top:4px}
   .empty{color:var(--dim);text-align:center;padding:40px 0}
   .inrow{display:flex;gap:8px} .inrow textarea{flex:1;resize:vertical;min-height:46px}
   .hint{font-size:12px;color:var(--dim)}
@@ -1814,7 +1822,7 @@ const $=s=>document.querySelector(s);
 const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
 const qp=new URLSearchParams(location.search);
-let MODELS=[], cur='', msgs=[], live='', busy=false, abort=null;
+let MODELS=[], cur='', msgs=[], live='', liveThink='', busy=false, abort=null;
 function aborter(){ if(abort){ try{abort.abort();}catch(e){} abort=null; } }
 async function loadModels(){
   let d; try{ d=await (await fetch('/status',{cache:'no-store'})).json(); }
@@ -1835,30 +1843,54 @@ async function loadModels(){
   if(MODELS.length){ cur=sel.value; $('#mhint').textContent=''; $('#send').disabled=false; $('#in').disabled=false; }
   else { cur=''; $('#mhint').innerHTML='no models loaded — <a href="/">load one on the Models tab</a>'; $('#send').disabled=true; $('#in').disabled=true; }
 }
-function switchModel(){ aborter(); cur=$('#model').value; msgs=[]; live=''; busy=false; render(); $('#in').focus(); }
-function clearChat(){ aborter(); msgs=[]; live=''; busy=false; render(); }
+function switchModel(){ aborter(); cur=$('#model').value; msgs=[]; live=''; liveThink=''; busy=false; render(); $('#in').focus(); }
+function clearChat(){ aborter(); msgs=[]; live=''; liveThink=''; busy=false; render(); }
 function key(e){ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); } }
-function bub(role,text){ const u=role==='user';
-  return '<div class="msg"><div class="who '+(u?'u':'a')+'">'+(u?'you':esc(cur))+'</div><div class="bub">'+esc(text||'')+'</div></div>'; }
+function bub(role,text,think,capped){ const u=role==='user';
+  // A reasoning model can legitimately finish a turn with EMPTY content — it hit its token cap
+  // while still in the thinking block. Rendering just '(no output)' there is actively misleading:
+  // the model worked, we simply threw the work away. Show the reasoning, and say what happened.
+  const th=(!u&&think)?('<div class="thinkh">reasoning</div><div class="think">'+esc(think)+'</div>'):'';
+  const body=(text&&text.length)?('<div class="bub">'+esc(text)+'</div>')
+    :(think?'<div class="capped">no answer yet — the whole reply budget went to reasoning. '
+            +'Raise Max tokens on the Config tab, or ask the model to think less.</div>'
+           :'<div class="bub">'+esc(text||'')+'</div>');
+  const cap=(capped&&text&&text.length)?'<div class="capped">cut off at the token cap</div>':'';
+  return '<div class="msg"><div class="who '+(u?'u':'a')+'">'+(u?'you':esc(cur))+'</div>'+th+body+cap+'</div>'; }
 function render(){ const l=$('#log'); if(!l)return;
-  let h=msgs.map(m=>bub(m.role,m.content)).join(''); if(busy)h+=bub('assistant',live||'…');
+  let h=msgs.map(m=>bub(m.role,m.content,m.think,m.capped)).join('');
+  if(busy)h+=bub('assistant',live||(liveThink?'':'…'),liveThink,false);
   l.innerHTML=h||'<div class="empty">select a loaded model and send a prompt</div>'; l.scrollTop=l.scrollHeight; }
 async function send(){
   if(busy||!cur)return; const ta=$('#in'); const t=ta.value.trim(); if(!t)return;
-  ta.value=''; msgs.push({role:'user',content:t}); live=''; busy=true; $('#send').disabled=true; render();
-  const ctrl=new AbortController(); abort=ctrl;
+  ta.value=''; msgs.push({role:'user',content:t}); live=''; liveThink=''; busy=true;
+  $('#send').disabled=true; render();
+  const ctrl=new AbortController(); abort=ctrl; let capped=false;
   try{
+    // num_predict was 512, which a reasoning model can spend ENTIRELY on its thinking block —
+    // qwen3.8-27b burns ~850 chars of scratchpad before its first content token, so the turn
+    // ended at the cap with empty content and the UI showed "(no output)". The cap is the
+    // response-length ceiling for the whole turn, reasoning included, so it has to clear the
+    // scratchpad before it can bound the answer. An explicit value still wins over the
+    // fleet default on the Config tab.
     const r=await fetch('/api/chat',{method:'POST',signal:ctrl.signal,headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model:cur,messages:msgs,stream:true,options:{temperature:0.7,num_predict:512}})});
+      body:JSON.stringify({model:cur,messages:msgs,stream:true,options:{temperature:0.7,num_predict:4096}})});
     if(!r.ok){ const tx=await r.text(); throw new Error(tx||('HTTP '+r.status)); }
     const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
     while(true){ const x=await rd.read(); if(x.done)break; buf+=dec.decode(x.value,{stream:true}); let nl;
       while((nl=buf.indexOf('\n'))>=0){ const ln=buf.slice(0,nl).trim(); buf=buf.slice(nl+1); if(!ln)continue;
         let j; try{j=JSON.parse(ln);}catch(e){continue;} if(j.error)live+='\n[error] '+j.error;
+        // #reasoning-channel: a thinking model streams its scratchpad as message.thinking, NEVER
+        // as content. Reading only content is why an all-reasoning turn looked empty.
+        const th=(j.message&&j.message.thinking)||''; if(th){ liveThink+=th; render(); }
+        if(j.done&&j.done_reason==='length') capped=true;
         const p=(j.message&&j.message.content)||j.response||''; if(p){ live+=p; render(); } } }
-    msgs.push({role:'assistant',content:live||'(no output)'});
+    // Keep `think` OUT of the message we send back next turn — msgs is posted verbatim as the
+    // conversation, and replaying a scratchpad as assistant content confuses the template.
+    msgs.push({role:'assistant',content:live,think:liveThink,capped:capped});
   }catch(e){ if(e.name!=='AbortError') msgs.push({role:'assistant',content:'[error] '+String(e.message||e)}); }
-  finally{ busy=false; live=''; abort=null; $('#send').disabled=(!cur); render(); const i=$('#in'); if(i)i.focus(); }
+  finally{ busy=false; live=''; liveThink=''; abort=null; $('#send').disabled=(!cur); render();
+           const i=$('#in'); if(i)i.focus(); }
 }
 window.addEventListener('beforeunload',aborter);
 loadModels(); render(); setInterval(loadModels,5000);
