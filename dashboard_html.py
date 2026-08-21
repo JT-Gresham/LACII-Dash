@@ -1808,6 +1808,11 @@ CHAT_HTML = r"""<!doctype html>
   <select id="model" onchange="switchModel()"></select>
   <span class="hint" id="mhint"></span>
   <span class="grow"></span>
+  <label class="hint" title="Reasoning models (qwen3.x, gpt-oss) think before answering. The
+thinking counts against the SAME token budget as the answer, so with it on a turn can run for
+minutes and can even hit the cap before writing a word. Off = direct answers, which is what a
+smoke-test chat usually wants. When on, the scratchpad is shown above the reply.">
+    <input type="checkbox" id="think" onchange="thinkToggle()">reasoning</label>
   <button class="btn sm" onclick="clearChat()">Clear</button>
 </div>
 <div id="log"></div>
@@ -1823,6 +1828,10 @@ const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;',
 const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
 const qp=new URLSearchParams(location.search);
 let MODELS=[], cur='', msgs=[], live='', liveThink='', busy=false, abort=null;
+// Default OFF. On is the model's own default and produced the bug this fixes: a turn
+// that spent its entire budget thinking and rendered as '(no output)'.
+let wantThink=false;
+function thinkToggle(){ const c=$('#think'); wantThink=!!(c&&c.checked); }
 function aborter(){ if(abort){ try{abort.abort();}catch(e){} abort=null; } }
 async function loadModels(){
   let d; try{ d=await (await fetch('/status',{cache:'no-store'})).json(); }
@@ -1846,20 +1855,24 @@ async function loadModels(){
 function switchModel(){ aborter(); cur=$('#model').value; msgs=[]; live=''; liveThink=''; busy=false; render(); $('#in').focus(); }
 function clearChat(){ aborter(); msgs=[]; live=''; liveThink=''; busy=false; render(); }
 function key(e){ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); } }
-function bub(role,text,think,capped){ const u=role==='user';
-  // A reasoning model can legitimately finish a turn with EMPTY content — it hit its token cap
-  // while still in the thinking block. Rendering just '(no output)' there is actively misleading:
-  // the model worked, we simply threw the work away. Show the reasoning, and say what happened.
+function bub(role,text,think,capped,streaming){ const u=role==='user';
+  // A reasoning model can legitimately FINISH a turn with empty content — it hit its token cap
+  // while still inside the thinking block. Rendering just '(no output)' there is actively
+  // misleading: the model worked, we threw the work away. Show the reasoning, and say what
+  // happened. `streaming` matters: mid-stream a turn with reasoning-but-no-content-yet is the
+  // NORMAL state, so it must show progress, not the ran-out-of-budget verdict.
   const th=(!u&&think)?('<div class="thinkh">reasoning</div><div class="think">'+esc(think)+'</div>'):'';
   const body=(text&&text.length)?('<div class="bub">'+esc(text)+'</div>')
-    :(think?'<div class="capped">no answer yet — the whole reply budget went to reasoning. '
-            +'Raise Max tokens on the Config tab, or ask the model to think less.</div>'
-           :'<div class="bub">'+esc(text||'')+'</div>');
+    :(streaming?(think?'':'<div class="bub">…</div>')
+      :(think?'<div class="capped">no answer — the whole reply budget went to reasoning. '
+              +'Untick “reasoning” above for a direct answer, or raise Max tokens on the '
+              +'Config tab.</div>'
+             :'<div class="bub">'+esc(text||'')+'</div>'));
   const cap=(capped&&text&&text.length)?'<div class="capped">cut off at the token cap</div>':'';
   return '<div class="msg"><div class="who '+(u?'u':'a')+'">'+(u?'you':esc(cur))+'</div>'+th+body+cap+'</div>'; }
 function render(){ const l=$('#log'); if(!l)return;
-  let h=msgs.map(m=>bub(m.role,m.content,m.think,m.capped)).join('');
-  if(busy)h+=bub('assistant',live||(liveThink?'':'…'),liveThink,false);
+  let h=msgs.map(m=>bub(m.role,m.content,m.think,m.capped,false)).join('');
+  if(busy)h+=bub('assistant',live,liveThink,false,true);
   l.innerHTML=h||'<div class="empty">select a loaded model and send a prompt</div>'; l.scrollTop=l.scrollHeight; }
 async function send(){
   if(busy||!cur)return; const ta=$('#in'); const t=ta.value.trim(); if(!t)return;
@@ -1874,7 +1887,16 @@ async function send(){
     // scratchpad before it can bound the answer. An explicit value still wins over the
     // fleet default on the Config tab.
     const r=await fetch('/api/chat',{method:'POST',signal:ctrl.signal,headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({model:cur,messages:msgs,stream:true,options:{temperature:0.7,num_predict:4096}})});
+      // Post ONLY role+content. msgs carries our own render-state (think, capped) and the wire
+      // format has no place for it — the server currently ignores unknown message keys, but the
+      // UI should not depend on that leniency, and a scratchpad must never be replayed as
+      // conversation anyway.
+      // `think` maps to enable_thinking on the chat template (serving._thinking_pref). Sent
+      // EXPLICITLY either way: on /api/chat a reasoning model defaults to thinking ON, so
+      // omitting the key is not the same as asking for a direct answer.
+      body:JSON.stringify({model:cur,messages:msgs.map(m=>({role:m.role,content:m.content})),
+                           stream:true,think:wantThink,
+                           options:{temperature:0.7,num_predict:4096}})});
     if(!r.ok){ const tx=await r.text(); throw new Error(tx||('HTTP '+r.status)); }
     const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
     while(true){ const x=await rd.read(); if(x.done)break; buf+=dec.decode(x.value,{stream:true}); let nl;
@@ -1885,8 +1907,7 @@ async function send(){
         const th=(j.message&&j.message.thinking)||''; if(th){ liveThink+=th; render(); }
         if(j.done&&j.done_reason==='length') capped=true;
         const p=(j.message&&j.message.content)||j.response||''; if(p){ live+=p; render(); } } }
-    // Keep `think` OUT of the message we send back next turn — msgs is posted verbatim as the
-    // conversation, and replaying a scratchpad as assistant content confuses the template.
+    // `think`/`capped` are render-state only; the request builder above strips them back out.
     msgs.push({role:'assistant',content:live,think:liveThink,capped:capped});
   }catch(e){ if(e.name!=='AbortError') msgs.push({role:'assistant',content:'[error] '+String(e.message||e)}); }
   finally{ busy=false; live=''; liveThink=''; abort=null; $('#send').disabled=(!cur); render();

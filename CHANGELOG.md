@@ -4,7 +4,7 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-21 (latest) — the dashboard chat threw away reasoning and showed "(no output)" (0.3.35 / 0.3.33)
+## 2026-08-21 (latest) — the dashboard chat threw away reasoning and showed "(no output)" (0.3.36 / 0.3.33)
 
 ### Fixed
 
@@ -25,6 +25,17 @@ single squashed commit, so the detail below is grouped by milestone rather than 
   Now the reasoning channel is accumulated and rendered (dimmed, italic, labelled, kept out of the
   message history posted back next turn), the cap is 4096, and a turn that ends with no content
   says so explicitly and points at the Max-tokens knob instead of showing a bare "(no output)".
+
+  **A `reasoning` toggle now sits beside the model picker, defaulting to OFF.** Measured while
+  verifying the fix: with thinking on, *"how to calculate pi?"* ran for **over ten minutes** on
+  qwen3.8-27b at ~7 tok/s without finishing, because the scratchpad and the answer share one token
+  budget. Off is what a smoke-test chat wants; on renders the scratchpad above the reply. `think`
+  is sent explicitly either way — on `/api/chat` a reasoning model defaults to thinking ON, so
+  omitting the key is not the same as asking for a direct answer.
+
+  The request also posts only `role`+`content`: the message objects carry render-state (`think`,
+  `capped`) that has no place on the wire. The server ignores unknown message keys today, but the
+  UI should not depend on that, and a scratchpad must never be replayed as conversation.
 
   Note for API callers: the endpoint's own default is `num_predict` from the fleet config, falling
   back to **256**. That is fine for a normal model and too small for a reasoning one — a
