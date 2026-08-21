@@ -204,11 +204,16 @@ class ModelSpec:
         /load then raised CapacityError on the same numbers — the two planners disagreeing about
         one model. Both now call this.
 
-        The hybrid gate is INSIDE the helper on purpose. It mirrors shard_build's
-        `_kvq_on = kv_quant != none and not self._hybrid`: a hybrid arch never builds a TurboQuant
-        cache, so sizing one claims a fit the worker then reserves at bf16 and OOMs on. Leaving
-        that gate to the callers is what produced the split above — the caller that has the rule
-        shrinks and the caller that lacks it does not, which is worse than neither shrinking.
+        The arch gate is INSIDE the helper on purpose: sizing a packed cache the worker does not
+        build claims a fit it then reserves at bf16 and OOMs on. Leaving that gate to the callers
+        is what produced the split above — the caller that has the rule shrinks and the caller that
+        lacks it does not, which is worse than neither shrinking.
+
+        Since #172-hybrid that gate is a per-layer BLEND rather than a whole-arch refusal. It
+        mirrors `Shard._kv_quant_layer_mask`: full_attention layers pack, sliding-window layers
+        stay bounded-bf16, linear-attention layers hold recurrent state, and the fla/kda archs pack
+        nothing at all. See `turboquant_layers` for why that is a third predicate rather than a
+        reuse of `is_hybrid` or `full_attention_layers`.
 
         `note` is non-empty exactly when a preset was asked for and refused, so the caller can say
         WHY rather than silently planning something other than what was requested.
@@ -216,12 +221,21 @@ class ModelSpec:
         kvq = (kv_quant or "none").strip().lower()
         if kvq not in ("turbo2", "turbo3", "turbo4"):
             return self, ""       # 'none' and every unrecognised preset -> bf16, never a smaller plan
-        if self.is_hybrid:
-            return self, ("kv_quant ignored — a hybrid / sliding-attention arch never builds a "
-                          "TurboQuant cache, so the worker reserves KV at bf16")
+        # #172-hybrid: a hybrid is no longer refused wholesale. Its full_attention layers pack
+        # exactly like a dense model's; only its linear-attention (recurrent-state) and
+        # sliding-window (bounded, different cache class) layers stay bf16. Refuse only when
+        # NOTHING will be packed — the fla/kda archs, whose cache is never a quantized one.
+        _q = self.turboquant_layers
+        _k = self.full_attention_layers
+        if _q <= 0:
+            return self, ("kv_quant ignored — this arch's layers hold recurrent state rather than "
+                          "a K/V cache, so the worker never builds a TurboQuant cache")
         try:
-            # Lazy: kv_quant.py is a controller leaf and placement.py is imported by the worker's
-            # planner path too. Ask it for the STORED bytes rather than assuming bits/16 — the
+            # Lazy so a missing//broken kv_quant.py degrades to bf16 sizing instead of breaking
+            # planning outright (the except below). (The previous note here claimed placement.py is
+            # imported by the worker too — it is not: only server.py and engine_load.py import it,
+            # and it is absent from client.py's EXTRA_UPDATE_FILES, which is correct.)
+            # Ask it for the STORED bytes rather than assuming bits/16 — the
             # indices are bit-packed to a byte boundary and each head carries an fp16 norm, so
             # turbo3 is not 3/16. Same function the worker reserves with (shard_build).
             import kv_quant as _kq
@@ -233,7 +247,13 @@ class ModelSpec:
             return self, "kv_quant ignored — sizing returned no packed figure; KV sized at bf16"
         # + one bf16 dequant transient amortized over the layers: the worker holds one full-ctx
         # bf16 layer per device owning any KV layer, and /status's #172 card counts it the same.
-        r = pt / bf + 1.0 / max(1, self.num_layers)
+        # Blend: of the _k layers that grow a ctx-scaled K/V, _q are packed and the remaining
+        # (_k - _q) stay bf16. kv_layer_frac already encodes _k/num_layers, so this ratio is
+        # applied per KV-BEARING layer, not per layer. On a dense model _q == _k and the whole
+        # expression collapses to pt/bf — bit-identical to the deployed figure.
+        _q = min(_q, _k) if _k > 0 else _q
+        r = ((_q * pt + max(0, _k - _q) * bf) / (_k * bf)) if _k > 0 else (pt / bf)
+        r += 1.0 / max(1, self.num_layers)
         return replace(self, kv_layer_frac=float(self.kv_layer_frac or 1.0) * r), ""
 
     # NOTE: is_hybrid and full_attention_layers answer DIFFERENT questions and deliberately use
@@ -276,6 +296,35 @@ class ModelSpec:
             return sum(1 for t in lt if not _is_kvless_layer_type(t))
         return max(0, int(round(self.num_layers * float(self.kv_layer_frac or 1.0))))
 
+
+    @property
+    def turboquant_layers(self) -> int:
+        """How many layers the worker will actually TurboQuant-PACK under a kv_quant preset.
+
+        ⚠⚠ Must mirror `Shard._kv_quant_layer_mask` (shard_build.py) exactly — that mask decides
+        what the worker really builds, and this number decides what the controller reserves. The
+        controller may over-reserve relative to the worker but must NEVER under-reserve.
+
+        A THIRD predicate, distinct from both is_hybrid and full_attention_layers, because it
+        answers a third question:
+          * is_hybrid           — "does this arch deviate from uniform full attention?" (broad)
+          * full_attention_layers — "which layers grow ctx-scaled K/V?" (sliding COUNTS)
+          * turboquant_layers   — "which layers get PACKED?" (sliding does NOT)
+        Sliding-window layers hold real K/V but bounded by their own transformers cache class,
+        which _TurboQuantLayer (an UNBOUNDED DynamicLayer) would replace and thereby unbound. They
+        stay bf16, so they are excluded here while still counting in full_attention_layers.
+
+        The no-layer_types cases split, and getting this wrong is a decode OOM:
+          * kv_layer_frac < 1.0 with no layer_types = the fla/kda archs (Kimi-Linear), which the
+            worker serves from _make_linattn_kv — a cache that is NEVER quantized. Answer 0.
+          * otherwise a plain dense model: every layer packs.
+        """
+        lt = self.layer_types or ()
+        if len(lt) == self.num_layers:
+            return sum(1 for t in lt if str(t) == "full_attention")
+        if float(self.kv_layer_frac or 1.0) < 1.0:
+            return 0        # fla/kda: worker builds the linattn cache, packs nothing
+        return self.num_layers
 
 MODEL_SPECS: dict[str, ModelSpec] = {
     "Qwen/Qwen2.5-0.5B-Instruct": ModelSpec(

@@ -4,7 +4,52 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-18 (latest) — the workers get #sha-pin, and the byte checks the controller already had (0.3.33 / 0.3.32)
+## 2026-08-18 (latest) — kv_quant now works on hybrid archs (0.3.34 / 0.3.33)
+
+### Added
+
+- **`kv_quant` on hybrid architectures — `#172-hybrid`.** A hybrid arch was refused a TurboQuant
+  cache outright, on the reasoning that linear-attention layers hold recurrent state rather than
+  K/V. That is true of *those layers*, but not of the arch: **Qwen3.5/3.6/3.8 is 48 linear +
+  16 `full_attention` of 64**, and those 16 grow an ordinary ctx-scaled K/V that packs exactly like
+  a dense model's. On `qwen3.8-27b` at its native 262144 ctx that was **~16 GB of bf16 KV left on
+  the table** — measured, by differencing `/plan` at two contexts: 14.0 GB across 229,376 tokens =
+  64 KB/token, i.e. the 16-layer figure (all-64 funding would be 256 KB/token).
+
+  Now the full-attention layers pack and everything else keeps its existing slot.
+
+  **Two layer kinds are deliberately NOT packed**, and conflating them is how this goes wrong:
+
+  - *linear-attention* — fixed-size conv + recurrent state, no K/V at all.
+  - *sliding-window* — real K/V, but **bounded** by its own transformers cache class.
+    `_TurboQuantLayer` extends the **unbounded** `DynamicLayer`, so swapping one into a sliding slot
+    would drop the window bound *and* reserve the smaller packed figure — an under-reserve, which is
+    a mid-decode OOM rather than a clean refusal. This is the same mistake that once funded
+    gpt-oss's 12-of-24 and Gemma-4's 20-of-24 sliding layers at zero bytes.
+
+  Which layers pack is decided in exactly one place, `Shard._kv_quant_layer_mask`, read by both the
+  cache builder (`shard_forward._make_hybrid_kv_cache`) and the reservation (`shard_build`), so the
+  cache and the bytes reserved for it cannot disagree. The controller mirrors it with a third
+  predicate, `ModelSpec.turboquant_layers` — distinct from `is_hybrid` ("deviates from uniform full
+  attention?") and `full_attention_layers` ("grows ctx-scaled K/V?", where sliding **counts**),
+  because "does it get PACKED?" is a third question with a different answer for sliding layers.
+  `for_kv_quant` now blends: packed layers at the bit-packed figure, the rest at bf16.
+
+  `kv_quant='none'` returns exactly `DynamicCache(config=cfg)` and dense models are bit-identical,
+  so every previously-working load is unchanged. Any failure in the swap returns a **fresh** plain
+  hybrid cache — fresh because the swap mutates in place, so a half-swapped cache must be discarded.
+
+  The fla/kda archs (Kimi-Linear) still refuse: they serve from `_make_linattn_kv`, which is never a
+  quantized cache. The controller detects them as `kv_layer_frac < 1.0` with no `layer_types`.
+
+  Two tests. `scratch_kv_quant_hybrid_mask_test.py` calls the **real** worker method against a stub
+  Shard (shard_build imports without torch) and compares it with the **real** controller property
+  across four archs, four shard offsets, the fla/kda case and an unknown layer kind — a
+  transcription of either rule would have proved nothing. `scratch_kv_quant_parity_test.py` gained
+  the blend, including a guard that a hybrid must **not** shrink like a dense model (which would
+  mean its sliding/linear layers had been packed).
+
+## 2026-08-18 — the workers get #sha-pin, and the byte checks the controller already had (0.3.33 / 0.3.32)
 
 ### Fixed
 

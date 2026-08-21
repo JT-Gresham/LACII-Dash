@@ -200,6 +200,46 @@ class ShardBuildMixin:
                 mask.append(True)   # unknown -> reserve full KV (never under-reserve)
         return mask
 
+    def _kv_quant_layer_mask(self) -> list:
+        """#172-hybrid: per-OWNED-layer bool — will this layer's cache slot be TurboQuant-PACKED?
+
+        THE SINGLE DEFINITION of that question. shard_forward builds the cache from it and
+        shard_build reserves memory from it. If the two ever disagreed, the reservation would be
+        sized for a cache the worker does not actually build — a decode OOM in one direction and a
+        needlessly refused placement in the other. (An invariant implemented once per branch is
+        this codebase's dominant bug; do NOT re-spell this rule at either call site.)
+
+        Three cases, mirroring shard_forward's cache if/elif order exactly:
+          * `_linattn_flat` (Kimi-style, linear layers declared via linear_attn_config): ALL FALSE.
+            That path builds _make_linattn_kv — a prealloc bf16 cache with conv/recurrent lists
+            bolted on — and never a quantized one.
+          * hybrid carrying `layer_types`: TRUE only where the kind is EXACTLY "full_attention".
+            NOT `not _is_linear_attn_type(...)`: that also catches `sliding_attention`, whose K/V
+            is real but BOUNDED by its own transformers cache class. _TurboQuantLayer extends the
+            UNBOUNDED DynamicLayer, so quantizing a sliding layer would drop the window bound while
+            reserving the smaller packed figure — the exact under-reserve that funded gpt-oss's
+            sliding layers at zero once already.
+          * everything else (plain uniform full attention): ALL TRUE — the deployed #172 path,
+            bit-identical.
+
+        CONSERVATIVE on uncertainty: an unreadable/short layer_types entry answers FALSE, so the
+        layer is reserved at full bf16 and left unquantized. Over-reserving refuses a placement;
+        under-reserving OOMs mid-decode."""
+        n = len(self.owned_layers)
+        if getattr(self, "_linattn_flat", False):
+            return [False] * n
+        lt = getattr(self.cfg, "layer_types", None)
+        if not getattr(self, "_hybrid", False) or not lt:
+            return [True] * n
+        base = int(getattr(self, "layer_start", 0) or 0)
+        out = []
+        for i in range(n):
+            try:
+                out.append(str(lt[base + i]) == "full_attention")
+            except Exception:
+                out.append(False)
+        return out
+
     def _place_modules(self, device: str, gpu_mem_gb: float, ctx: int = 0,
                        gpu_budget_gb: float = -1.0) -> None:
         """Assign embed / each owned layer / norm+head to CPU or GPU and move them.
@@ -1389,9 +1429,13 @@ class ShardBuildMixin:
         # device is (sum of packed resting) + one bf16 layer. Track the max bf16 layer per device and
         # add it once below. kv_quant='none' -> resting == pl (bf16), transient 0 -> bit-identical.
         _kvq = (getattr(self, "kv_quant", "none") or "none")
-        # #kimi-linear: a hybrid shard allocates a plain bf16 cache regardless of kv_quant /
-        # kv_offload (shard_forward's if/elif order), so probe what it will really allocate.
-        _kvq_on = _kvq != "none" and not getattr(self, "_hybrid", False)
+        # #172-hybrid: probe what shard_forward will REALLY allocate, per layer. This used to be
+        # `_kvq != "none" and not self._hybrid` — a whole-shard boolean that refused every hybrid,
+        # because a hybrid then built a plain bf16 cache. A hybrid now packs its full_attention
+        # layers (its linear ones hold recurrent state and its sliding ones stay bounded-bf16), so
+        # the gate is per-layer and comes from the SINGLE mask both files read.
+        _kvq_mask = self._kv_quant_layer_mask()
+        _kvq_on = _kvq != "none" and any(_kvq_mask)
         # #kv-slots: C independent per-request KV streams each grow to full ctx — reserve C x the
         # per-slot resting figure (the load must FAIL here, clean and replannable, if C streams
         # can't fit; never OOM mid-decode). The bf16 dequant transient stays x1 (kv_quant is
@@ -1407,7 +1451,8 @@ class ShardBuildMixin:
         _lin_state = self._linattn_state_bytes()
         by_dev: dict = {}
         max_bf16: dict = {}
-        for layer, d, holds_kv in zip(self.owned_layers, self.layer_devices, kv_mask):
+        for layer, d, holds_kv, packs in zip(self.owned_layers, self.layer_devices, kv_mask,
+                                             _kvq_mask):
             if not holds_kv:
                 if _lin_state and getattr(d, "type", "") == "cuda":
                     by_dev[d] = by_dev.get(d, 0) + _lin_state * _slots
@@ -1428,7 +1473,10 @@ class ShardBuildMixin:
                 nkv_l, hd_use = max(1, n_heads // grp_l), hd_l
                 pl = 2 * int(ctx) * nkv_l * hd_use * 2
             resting = pl
-            if _kvq_on:   # packed resting for this layer's geometry; any failure -> bf16 pl (conservative)
+            # `packs` (not `_kvq_on`): on a hybrid only the full_attention layers are packed —
+            # a sliding layer keeps its bounded bf16 slot and must be charged bf16 here, or the
+            # reservation is smaller than the cache the worker builds.
+            if _kvq != "none" and packs:   # packed resting for this layer's geometry; any failure -> bf16 pl
                 try:
                     import kv_quant
                     _pt = kv_quant.kv_quant_bytes_per_token_per_layer(_kvq, nkv_l, hd_use)
@@ -1437,7 +1485,11 @@ class ShardBuildMixin:
                 except Exception:
                     resting = pl
             by_dev[d] = by_dev.get(d, 0) + resting * _slots   # #kv-slots: C streams per layer
-            max_bf16[d] = max(max_bf16.get(d, 0), pl)
+            # The bf16 dequant transient exists only for layers that are actually PACKED — an
+            # unpacked layer already carries its full bf16 in `resting`, so counting it here too
+            # would double-charge it. All-True on the plain path -> bit-identical.
+            if packs:
+                max_bf16[d] = max(max_bf16.get(d, 0), pl)
         if _kvq_on:   # + one bf16 dequant transient per device that holds any KV layer
             for d in list(by_dev):
                 by_dev[d] += max_bf16.get(d, 0)

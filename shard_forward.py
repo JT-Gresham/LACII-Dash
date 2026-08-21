@@ -398,6 +398,60 @@ class ShardForwardMixin:
             print(f"[kv_quant] '{name}' unavailable ({exc!r}) -> plain bf16 KV", flush=True)
             return DynamicCache()
 
+    def _make_hybrid_kv_cache(self, name):
+        """#172-hybrid: the hybrid arch's cache, with TurboQuant layers swapped into its
+        full_attention slots (kv_quant != 'none') — or the plain one, unchanged, otherwise.
+
+        Before this, a hybrid always got a plain bf16 DynamicCache and kv_quant was refused
+        outright, on the reasoning that a linear-attention layer holds recurrent state rather than
+        K/V. True of those layers, but not of the arch: Qwen3.5/3.6/3.8 is 48 linear + 16
+        full_attention of 64, and those 16 grow an ordinary ctx-scaled K/V that packs exactly like
+        a dense model's. At 262144 ctx on qwen3.8-27b that is ~16 GB of bf16 KV left on the table.
+
+        Which slots get swapped is NOT decided here — it comes from Shard._kv_quant_layer_mask, the
+        same mask shard_build reserves from, so the cache and its reservation cannot disagree.
+        Sliding-window layers are deliberately excluded by that mask (bounded K/V, different cache
+        class). Correctness-first, matching _make_kv_quant_cache: ANY failure returns a FRESH plain
+        hybrid cache — fresh because the swap mutates in place, so a half-swapped cache must be
+        discarded rather than handed to the model."""
+        from transformers import DynamicCache
+        base = DynamicCache(config=self.cfg)
+        if not name or name == "none":
+            return base
+        try:
+            from transformers.cache_utils import DynamicLayer
+            import kv_quant as _kq
+            pb = _kq.preset_bits(name)
+            if not pb:
+                return base
+            kb, vb = pb
+            torch = self.torch
+
+            def _qf(head_dim, device, dtype):
+                return _kq.TurboQuantizer(torch, head_dim, key_bits=kb, value_bits=vb,
+                                          device=device, dtype=dtype)
+            try:
+                _rw = max(0, int(os.environ.get("INFINITEMODEL_KV_QUANT_RESIDUAL", "0")))
+            except Exception:
+                _rw = 0
+            # The mask is per-OWNED layer; cache slots are addressed by GLOBAL layer index (the
+            # same convention _make_linattn_kv documents). Slots this shard does not own are never
+            # written, so swapping only the owned ones is sufficient and keeps the rest stock.
+            _b = int(getattr(self, "layer_start", 0) or 0)
+            idx = [_b + i for i, q in enumerate(self._kv_quant_layer_mask()) if q]
+            if not idx:
+                return base
+            n_q = len(idx)
+            out = _kq.make_hybrid_turboquant_cache(base, DynamicCache, DynamicLayer, _qf, idx,
+                                                   residual_window=_rw)
+            print(f"[kv_quant] hybrid '{name}': packed {n_q} full-attention layer(s) of "
+                  f"{len(self.owned_layers)} owned; other kinds left bf16", flush=True)
+            return out
+        except Exception as exc:
+            print(f"[kv_quant] hybrid '{name}' unavailable ({exc!r}) -> plain bf16 hybrid KV",
+                  flush=True)
+            return DynamicCache(config=self.cfg)
+
     def _make_prealloc_kv(self):
         """#kv-prealloc: KV cache for the PLAIN standard-attention branch — preallocated,
         capacity-doubling, index-write append instead of stock DynamicLayer's per-token torch.cat
@@ -507,7 +561,10 @@ class ShardForwardMixin:
                 # every other model byte-identical.
                 self.kv = self._make_linattn_kv()
             elif self._hybrid:
-                self.kv = DynamicCache(config=self.cfg)
+                # #172-hybrid: a hybrid now packs its full_attention layers too (see
+                # _make_hybrid_kv_cache). kv_quant='none' returns exactly DynamicCache(config=cfg),
+                # so every previously-working hybrid load is byte-identical.
+                self.kv = self._make_hybrid_kv_cache(_kvq)
             elif _kvq and _kvq != "none":
                 # #172 TurboQuant: quantized resting KV (un-rotated on read -> attention unchanged).
                 self.kv = self._make_kv_quant_cache(_kvq)

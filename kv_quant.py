@@ -341,3 +341,48 @@ def make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factor
             self.layer_class_to_replicate = _TurboQuantLayer
 
     return _TurboQuantCache()
+
+
+def turboquant_layer_cls(dynamic_cache_cls, dynamic_layer_cls, quantizer_factory,
+                         residual_window: int = 0):
+    """The _TurboQuantLayer class alone, for callers that need to place quantized layers into a
+    cache they did not build.
+
+    Deliberately obtained by reading it back off a throwaway cache instance rather than by lifting
+    the class body out of make_turboquant_cache into a shared factory. The mechanical extraction
+    was the obvious refactor and is the wrong trade here: _TurboQuantLayer is ~120 lines of
+    quantize/pack/unpack/mask-length logic that is CORRECT and deployed, and re-indenting it into a
+    new enclosing scope risks a silent behaviour change in the one path that already works, to buy
+    nothing a two-line accessor cannot. _TurboQuantCache.__init__ already publishes the class as
+    layer_class_to_replicate, so there is exactly one definition either way."""
+    c = make_turboquant_cache(dynamic_cache_cls, dynamic_layer_cls, quantizer_factory,
+                              residual_window=residual_window)
+    return c.layer_class_to_replicate
+
+
+def make_hybrid_turboquant_cache(cache, dynamic_cache_cls, dynamic_layer_cls, quantizer_factory,
+                                 quant_idx, residual_window: int = 0):
+    """#172-hybrid: take an ALREADY-BUILT hybrid cache and swap a TurboQuant layer into each slot
+    named by `quant_idx` (GLOBAL layer indices). Returns the same cache object.
+
+    Why swap instead of building a fresh cache: on a hybrid arch, transformers' DynamicCache(config)
+    pre-creates one layer object per entry in config.layer_types, choosing the class per kind — a
+    linear-attention slot and a sliding-window slot are NOT plain DynamicLayers. Rebuilding that
+    mapping here would fork it; replacing only the slots we are certain about leaves every other
+    kind exactly as the installed transformers made it.
+
+    ⚠⚠ `quant_idx` must name ONLY `full_attention` layers. A sliding-window layer holds real K/V,
+    but BOUNDED to cfg.sliding_window by its own cache class; _TurboQuantLayer extends the
+    UNBOUNDED DynamicLayer, so swapping one in would silently drop the window bound — unbounded
+    growth plus a KV reservation sized for the packed-and-bounded figure, i.e. a decode OOM. The
+    caller's mask (Shard._kv_quant_layer_mask) is the single place that decides this."""
+    cls = turboquant_layer_cls(dynamic_cache_cls, dynamic_layer_cls, quantizer_factory,
+                               residual_window=residual_window)
+    layers = getattr(cache, "layers", None)
+    if layers is None:
+        raise RuntimeError("cache has no .layers — transformers Cache API drift")
+    for i in quant_idx:
+        i = int(i)
+        if 0 <= i < len(layers):
+            layers[i] = cls()
+    return cache

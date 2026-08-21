@@ -97,6 +97,29 @@ MQA = ("mqa-1kv-head", _spec(num_kv_heads=1, head_dim=64, num_layers=80),
 CASES = [DENSE, DENSE_DECL, SLIDING, LINEAR, MQA]
 PRESETS = ["none", "turbo2", "turbo3", "turbo4", "", None, "TURBO3", "bogus", "int4"]
 
+
+def blended_ratio(spec, norm, cfg):
+    """#172-hybrid: the ratio for_kv_quant SHOULD produce, derived from the FIXTURE's declared
+    layer_types rather than from the ModelSpec properties under test — otherwise this would just
+    assert that the code equals itself.
+
+    Q = layers that PACK (exactly "full_attention").
+    K = layers that grow a ctx-scaled K/V (everything except linear-attention; sliding COUNTS).
+    Packed Q at `pt` bytes/token, the remaining K-Q at bf16, plus the one-bf16-layer dequant
+    transient amortised over all layers. Returns None when nothing packs (the caller must then
+    expect a refusal), which is the fla/kda case with no layer_types at all."""
+    lts = cfg.get("layer_types")
+    if lts is None:
+        return None
+    pt = _kq.kv_quant_bytes_per_token_per_layer(norm, spec.num_kv_heads, spec.head_dim)
+    bf = 2 * spec.num_kv_heads * spec.head_dim * KV_DTYPE_BYTES
+    q = sum(1 for t in lts if str(t) == "full_attention")
+    k = sum(1 for t in lts if "linear" not in str(t))
+    if q <= 0 or k <= 0 or pt <= 0 or bf <= 0:
+        return None
+    return ((q * pt + (k - q) * bf) / (k * bf)) + 1.0 / max(1, spec.num_layers)
+
+
 checked = 0
 for label, spec, cfg in CASES:
     for preset in PRESETS:
@@ -109,12 +132,34 @@ for label, spec, cfg in CASES:
             if got.kv_layer_frac != spec.kv_layer_frac or note:
                 failures.append(f"{label}/{preset!r}: non-preset must be a no-op, "
                                 f"got frac={got.kv_layer_frac} note={note!r}")
-        elif hyb:
+        elif blended_ratio(spec, norm, cfg) is None:
+            # Nothing packs on this arch (fla/kda: the worker builds _make_linattn_kv, never a
+            # quantized cache). MUST refuse — sizing a packed cache the worker does not build is
+            # an under-reserve, i.e. a decode OOM.
             if got.kv_layer_frac != spec.kv_layer_frac:
-                failures.append(f"{label}/{preset!r}: HYBRID must NOT shrink (worker reserves "
-                                f"bf16) — frac {spec.kv_layer_frac} -> {got.kv_layer_frac}")
+                failures.append(f"{label}/{preset!r}: NOTHING packs here — must NOT shrink "
+                                f"(frac {spec.kv_layer_frac} -> {got.kv_layer_frac})")
             if not note:
-                failures.append(f"{label}/{preset!r}: hybrid refusal must explain itself")
+                failures.append(f"{label}/{preset!r}: refusal must explain itself")
+        elif hyb:
+            # #172-hybrid: a hybrid now packs its full_attention layers. Expect the BLEND, and
+            # expect it to be strictly between "all packed" and "no shrink at all" whenever the
+            # arch actually mixes kinds — a hybrid that shrank like a dense model would mean
+            # sliding/linear layers were packed too, which is the under-reserve this guards.
+            want = blended_ratio(spec, norm, cfg) * float(spec.kv_layer_frac or 1.0)
+            if abs(got.kv_layer_frac - want) > 1e-12:
+                failures.append(f"{label}/{preset!r}: hybrid blend wrong — got {got.kv_layer_frac!r} "
+                                f"want {want!r}")
+            elif note:
+                failures.append(f"{label}/{preset!r}: sized fine but emitted a refusal {note!r}")
+            elif not got.kv_layer_frac < spec.kv_layer_frac:
+                failures.append(f"{label}/{preset!r}: packing some layers must SHRINK the plan "
+                                f"({got.kv_layer_frac} !< {spec.kv_layer_frac})")
+            else:
+                _dense = old_ratio(spec, norm) or 0.0
+                if _dense and abs(got.kv_layer_frac - _dense * float(spec.kv_layer_frac or 1.0)) <= 1e-12:
+                    failures.append(f"{label}/{preset!r}: hybrid shrank like a DENSE model — its "
+                                    f"sliding/linear layers were packed, which under-reserves")
         else:
             want = old_ratio(spec, norm)
             if want is None:
@@ -157,4 +202,5 @@ if failures:
         print("  -", f)
     sys.exit(1)
 print(f"PASS — for_kv_quant is a pure dedup over {checked} (arch x preset) combinations, pinned to "
-      f"{PRE_COLLAPSE}'s formula; is_hybrid matches the old gate; both planners use one helper")
+      f"{PRE_COLLAPSE}'s formula on dense; hybrids blend per-layer; fla/kda still refused; "
+      "both planners use one helper")
