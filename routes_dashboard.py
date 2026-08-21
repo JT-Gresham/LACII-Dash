@@ -51,25 +51,45 @@ def _graph_owner(host: str):
 def register(app):
 
     # ---- dashboard + introspection ----
+    def _page(html: str) -> HTMLResponse:
+        """#dash-nocache: serve a dashboard page with caching switched OFF.
+
+        These pages used to be returned as bare strings, so the response carried NO Cache-Control,
+        NO ETag and NO Last-Modified. With neither a directive nor a validator a browser falls back
+        to HEURISTIC caching and may reuse its copy indefinitely without ever revalidating — so a
+        controller self-update shipped new dashboard JS that an already-open tab kept ignoring, and
+        the operator saw the OLD behaviour while /chat on the wire served the NEW page. That is
+        indistinguishable from "the fix did not work", and it cost exactly that confusion once: a
+        chat still rendering "(no output)" from JS that had already been replaced on the server.
+
+        The whole page is a Python constant that changes on every update and is ~12 KB, so there is
+        nothing to gain by caching it and a correctness bug to lose. Applied in ONE helper, over a
+        header set defined ONCE in dashboard_html.NOCACHE_HEADERS and shared with routes_peers'
+        /controllers page: a header dict copied per route is precisely the per-branch duplication
+        that drifts in this codebase.
+
+        Scope is the HTML shell only. The JSON endpoints it polls are uncached already."""
+        return HTMLResponse(html, headers=NOCACHE_HEADERS)
+
     @app.get("/", response_class=HTMLResponse)
-    async def index() -> str:
-        return DASHBOARD_HTML
+    async def index() -> HTMLResponse:
+        return _page(DASHBOARD_HTML)
 
     @app.get("/bandwidth", response_class=HTMLResponse)
-    async def bandwidth_page() -> str:
-        return BANDWIDTH_HTML
+    async def bandwidth_page() -> HTMLResponse:
+        return _page(BANDWIDTH_HTML)
 
     @app.get("/config", response_class=HTMLResponse)   # dashboard: Configuration page (settings + node tiers)
-    async def config_page() -> str:
-        return CONFIG_HTML
+    async def config_page() -> HTMLResponse:
+        return _page(CONFIG_HTML)
 
     @app.get("/logs-page", response_class=HTMLResponse)   # dashboard: Logging page (controller + per-node logs)
-    async def logs_page() -> str:
-        return LOGS_HTML
+    async def logs_page() -> HTMLResponse:
+        return _page(LOGS_HTML)
 
     @app.get("/chat", response_class=HTMLResponse)   # dashboard: Chat page (pick a loaded model, send/stream)
-    async def chat_page() -> str:
-        return CHAT_HTML
+    async def chat_page() -> HTMLResponse:
+        return _page(CHAT_HTML)
 
     @app.get("/bandwidthdata")       # full traffic picture: controller<->node + node<->node
     async def bandwidthdata() -> JSONResponse:

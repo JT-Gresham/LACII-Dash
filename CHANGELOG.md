@@ -4,7 +4,40 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-21 (latest) — the dashboard chat threw away reasoning and showed "(no output)" (0.3.36 / 0.3.33)
+## 2026-08-21 (latest) — dashboard pages were served with NO cache headers at all (0.3.37 / 0.3.33)
+
+### Fixed
+
+- **`#dash-nocache`: an open browser tab kept running dashboard JS the server had already
+  replaced.** Every dashboard page was returned as a **bare string**, so the response carried no
+  `Cache-Control`, no `ETag` and no `Last-Modified`. Given neither a directive nor a validator, a
+  browser falls back to **heuristic caching** and may reuse its copy indefinitely without ever
+  revalidating.
+
+  The effect is nastier than a stale page: a controller self-update ships new JS, the wire serves
+  the new page, and the operator — looking at a tab opened before the update — sees the **old**
+  behaviour. That is indistinguishable from *"your fix does not work"*, and it cost exactly that:
+  a chat still rendering `"(no output)"` from JS that had already been replaced on the server, with
+  the previous fix wrongly suspected.
+
+  All **six** HTML routes (the five in `routes_dashboard` plus `/controllers` in `routes_peers`) now
+  serve `no-store, no-cache, must-revalidate, max-age=0` from a header set defined **once** in
+  `dashboard_html.NOCACHE_HEADERS`, reaching both route modules by the same
+  import + `state.publish`/`bind` path the HTML constants already take. The pages are ~12 KB Python
+  constants that change on every update, so there is nothing to gain by caching them and a
+  correctness bug to lose.
+
+  `scratch_dash_nocache_test.py` asserts the structural property — one definition, it still
+  contains `no-store`, and every route declaring `response_class=HTMLResponse` returns through it —
+  so a page added later as a bare `return SOME_HTML` fails the test.
+
+  ⚠ The first version of that test was **inert**: it substring-matched the function body, and the
+  explanatory comment above the return contained `NOCACHE_HEADERS`, so reverting the return to a
+  bare string still passed. A negative control caught it, and the check now inspects the actual
+  return *expression* via AST. Worth recording because it is the same defect class the test exists
+  to prevent.
+
+## 2026-08-21 — the dashboard chat threw away reasoning and showed "(no output)" (0.3.36 / 0.3.33)
 
 ### Fixed
 

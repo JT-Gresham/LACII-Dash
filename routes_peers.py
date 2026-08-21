@@ -106,7 +106,10 @@ def register(app):
 
     @app.get("/controllers", response_class=HTMLResponse)   # dashboard: Cross-controller page
     async def controllers_page() -> str:
-        return CONTROLLERS_HTML
+        # #dash-nocache: same no-store treatment as the other five pages (see
+        # dashboard_html.NOCACHE_HEADERS). This page lives in a different route module and
+        # would otherwise be the one an open tab keeps serving stale after an update.
+        return HTMLResponse(CONTROLLERS_HTML, headers=NOCACHE_HEADERS)
 
     @app.get("/peer_info")
     async def peer_info() -> JSONResponse:

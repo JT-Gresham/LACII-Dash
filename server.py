@@ -66,7 +66,7 @@ except ImportError as exc:  # pragma: no cover
         f"(import error: {exc})"
     )
 
-VERSION = "0.3.36"  # version tag only; full changelog -> CHANGELOG.md
+VERSION = "0.3.37"  # version tag only; full changelog -> CHANGELOG.md
 OLLAMA_API_VERSION = "0.5.4"   # version string reported on /api/version for tool compat
 GB = 1024 ** 3
 
@@ -3283,7 +3283,8 @@ def _display_host() -> str:
 # Dashboard + bandwidth HTML live in dashboard_html.py (server-only); kept in sync by the
 # multi-file self-update (in EXTRA_UPDATE_FILES) + present from a fresh git clone -> plain import.
 from dashboard_html import (DASHBOARD_HTML, BANDWIDTH_HTML, CONFIG_HTML, LOGS_HTML,   # noqa: F401
-                            CHAT_HTML, CONTROLLERS_HTML)   # CONTROLLERS_HTML: #federation Phase 2
+                            CHAT_HTML, CONTROLLERS_HTML,   # CONTROLLERS_HTML: #federation Phase 2
+                            NOCACHE_HEADERS)   # #dash-nocache: shared by every page route
 
 
 # ---------------------------------------------------------------------------

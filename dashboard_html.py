@@ -2019,6 +2019,27 @@ refresh(); tick(); setInterval(tick,3000);
 # --- #federation: Cross-controller page (peers, their models/nodes, controller config) ------------
 # Phase 2. Renders GET /peers (peers.py's gossip cache). Actions land in later phases:
 #   Phase 4 adds "Pull" (fetch a model's weights FROM a peer), Phase 5 adds node lending.
+# #dash-nocache: the header set every dashboard page is served with.
+#
+# These pages were returned as BARE STRINGS, so the response carried no Cache-Control, no ETag and
+# no Last-Modified. Given neither a directive nor a validator, a browser falls back to HEURISTIC
+# caching and may reuse its copy indefinitely without revalidating. The effect is that a controller
+# self-update ships new dashboard JS and an already-open tab keeps running the OLD code — the wire
+# serves the new page while the operator sees the old behaviour, which is indistinguishable from
+# "your fix does not work". It cost exactly that: a chat still rendering "(no output)" from JS the
+# server had already replaced.
+#
+# Every page here is a Python constant that changes on each update and is ~12 KB, so there is
+# nothing to gain by caching and a correctness bug to lose. Defined ONCE and shared by every route
+# (routes_dashboard's five pages + routes_peers' /controllers) rather than copied per route —
+# per-branch copies of a rule are this codebase's dominant failure mode. Reaches the route modules
+# through server.py's import + state.publish/bind, the same path the HTML constants take.
+NOCACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",   # HTTP/1.0 intermediaries (GoldenEye fronts this fleet)
+    "Expires": "0",
+}
+
 CONTROLLERS_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
