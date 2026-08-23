@@ -958,8 +958,28 @@ class WorkerLoadMixin:
             return
         try:
             audio = base64.b64decode(msg.get("audio_b64") or "")
+            # #bazarr-asr: `mode` selects what the caller needs. Absent (every pre-existing
+            # controller) == "text", the original path, byte-identical.
+            #   text     -> plain transcript                       (/v1/audio/transcriptions)
+            #   segments -> timestamped cues, for SRT output       (/asr)
+            #   detect   -> spoken language only, first 30 s       (/detect-language)
+            mode = str(msg.get("mode") or "text").strip().lower()
             self._building += 1
             try:
+                if mode == "detect":
+                    code, name = await asyncio.to_thread(eng.detect_language, audio)
+                    await reply({"type": "stt_done", "req_id": rid, "model_id": mid,
+                                 "text": "", "language": code, "language_name": name,
+                                 "seconds": 0.0, "audio_s": 0.0})
+                    return
+                if mode == "segments":
+                    segs, text, secs, audio_s = await asyncio.to_thread(
+                        eng.transcribe_segments, audio,
+                        str(msg.get("language") or ""), str(msg.get("task") or "transcribe"))
+                    await reply({"type": "stt_done", "req_id": rid, "model_id": mid,
+                                 "text": text, "segments": segs, "seconds": round(secs, 1),
+                                 "audio_s": round(audio_s, 1)})
+                    return
                 text, secs, audio_s = await asyncio.to_thread(
                     eng.transcribe, audio,
                     str(msg.get("language") or ""), str(msg.get("task") or "transcribe"))

@@ -35,6 +35,19 @@ GB = 1024 ** 3
 SR = 16000                 # Whisper's fixed input sample rate (Hz)
 _CHUNK_S = 30              # Whisper's native receptive window (30 s of 16 kHz audio)
 
+# #bazarr-asr: code -> English name, used ONLY when transformers' own LANGUAGES map cannot be
+# imported. Covers the languages a media library realistically contains; anything else falls back
+# to echoing the code, which still satisfies the contract (language_code is the field that matters).
+_LANG_FALLBACK = {
+    "en": "english", "es": "spanish", "fr": "french", "de": "german", "it": "italian",
+    "pt": "portuguese", "nl": "dutch", "sv": "swedish", "no": "norwegian", "da": "danish",
+    "fi": "finnish", "pl": "polish", "ru": "russian", "uk": "ukrainian", "cs": "czech",
+    "tr": "turkish", "el": "greek", "he": "hebrew", "ar": "arabic", "hi": "hindi",
+    "ja": "japanese", "ko": "korean", "zh": "chinese", "th": "thai", "vi": "vietnamese",
+    "id": "indonesian", "ro": "romanian", "hu": "hungarian", "bg": "bulgarian", "hr": "croatian",
+    "sr": "serbian", "sk": "slovak", "sl": "slovenian", "ca": "catalan", "fa": "persian",
+}
+
 
 class _suppress:
     """Tiny contextlib.suppress(Exception) without importing contextlib at module top."""
@@ -258,3 +271,167 @@ class WhisperPipeline:
             print(f"[stt] {audio_s:.1f}s audio -> {len(text)} chars in {self.last_gen_s:.1f}s "
                   f"(RTF {self.last_gen_s / max(audio_s, 1e-6):.2f})", flush=True)
             return text, self.last_gen_s, audio_s
+
+    # -- timestamps + language detection (#bazarr-asr) ------------------------------------
+
+    def _window_segments(self, ids, offset_s: float, win_end_s: float) -> tuple:
+        """One window's generated ids -> ([{start,end,text}], how) in ABSOLUTE seconds.
+
+        `how` names the path that produced them, and is logged: a silent fall back to
+        whole-window timestamps still yields valid SRT, so without saying which path ran there is
+        no way to tell real per-utterance timings from 30 s blocks.
+
+        Two extraction paths because the tokenizer API differs across transformers releases, and
+        this worker must not break on the version the fleet happens to have:
+          1. `decode(..., output_offsets=True)` — the supported API, gives (start, end) per segment.
+          2. Parsing the literal `<|0.00|>` timestamp tokens out of a timestamped decode. Ugly, but
+             those tokens are part of Whisper's vocabulary rather than an API, so it survives
+             version drift.
+        Neither working returns [] and lets the caller fall back to the window bounds."""
+        import re as _re
+        tok = getattr(self._processor, "tokenizer", None) or self._processor
+        seq = ids[0] if hasattr(ids, "__getitem__") and not isinstance(ids, (list, tuple)) else ids
+        try:
+            out = tok.decode(seq, skip_special_tokens=True, output_offsets=True)
+            segs = []
+            for o in ((out or {}).get("offsets") or []):
+                ts = o.get("timestamp") or (None, None)
+                if ts[0] is None:
+                    continue
+                a = offset_s + float(ts[0])
+                b = offset_s + float(ts[1]) if ts[1] is not None else a
+                txt = (o.get("text") or "").strip()
+                if txt:
+                    segs.append({"start": a, "end": max(b, a), "text": txt})
+            if segs:
+                return segs, "offsets"
+        except Exception:
+            pass
+        try:
+            raw = tok.decode(seq, decode_with_timestamps=True, skip_special_tokens=False)
+            segs = []
+            for a, txt, b in _re.findall(r"<\|(\d+\.\d+)\|>([^<]*)<\|(\d+\.\d+)\|>", raw or ""):
+                t = txt.strip()
+                if t:
+                    segs.append({"start": offset_s + float(a),
+                                 "end": offset_s + float(b), "text": t})
+            if segs:
+                return segs, "markers"
+        except Exception:
+            pass
+        return [], "none"
+
+    def transcribe_segments(self, audio_bytes: bytes, language: str = "",
+                            task: str = "transcribe") -> tuple:
+        """#bazarr-asr: like transcribe(), but returns TIMESTAMPED segments for SRT output.
+
+        Returns ([{start,end,text}], full_text, wall_s, audio_s). Same 30 s windowing as
+        _transcribe — deliberately, so the two share the long-form behaviour that is already
+        proven here — with each window's timestamps shifted by that window's absolute offset.
+        A window whose timestamps cannot be recovered contributes ONE segment spanning the window,
+        so the result is always renderable as SRT even on a transformers build whose tokenizer
+        API has moved."""
+        import torch
+        with self._gen_lock:
+            t0 = time.time()
+            y = _decode_audio(audio_bytes)
+            audio_s = len(y) / float(SR) if len(y) else 0.0
+            if not len(y):
+                raise RuntimeError("empty / undecodable audio")
+            task = (task or "transcribe").strip().lower()
+            if task not in ("transcribe", "translate"):
+                task = "transcribe"
+            win = SR * _CHUNK_S
+            segments: list = []
+            hows: dict = {}
+            for i in range(0, max(len(y), 1), win):
+                seg = y[i:i + win]
+                if len(seg) < SR // 5:      # <0.2 s tail is silence
+                    continue
+                off = i / float(SR)
+                end = off + len(seg) / float(SR)
+                feats = self._processor(seg, sampling_rate=SR,
+                                        return_tensors="pt").input_features
+                dtype = next(self.model.parameters()).dtype
+                feats = feats.to(self.model.device, dtype=dtype)
+                kw: dict = {"return_timestamps": True}
+                if language:
+                    kw["language"] = language
+                if task:
+                    kw["task"] = task
+                with torch.no_grad():
+                    ids = self.model.generate(feats, **kw)
+                got, how = self._window_segments(ids, off, end)
+                hows[how] = hows.get(how, 0) + 1
+                if not got:
+                    txt = (self._processor.batch_decode(ids, skip_special_tokens=True) or [""])[0]
+                    txt = txt.strip()
+                    if txt:
+                        got = [{"start": off, "end": end, "text": txt}]
+                segments.extend(got)
+            # Clamp to the real audio length and drop empties: Whisper happily emits a timestamp
+            # past the end of a padded final window, which renders as an SRT cue running beyond
+            # the video.
+            out = []
+            for s in segments:
+                a = max(0.0, min(float(s["start"]), audio_s))
+                b = max(a, min(float(s["end"]), audio_s))
+                if s.get("text"):
+                    out.append({"start": a, "end": b, "text": s["text"]})
+            text = " ".join(s["text"] for s in out).strip()
+            self.last_gen_s = time.time() - t0
+            self.last_audio_s = audio_s
+            print(f"[stt] {audio_s:.1f}s audio -> {len(out)} segment(s), {len(text)} chars in "
+                  f"{self.last_gen_s:.1f}s (timestamps: "
+                  f"{', '.join(f'{k}x{v}' for k, v in hows.items()) or 'none'})", flush=True)
+            return out, text, self.last_gen_s, audio_s
+
+    def detect_language(self, audio_bytes: bytes) -> tuple:
+        """#bazarr-asr: detect the spoken language from the FIRST 30 s. -> (code, name).
+
+        Whisper predicts the language as a single `<|xx|>` token before any text, so this needs
+        one window and one token, not a transcription — which is why Bazarr's /detect-language is
+        near-instant next to /asr."""
+        import torch
+        with self._gen_lock:
+            y = _decode_audio(audio_bytes)
+            if not len(y):
+                raise RuntimeError("empty / undecodable audio")
+            y = y[:SR * _CHUNK_S]
+            feats = self._processor(y, sampling_rate=SR, return_tensors="pt").input_features
+            dtype = next(self.model.parameters()).dtype
+            feats = feats.to(self.model.device, dtype=dtype)
+            tok = getattr(self._processor, "tokenizer", None) or self._processor
+            code = ""
+            # Preferred: the model's own detector (transformers >= 4.39).
+            try:
+                with torch.no_grad():
+                    lid = self.model.detect_language(input_features=feats)
+                t = tok.convert_ids_to_tokens(int(lid[0][0] if hasattr(lid[0], "__len__") else lid[0]))
+                code = str(t).strip("<|>")
+            except Exception:
+                # Fallback: generate a couple of tokens with NO forced language and read the
+                # language token out of the prefix.
+                try:
+                    import re as _re
+                    with torch.no_grad():
+                        ids = self.model.generate(feats, max_new_tokens=2, return_timestamps=False)
+                    raw = tok.decode(ids[0], skip_special_tokens=False)
+                    # The prefix looks like <|startoftranscript|><|en|><|transcribe|>...
+                    # so the FIRST 2-3 letter tag is the language.
+                    m = _re.search(r"<\|([a-z]{2,3})\|>", raw or "")
+                    if m:
+                        code = m.group(1)
+                except Exception:
+                    code = ""
+            code = (code or "en").lower()
+            name = ""
+            try:    # transformers ships the canonical code -> English-name map
+                from transformers.models.whisper.tokenization_whisper import LANGUAGES
+                name = str(LANGUAGES.get(code) or "")
+            except Exception:
+                name = ""
+            if not name:
+                name = _LANG_FALLBACK.get(code, code)
+            print(f"[stt] detected language: {code} ({name})", flush=True)
+            return code, name.lower()

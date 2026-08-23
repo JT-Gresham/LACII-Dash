@@ -3092,7 +3092,7 @@ class EngineLoadMixin:
         return lm
 
     async def stt_transcribe(self, friendly: str, audio_bytes: bytes, language: str = "",
-                             task: str = "transcribe") -> tuple[str, dict]:
+                             task: str = "transcribe", mode: str = "text") -> tuple[str, dict]:
         """#stt-serve: transcribe audio on the model's Whisper worker. Serializes per model on
         LoadedModel.lock (same discipline as text/image/speech gens); the audio travels the control
         link as base64 and the transcript returns in stt_done. Returns (text, meta)."""
@@ -3119,7 +3119,12 @@ class EngineLoadMixin:
                 await link.send({"type": "stt_transcribe", "model_id": lm.target_id, "req_id": rid,
                                  "audio_b64": base64.b64encode(audio_bytes).decode("ascii"),
                                  "language": str(language or ""),
-                                 "task": str(task or "transcribe")})
+                                 "task": str(task or "transcribe"),
+                                 # #bazarr-asr: "text" (default) is the original path; "segments"
+                                 # asks for timestamped cues (SRT) and "detect" for the spoken
+                                 # language only. A pre-#bazarr-asr worker ignores the key and
+                                 # answers with plain text, which the callers below detect.
+                                 "mode": str(mode or "text")})
                 # Whisper decode is ~ realtime on GPU, a few x slower on CPU; scale to audio size.
                 r = await asyncio.wait_for(
                     fut, timeout=max(GEN_TIMEOUT_S, 120.0 + len(audio_bytes) / 20000.0))
@@ -3136,7 +3141,13 @@ class EngineLoadMixin:
             log_activity(f"{_ollama_name(friendly)}: transcribed {r.get('audio_s', '?')}s audio "
                          f"({len(text)} chars)")
             return text, {"seconds": r.get("seconds"), "audio_s": r.get("audio_s"),
-                          "language": language, "task": task}
+                          "language": language, "task": task,
+                          # #bazarr-asr: present only when the worker answered a segments/detect
+                          # request. Absent => an older worker that ignored `mode`; the caller
+                          # must say so rather than silently emitting a subtitle with no timings.
+                          "segments": r.get("segments"),
+                          "detected_language": r.get("language"),
+                          "detected_language_name": r.get("language_name")}
 
     async def tts_generate(self, friendly: str, text: str, voice: str = "",
                            speed: float = 1.0, fmt: str = "wav") -> tuple[bytes, dict]:

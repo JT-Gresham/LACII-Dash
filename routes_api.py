@@ -6,6 +6,51 @@ build_app() calls register(app) to attach them. Controller-only leaf; in EXTRA_U
 from __future__ import annotations
 
 
+# ---- #bazarr-asr pure helpers (module scope so they are unit-testable without a running app;
+# they close over nothing). See register() for the /asr and /detect-language routes themselves.
+def _wav_from_pcm16(pcm: bytes, sr: int = 16000, ch: int = 1) -> bytes:
+    """Wrap HEADERLESS s16le PCM in a 44-byte RIFF/WAVE header.
+
+    This is the whole `encode=false` contract: Bazarr pre-decodes with
+    `ffmpeg -f s16le -acodec pcm_s16le -ac 1 -ar 16000`, so the body has no container at all.
+    The Whisper leaf decodes via soundfile, which needs a header — giving it one here keeps
+    the worker's decode path completely unchanged rather than teaching it a second input
+    shape. Do NOT try to sniff or probe this input: there is nothing to sniff."""
+    import struct
+    n = len(pcm)
+    return (b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, ch, sr, sr * ch * 2, ch * 2, 16) +
+            b"data" + struct.pack("<I", n) + pcm)
+
+def _srt_ts(t: float) -> str:
+    ms = int(round(max(0.0, float(t)) * 1000.0))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    sec, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
+
+def _segments_to_srt(segs: list) -> str:
+    """Timestamped segments -> SRT. Enforces the two invariants a player cares about:
+    cues are monotonic (Whisper's per-window timestamps can overlap at a window boundary)
+    and no cue has zero duration (it would never be displayed)."""
+    out, prev_end, idx = [], 0.0, 0
+    for sg in segs or []:
+        txt = " ".join(str(sg.get("text") or "").split())
+        if not txt:
+            continue
+        a = max(float(sg.get("start") or 0.0), prev_end)
+        b = float(sg.get("end") or 0.0)
+        if b <= a:
+            b = a + 0.8
+        idx += 1
+        prev_end = b
+        out.append(f"{idx}\n{_srt_ts(a)} --> {_srt_ts(b)}\n{txt}\n")
+    return "\n".join(out)
+
+def _segments_to_vtt(segs: list) -> str:
+    return "WEBVTT\n\n" + _segments_to_srt(segs).replace(",", ".")
+
+
 def register(app):
 
     # ---- Ollama API ----
@@ -536,6 +581,179 @@ def register(app):
         """OpenAI /v1/audio/translations: same shape as transcriptions, but Whisper translates the
         speech to ENGLISH (task=translate)."""
         return await _run_transcription(req, "translate")
+
+    # ---- Bazarr / whisper-asr-webservice compatible ASR (#bazarr-asr) ------------------
+    #
+    # Bazarr's built-in "Whisper" provider is its last-resort path for GENERATING subtitles when
+    # none can be downloaded. It does NOT speak the OpenAI audio API above — it speaks
+    # ahmetoner/whisper-asr-webservice: POST /asr and POST /detect-language, at the SERVER ROOT.
+    # Bazarr is given a base URL and appends those paths itself, so they cannot live under /v1.
+    # Both are thin adapters over the same Whisper leaf /v1/audio/transcriptions already uses.
+
+    _ASR_MODEL_CACHE: dict = {}
+
+    def _asr_model_name(explicit: str = "") -> str:
+        """Which Whisper model /asr should use. Bazarr sends no model name at all.
+
+        Order: an explicit ?model=, then ENGINE_CONFIG['asr_model'] (so an operator can pin one),
+        then auto-detect the registered Whisper checkpoint. Auto-detection is cached because it
+        stats model directories, and /asr is called once per episode."""
+        if explicit:
+            return explicit
+        cfg = str(ENGINE_CONFIG.get("asr_model") or "").strip()
+        if cfg:
+            return cfg
+        hit = _ASR_MODEL_CACHE.get("name")
+        if hit:
+            return hit
+        cands = []
+        for nm in list(MODELS):
+            try:
+                d = _local_model_dir(MODELS[nm][0])
+            except Exception:
+                d = ""
+            if d and _is_whisper_dir(d):
+                cands.append(nm)
+        if not cands:
+            return ""
+        # Prefer an already-RESIDENT one (no load latency for the first subtitle), then the
+        # largest-sounding name — 'turbo' is the accuracy/speed sweet spot for subtitles.
+        resident = {n for n in cands if n in getattr(engine, "models", {})}
+        cands.sort(key=lambda n: (n in resident, "turbo" in n, "large" in n), reverse=True)
+        _ASR_MODEL_CACHE["name"] = cands[0]
+        return cands[0]
+
+    async def _asr_read_audio(req):
+        """Pull the audio out of a whisper-asr-webservice request -> (bytes, error_response).
+
+        Field name is `audio_file` (not OpenAI's `file`). Also accepts a raw request body so the
+        endpoint can be exercised without python-multipart. `encode=false` (all Bazarr ever sends)
+        means the body is raw PCM and gets a WAV header; `encode=true` means a real media file,
+        which is ffmpeg-decoded here when ffmpeg exists and otherwise passed through for soundfile
+        to try."""
+        qp = req.query_params
+        enc = str(qp.get("encode", "false")).strip().lower()
+        encode = enc in ("1", "true", "yes", "on")
+        data = b""
+        ctype = (req.headers.get("content-type") or "").lower()
+        if "multipart/form-data" in ctype:
+            try:
+                form = await req.form()
+            except Exception as exc:
+                return b"", JSONResponse({"error": f"multipart parse failed: {exc}"}, status_code=400)
+            f = form.get("audio_file") or form.get("file")
+            if f is not None and hasattr(f, "read"):
+                data = await f.read()
+            elif f is not None:
+                data = str(f).encode()
+        else:
+            data = await req.body()
+        if not data:
+            return b"", JSONResponse(
+                {"error": "no audio — send multipart field 'audio_file' (or POST raw bytes)"},
+                status_code=400)
+        if not encode:
+            return _wav_from_pcm16(data), None
+        # encode=true: a container we must decode. ffmpeg if present; otherwise hand the bytes to
+        # the worker, whose soundfile decode handles wav/flac/ogg (but not mp4/mkv/mp3).
+        try:
+            import shutil as _sh
+            import subprocess as _sp
+            exe = _sh.which("ffmpeg")
+            if exe:
+                pr = _sp.run([exe, "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+                              "-f", "wav", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+                              "pipe:1"], input=data, capture_output=True)
+                if pr.returncode == 0 and pr.stdout:
+                    return pr.stdout, None
+        except Exception:
+            pass
+        return data, None
+
+    async def _asr_run(req, mode: str):
+        """Shared body for /asr and /detect-language."""
+        ip = _client_ip(req)
+        qp = req.query_params
+        audio, err = await _asr_read_audio(req)
+        if err is not None:
+            return err
+        model = _asr_model_name(qp.get("model") or "")
+        if not model:
+            return JSONResponse({"error": "no Whisper model is registered on this controller — "
+                                 "add one (e.g. whisper-large-v3-turbo) or set "
+                                 "/config?asr_model=<name>"}, status_code=503)
+        try:
+            friendly = resolve_model_name(model)
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        try:
+            await engine.ensure_loaded(friendly, 0, auto_load=True)
+        except Exception as exc:
+            return _media_load_error(exc, friendly, "stt")
+
+        if mode == "detect":
+            _, meta = await engine.stt_transcribe(friendly, audio, mode="detect")
+            code = str(meta.get("detected_language") or "").strip().lower()
+            name = str(meta.get("detected_language_name") or "").strip().lower()
+            if not code:
+                return JSONResponse({"error": "this Whisper worker is running pre-#bazarr-asr "
+                                     "code and cannot detect a language — update the fleet"},
+                                    status_code=503)
+            print(f"[asr] detect-language -> {code} ({name}) from {ip}")
+            # EXACTLY the two keys the reference service returns; Bazarr reads language_code.
+            return JSONResponse({"detected_language": name or code, "language_code": code})
+
+        task = (qp.get("task") or "transcribe").strip().lower()
+        if task not in ("transcribe", "translate"):
+            task = "transcribe"
+        lang = (qp.get("language") or "").strip()
+        if lang.lower() in ("auto", "none", "null"):
+            lang = ""
+        text, meta = await engine.stt_transcribe(friendly, audio, language=lang,
+                                                 task=task, mode="segments")
+        segs = meta.get("segments")
+        if segs is None:
+            # An older worker ignored mode= and returned plain text. Emitting one giant cue, or
+            # cues with invented timings, would hand Bazarr a subtitle it CACHES and stops
+            # retrying for. A 503 is recoverable; a wrong subtitle file is not.
+            return JSONResponse({"error": "this Whisper worker is running pre-#bazarr-asr code "
+                                 "and returned no timestamps — update the fleet"}, status_code=503)
+        out = (qp.get("output") or "srt").strip().lower()
+        body = (_segments_to_vtt(segs) if out == "vtt"
+                else text if out in ("txt", "text")
+                else _segments_to_srt(segs))
+        print(f"[asr] {friendly}: {meta.get('audio_s')}s audio -> {len(segs)} cue(s) "
+              f"({task}, lang={lang or 'auto'}, out={out}) from {ip}")
+        if out == "json":
+            return JSONResponse({"text": text, "segments": segs})
+        return Response(content=body, media_type="text/plain; charset=utf-8")
+
+    @app.post("/asr")
+    async def bazarr_asr(req: Request):
+        """whisper-asr-webservice /asr — Bazarr's subtitle-generation call.
+
+        Query: task=transcribe|translate, language=<ISO-639-1|empty>, output=srt, encode=false.
+        Body: multipart field `audio_file`. Returns raw SRT as text/plain, NOT JSON.
+        No server-side timeout is imposed: a full episode legitimately takes minutes, and Bazarr
+        manages its own client timeout."""
+        try:
+            return await _asr_run(req, "asr")
+        except Exception as exc:
+            import traceback
+            print(f"[asr] error: {exc!r}\n{traceback.format_exc()[-1200:]}")
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+
+    @app.post("/detect-language")
+    async def bazarr_detect_language(req: Request):
+        """whisper-asr-webservice /detect-language -> {"detected_language","language_code"}.
+
+        Runs Whisper's language head on the first 30 s only, so it is near-instant next to /asr."""
+        try:
+            return await _asr_run(req, "detect")
+        except Exception as exc:
+            import traceback
+            print(f"[detect-language] error: {exc!r}\n{traceback.format_exc()[-1200:]}")
+            return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
 
     @app.post("/v1/audio/speech")
     async def v1_audio_speech(req: Request):

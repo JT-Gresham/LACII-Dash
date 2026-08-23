@@ -4,7 +4,48 @@ A capability-level summary of how the engine came together. (The original repo t
 per-commit granularity in `server.py` / `client.py` `VERSION` tags; this public history starts from a
 single squashed commit, so the detail below is grouped by milestone rather than by commit.)
 
-## 2026-08-21 (latest) — dashboard pages were served with NO cache headers at all (0.3.37 / 0.3.33)
+## 2026-08-21 (latest) — Bazarr-compatible Whisper ASR (`#bazarr-asr`) (0.3.38 / 0.3.34)
+
+### Added
+
+- **`POST /asr` and `POST /detect-language` at the server root** — the
+  `ahmetoner/whisper-asr-webservice` API that Bazarr's built-in Whisper provider speaks. Bazarr
+  uses it as the last-resort path to *generate* subtitles when none can be downloaded; it is given
+  a base URL and appends the paths itself, so they cannot live under `/v1`. Both are adapters over
+  the same Whisper leaf `/v1/audio/transcriptions` already uses.
+
+  This was **not** a pure routing job. The STT worker ran `model.generate` per 30 s window and
+  concatenated *text* — there were no timestamps anywhere, and SRT is nothing but timestamps. So:
+
+  - `WhisperPipeline.transcribe_segments()` keeps the existing 30 s windowing (deliberately — that
+    long-form behaviour is already proven) and shifts each window's timestamps by its absolute
+    offset. Timestamps are recovered via the tokenizer's `output_offsets` API, falling back to
+    parsing the literal `<|0.00|>` timestamp tokens, which are part of Whisper's vocabulary rather
+    than an API and so survive transformers version drift. Which path ran is **logged** — a silent
+    fallback to whole-window timings still produces valid SRT, so without that line there is no way
+    to tell real per-utterance cues from 30 s blocks.
+  - `WhisperPipeline.detect_language()` runs the language head on the first 30 s only, which is why
+    `/detect-language` is near-instant next to `/asr`.
+  - The worker request grew a `mode` field (`text` | `segments` | `detect`). Absent — i.e. every
+    pre-existing caller — means `text`, the original path, byte-identical.
+
+  **The `encode=false` gotcha.** Bazarr pre-decodes with ffmpeg and sends **headerless** s16le /
+  mono / 16 kHz PCM — no container to sniff. The controller prepends a 44-byte RIFF/WAVE header, so
+  the worker's decode path is completely unchanged rather than learning a second input shape.
+  `encode=true` is also supported (ffmpeg-decoded when ffmpeg is present) purely so the endpoint
+  can be exercised with an ordinary media file.
+
+  If the worker answers without segments — an out-of-date node during a rollout — `/asr` returns
+  **503 rather than a subtitle with invented timings**. Bazarr caches what it receives and stops
+  retrying, so a wrong subtitle file is permanent while a 503 is recoverable.
+
+  `scratch_bazarr_asr_test.py` decodes the generated WAV header back with the stdlib `wave` module
+  and compares sample-for-sample (a wrong sample rate would still transcribe — at the wrong speed —
+  so it must be caught structurally), and checks the SRT is monotonic, gap-free in numbering, and
+  free of zero-length cues. Both properties were verified by sabotage: a 44.1 kHz header and a
+  dropped monotonic clamp each fail the test.
+
+## 2026-08-21 — dashboard pages were served with NO cache headers at all (0.3.37 / 0.3.33)
 
 ### Fixed
 
