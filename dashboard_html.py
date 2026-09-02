@@ -37,6 +37,2522 @@ BANDWIDTH_HTML = """<!doctype html>
   .btn.pri{border-color:var(--accent);color:#cfe0ff}
   .btn.sm{padding:4px 9px;font-size:12px}
   .btn.ghost{background:transparent;border-color:var(--border);color:var(--muted)}
+  /* fleet bar */
+  .fleet{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:8px}
+  .tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 13px}
+  .tile .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+  .tile .v{font-size:22px;font-weight:600;margin-top:2px}
+  .tile .v small{font-size:12px;color:var(--dim);font-weight:400}
+  .bar{height:5px;background:#0a0e14;border:1px solid var(--border);border-radius:4px;margin-top:7px;overflow:hidden}
+  .bar > i{display:block;height:100%;background:var(--accent)}
+  .bar.warn > i{background:var(--warn)} .bar.hot > i{background:var(--hot)}
+  /* #pool-split: GPU/RAM pool bars show iM's own usage (green) vs other processes (blue) */
+  .poolbar{display:flex}
+  .poolbar > i{display:block;height:100%}
+  .poolbar > i.prog{background:var(--good)} .poolbar > i.oth{background:var(--accent)}
+  .poolbar.warn{border-color:var(--warn)} .poolbar.hot{border-color:var(--hot)}
+  /* section */
+  .sec{display:flex;align-items:baseline;gap:10px;margin:22px 0 9px}
+  .sec h2{font-size:16px;font-weight:600;margin:0}
+  .sec .hint{font-size:12px;color:var(--dim)}
+  input.f{background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:8px;
+          padding:5px 10px;font-size:13px;width:170px}
+  input.f::placeholder{color:var(--dim)}
+  /* legend */
+  .legend{display:flex;gap:15px;font-size:12px;color:var(--muted);margin-bottom:9px;flex-wrap:wrap}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:1px}
+  /* connections rows (#connections — same shape as the Config page's node rows) */
+  .nrow{display:flex;align-items:center;gap:14px;padding:9px 15px;border-bottom:1px solid var(--border);font-size:13px}
+  .nrow:last-child{border-bottom:none}
+  .nrow .nn{min-width:220px;font-weight:600}
+  .nrow .nn small{font-weight:400;color:var(--dim);font-size:11px}
+  .nrow .em{color:var(--dim)}
+  /* model list */
+  .list{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .row{display:flex;align-items:center;gap:12px;padding:11px 15px;border-bottom:1px solid var(--border)}
+  .row:last-child{border-bottom:none}
+  .row:hover{background:var(--surface2)}
+  .row .nm{min-width:240px;cursor:pointer}
+  .row .nm b{font-weight:600}
+  .chip{font-size:10.5px;color:var(--muted);border:1px solid var(--border2);border-radius:9px;padding:1px 7px;margin-left:6px}
+  .chip.al{color:var(--dim);border-style:dashed}
+  .chip.q4{color:var(--accent);border-color:var(--accent);cursor:pointer;white-space:nowrap}
+  .chip.q4:hover{background:var(--accent);color:#0a0e14}
+  .row .meta{flex:1;font-size:12.5px;color:var(--muted);min-width:0}
+  .row .meta .em{color:var(--text)}
+  /* #models-tps-graph: per-loaded-model tok/s traffic graph, its own line under the stats.
+     RIGHT-aligned: .meta is flex:1 so its LEFT edge starts wherever that model's name (.nm)
+     ends — a left-aligned fixed-width spark therefore staggers row to row. .meta's RIGHT edge
+     is common to every row (bounded by .acts), so aligning right lines the graphs up. */
+  /* #load-graph: downloaded-vs-total bar shown BESIDE a loading row. Deliberately NOT .mspark —
+     the poll wipes every #models .mspark from modelSparkCache, which would blank this. */
+  .ldspark{display:inline-block;vertical-align:middle;margin-left:10px;line-height:0}
+  .ldspark svg{vertical-align:middle}
+  .ldspark rect{transition:width .3s linear}
+  .row .meta .mspark{margin-top:7px;line-height:0;text-align:right}
+  .row .meta .mspark svg{max-width:100%;height:auto;vertical-align:middle}
+  .row .acts{display:flex;align-items:center;gap:7px}
+  .miniprog{height:4px;background:#0a0e14;border-radius:3px;margin-top:5px;max-width:280px;overflow:hidden}
+  .miniprog > i{display:block;height:100%;background:var(--warn)}
+  /* #load-phase: pre-dispatch has no percentage to show (totals come from the plan). A sliding
+     indeterminate bar says "working" without faking progress at a stuck 0%. */
+  .miniprog.indet > i{width:35%;animation:indet 1.1s ease-in-out infinite}
+  @keyframes indet{0%{margin-left:-35%}100%{margin-left:100%}}
+  @media (prefers-reduced-motion: reduce){.miniprog.indet > i{animation:none;width:100%;opacity:.45}}
+  .grp{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;padding:8px 15px 4px;background:var(--bg)}
+  /* nodes */
+  .node{display:grid;grid-template-columns:210px 1fr 1fr 96px;align-items:center;gap:14px;padding:8px 15px;border-bottom:1px solid var(--border);font-size:13px}
+  .node:last-child{border-bottom:none}
+  .node .nn{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .node .nn small{font-weight:400;color:var(--dim);font-size:11px}
+  .node .nn .nrst{cursor:pointer;color:var(--dim);font-weight:400;padding:0 2px;border-radius:4px}
+  .node .nn .nrst:hover{color:var(--hot);background:var(--border)}
+  .node .mb{display:flex;align-items:center;gap:8px;min-width:0}
+  .node .mb .lab{font-size:11px;color:var(--muted);width:34px;flex:none}
+  .node .mb .bar{flex:1}
+  .node .mb .num{font-size:11px;color:var(--muted);white-space:nowrap;flex:none;width:82px;text-align:right}
+  .node .util{font-size:11px;color:var(--dim);text-align:right}
+  .node .ver{font-size:10px;color:var(--dim);font-family:var(--mono);margin-top:2px}
+  .node .ver.stale{color:var(--warn)}
+  /* overlay/modal */
+  .ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-start;justify-content:center;z-index:50}
+  .ov.show{display:flex}
+  /* #modal-scroll: while a popup is open the PAGE must not scroll — lock body (also covers
+     touch/keyboard), and contain wheel chaining when the modal's own scroll hits an end. */
+  body:has(.ov.show){overflow:hidden}
+  .modal{background:var(--surface);border:1px solid var(--border2);border-radius:12px;max-width:640px;width:92%;
+         margin:60px 0;padding:20px 22px;max-height:80vh;overflow:auto;overscroll-behavior:contain}
+  .modal h3{margin:0 0 4px;font-size:17px}
+  .modal .x{float:right;cursor:pointer;color:var(--muted);font-size:20px;line-height:1}
+  .modal label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px}
+  .modal input,.modal select{width:100%;background:var(--bg);border:1px solid var(--border2);color:var(--text);
+         border-radius:8px;padding:7px 10px;font-size:13px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .note{font-size:12px;color:var(--warn);margin-top:8px}
+  table.kv{width:100%;font-size:12.5px;border-collapse:collapse;margin-top:6px}
+  table.kv td{padding:3px 0;color:var(--muted)} table.kv td.v{color:var(--text);text-align:right}
+  .empty{padding:26px;text-align:center;color:var(--dim);font-size:13px}
+  .err{color:var(--bad);font-size:12px}
+  body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Consolas,monospace;margin:18px}
+  h1{font-size:18px;margin:0 0 4px} a{color:#58a6ff;text-decoration:none} a:hover{text-decoration:underline}
+  .sub{color:#8b949e;font-size:12px}
+  table{border-collapse:collapse;margin:14px 0;width:100%}
+  th,td{padding:5px 10px;border-bottom:1px solid #21262d;text-align:right;white-space:nowrap}
+  th:first-child,td:first-child{text-align:left}
+  th{color:#8b949e;font-weight:600;border-bottom:1px solid #30363d}
+  .dn{color:#58a6ff}.up{color:#3fb950}.nn{color:#d29922}
+  .tot{color:#8b949e;font-size:11px}
+  .card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px 16px;margin:10px 0}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+  .ok{background:#3fb950}.off{background:#f85149}
+  code{background:#21262d;padding:1px 5px;border-radius:4px}
+  .sparkbox{display:inline-block;width:110px;height:30px;vertical-align:middle;line-height:0}
+  .sparkbox svg{display:block}
+</style></head><body>
+<div class="sub">controller node is metered on the controller's own sockets (authoritative). node↔node
+hidden-state traffic — invisible to the controller during decode — is reported by each worker.
+Rates are derived from 2&nbsp;s deltas; totals are cumulative since each process started.</div>
+
+<div class="card">
+  <b>Per node</b>
+  <table id="nodes"><thead><tr>
+    <th>Node</th>
+    <th>ctrl→node ⟱</th><th>node→ctrl ⟰</th>
+    <th>node↔node in</th><th>node↔node out</th>
+    <th>total ↓</th><th>total ↑</th><th>graph ↓/↑</th>
+  </tr></thead><tbody><tr><td colspan="8" class="sub">connecting…</td></tr></tbody></table>
+</div>
+
+<div class="card">
+  <b>Node ↔ node hops</b> <span class="sub">(directed; each worker reports what it SENT to each peer)</span>
+  <table id="edges"><thead><tr><th>From</th><th>→ To</th><th>rate</th><th>total</th></tr></thead>
+  <tbody><tr><td colspan="4" class="sub">no node-to-node traffic yet (only flows during a multi-node generation)</td></tr></tbody></table>
+</div>
+
+<div class="card">
+  <b>Totals</b> <span class="sub">(grouped — controller↔all nodes, and all node↔node)</span>
+  <table id="totals"><thead><tr><th>Link</th><th>rate</th><th>packets/s</th><th>total</th></tr></thead><tbody>
+    <tr><td>controller → nodes</td><td class="dn" id="t-cn-r">—</td><td class="dn" id="t-cn-p">—</td><td class="tot" id="t-cn-b">—</td></tr>
+    <tr><td>nodes → controller</td><td class="up" id="t-nc-r">—</td><td class="up" id="t-nc-p">—</td><td class="tot" id="t-nc-b">—</td></tr>
+    <tr><td>node ↔ node (all hops)</td><td class="nn" id="t-nn-r">—</td><td class="nn" id="t-nn-p">—</td><td class="tot" id="t-nn-b">—</td></tr>
+  </tbody></table>
+</div>
+
+<script>
+let prev=null, prevT=0, sparkCache={}, lastSparkT=0;
+function hb(n){ n=n||0; if(n<1024)return n.toFixed(0)+' B/s'; n/=1024; if(n<1024)return n.toFixed(1)+' KB/s'; n/=1024; if(n<1024)return n.toFixed(1)+' MB/s'; return (n/1024).toFixed(2)+' GB/s'; }
+function hbytes(n){ n=n||0; if(n<1024)return n.toFixed(0)+' B'; n/=1024; if(n<1024)return n.toFixed(1)+' KB'; n/=1024; if(n<1024)return n.toFixed(1)+' MB'; return (n/1024).toFixed(2)+' GB'; }
+function pps(n){ n=n||0; if(n<1000)return n.toFixed(n<10?1:0)+' p/s'; return (n/1000).toFixed(1)+'k p/s'; }
+function rate(cur,key,id,dt){ if(!prev||!prev[id])return 0; const p=prev[id][key]; return dt>0?Math.max(0,(cur-p)/dt):0; }
+async function tick(){
+  let d; try{ d=await (await fetch('/bandwidthdata',{cache:'no-store'})).json(); }
+  catch(e){ document.getElementById('ctl').textContent='controller unreachable'; return; }
+  document.getElementById('ctl').textContent=d.controller;
+  const now=Date.now()/1000, dt=prevT?now-prevT:0;
+  const cur={};
+  const nrows=(d.nodes||[]).map(n=>{
+    const id='n:'+n.node_id;
+    cur[id]={cti:n.ctrl_to_node,ntc:n.node_to_ctrl,nni:n.nn_in,nno:n.nn_out,
+             ctip:n.ctrl_to_node_pkts,ntcp:n.node_to_ctrl_pkts,nnip:n.nn_in_pkts,nnop:n.nn_out_pkts};
+    const cti=rate(n.ctrl_to_node,'cti',id,dt), ntc=rate(n.node_to_ctrl,'ntc',id,dt);
+    const nni=rate(n.nn_in,'nni',id,dt), nno=rate(n.nn_out,'nno',id,dt);
+    const ctip=rate(n.ctrl_to_node_pkts,'ctip',id,dt), ntcp=rate(n.node_to_ctrl_pkts,'ntcp',id,dt);
+    const nnip=rate(n.nn_in_pkts,'nnip',id,dt), nnop=rate(n.nn_out_pkts,'nnop',id,dt);
+    return `<tr><td><span class="dot ${n.alive?'ok':'off'}"></span>${n.hostname}</td>`
+      +`<td class="dn">${hb(cti)} <span class="sub">${pps(ctip)}</span><br><span class="tot">${hbytes(n.ctrl_to_node)}</span></td>`
+      +`<td class="up">${hb(ntc)} <span class="sub">${pps(ntcp)}</span><br><span class="tot">${hbytes(n.node_to_ctrl)}</span></td>`
+      +`<td class="nn">${hb(nni)} <span class="sub">${pps(nnip)}</span><br><span class="tot">${hbytes(n.nn_in)}</span></td>`
+      +`<td class="nn">${hb(nno)} <span class="sub">${pps(nnop)}</span><br><span class="tot">${hbytes(n.nn_out)}</span></td>`
+      +`<td class="dn">${hb(cti+nni)}</td><td class="up">${hb(ntc+nno)}</td>`
+      +`<td><span class="sparkbox" data-host="${n.hostname}" title="recent ↓/↑ — click to expand"></span></td></tr>`;
+  }).join('');
+  document.querySelector('#nodes tbody').innerHTML=nrows||'<tr><td colspan="8" class="sub">no nodes</td></tr>';
+  // Flash-free sparklines: this table is rebuilt every tick (2s), which recreates the sparkbox spans
+  // EMPTY. Refill them INSTANTLY from cache (no empty-frame flash), and re-fetch the server-rendered
+  // SVGs only every ~10s (a sparkline needs no 2s cadence) — so they stop flickering on every poll.
+  document.querySelectorAll('#nodes span.sparkbox').forEach(box=>{ const s=sparkCache[box.dataset.host]; if(s) box.innerHTML=s; });
+  if(now-lastSparkT>10){
+    lastSparkT=now;
+    fetch('/status?graphs=1',{cache:'no-store'}).then(r=>r.json()).then(sd=>{
+      (sd.nodes||[]).forEach(n=>{ if(n.spark_bw) sparkCache[n.hostname]=n.spark_bw; });
+      document.querySelectorAll('#nodes span.sparkbox').forEach(box=>{ const s=sparkCache[box.dataset.host]; if(s) box.innerHTML=s; });
+    }).catch(()=>{});
+  }
+  const erows=(d.edges||[]).map((e,i)=>{
+    const id='e:'+e.src+'>'+e.dst;
+    cur[id]={b:e.bytes,p:e.pkts};
+    const r=rate(e.bytes,'b',id,dt), rp=rate(e.pkts,'p',id,dt);
+    return `<tr><td>${e.src}</td><td>→ ${e.dst}</td><td class="nn">${hb(r)} <span class="sub">${pps(rp)}</span></td><td class="tot">${hbytes(e.bytes)}</td></tr>`;
+  }).join('');
+  document.querySelector('#edges tbody').innerHTML=erows||'<tr><td colspan="4" class="sub">no node-to-node traffic yet (only flows during a multi-node generation)</td></tr>';
+  // grouped totals: controller<->all nodes + all node<->node (rate from the aggregate delta)
+  const cnT=(d.nodes||[]).reduce((a,n)=>a+n.ctrl_to_node,0);
+  const ncT=(d.nodes||[]).reduce((a,n)=>a+n.node_to_ctrl,0);
+  const nnT=(d.edges||[]).reduce((a,e)=>a+e.bytes,0);
+  const cnP=(d.nodes||[]).reduce((a,n)=>a+(n.ctrl_to_node_pkts||0),0);
+  const ncP=(d.nodes||[]).reduce((a,n)=>a+(n.node_to_ctrl_pkts||0),0);
+  const nnP=(d.edges||[]).reduce((a,e)=>a+(e.pkts||0),0);
+  cur['totals']={cn:cnT,nc:ncT,nn:nnT,cnp:cnP,ncp:ncP,nnp:nnP};
+  document.getElementById('t-cn-r').textContent=hb(rate(cnT,'cn','totals',dt));
+  document.getElementById('t-cn-p').textContent=pps(rate(cnP,'cnp','totals',dt));
+  document.getElementById('t-cn-b').textContent=hbytes(cnT);
+  document.getElementById('t-nc-r').textContent=hb(rate(ncT,'nc','totals',dt));
+  document.getElementById('t-nc-p').textContent=pps(rate(ncP,'ncp','totals',dt));
+  document.getElementById('t-nc-b').textContent=hbytes(ncT);
+  document.getElementById('t-nn-r').textContent=hb(rate(nnT,'nn','totals',dt));
+  document.getElementById('t-nn-p').textContent=pps(rate(nnP,'nnp','totals',dt));
+  document.getElementById('t-nn-b').textContent=hbytes(nnT);
+  prev=cur; prevT=now;
+}
+tick(); setInterval(tick,2000);
+</script>
+</body></html>"""
+
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LACII</title>
+<style>
+  :root{
+    --bg:#0d1117; --surface:#161b22; --surface2:#1c2230; --border:#2a3038; --border2:#3a424d;
+    --text:#e6edf3; --muted:#9aa7b4; --dim:#6e7b89;
+    --accent:#4f8cff; --good:#2ea043; --warn:#d29922; --hot:#e0833a; --bad:#da3633;
+    --radius:10px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 60px;}
+  /* header */
+  header{display:flex;align-items:center;gap:14px;margin-bottom:16px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600;letter-spacing:.2px}
+  .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px}
+  nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)}
+  nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;
+       padding:6px 12px;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .btn:hover{border-color:var(--accent)} .btn:active{transform:scale(.98)}
+  .btn.pri{border-color:var(--accent);color:#cfe0ff}
+  .btn.sm{padding:4px 9px;font-size:12px}
+  .btn.ghost{background:transparent;border-color:var(--border);color:var(--muted)}
+  /* fleet bar */
+  .fleet{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:8px}
+  .tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:10px 13px}
+  .tile .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+  .tile .v{font-size:22px;font-weight:600;margin-top:2px}
+  .tile .v small{font-size:12px;color:var(--dim);font-weight:400}
+  .bar{height:5px;background:#0a0e14;border:1px solid var(--border);border-radius:4px;margin-top:7px;overflow:hidden}
+  .bar > i{display:block;height:100%;background:var(--accent)}
+  .bar.warn > i{background:var(--warn)} .bar.hot > i{background:var(--hot)}
+  /* #pool-split: GPU/RAM pool bars show iM's own usage (green) vs other processes (blue) */
+  .poolbar{display:flex}
+  .poolbar > i{display:block;height:100%}
+  .poolbar > i.prog{background:var(--good)} .poolbar > i.oth{background:var(--accent)}
+  .poolbar.warn{border-color:var(--warn)} .poolbar.hot{border-color:var(--hot)}
+  /* section */
+  .sec{display:flex;align-items:baseline;gap:10px;margin:22px 0 9px}
+  .sec h2{font-size:16px;font-weight:600;margin:0}
+  .sec .hint{font-size:12px;color:var(--dim)}
+  input.f{background:var(--surface);border:1px solid var(--border);color:var(--text);border-radius:8px;
+          padding:5px 10px;font-size:13px;width:170px}
+  input.f::placeholder{color:var(--dim)}
+  /* legend */
+  .legend{display:flex;gap:15px;font-size:12px;color:var(--muted);margin-bottom:9px;flex-wrap:wrap}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:1px}
+  /* connections rows (#connections — same shape as the Config page's node rows) */
+  .nrow{display:flex;align-items:center;gap:14px;padding:9px 15px;border-bottom:1px solid var(--border);font-size:13px}
+  .nrow:last-child{border-bottom:none}
+  .nrow .nn{min-width:220px;font-weight:600}
+  .nrow .nn small{font-weight:400;color:var(--dim);font-size:11px}
+  .nrow .em{color:var(--dim)}
+  /* model list */
+  .list{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .row{display:flex;align-items:center;gap:12px;padding:11px 15px;border-bottom:1px solid var(--border)}
+  .row:last-child{border-bottom:none}
+  .row:hover{background:var(--surface2)}
+  .row .nm{min-width:240px;cursor:pointer}
+  .row .nm b{font-weight:600}
+  .chip{font-size:10.5px;color:var(--muted);border:1px solid var(--border2);border-radius:9px;padding:1px 7px;margin-left:6px}
+  .chip.al{color:var(--dim);border-style:dashed}
+  .chip.q4{color:var(--accent);border-color:var(--accent);cursor:pointer;white-space:nowrap}
+  .chip.q4:hover{background:var(--accent);color:#0a0e14}
+  .row .meta{flex:1;font-size:12.5px;color:var(--muted);min-width:0}
+  .row .meta .em{color:var(--text)}
+  /* #models-tps-graph: per-loaded-model tok/s traffic graph, its own line under the stats.
+     RIGHT-aligned: .meta is flex:1 so its LEFT edge starts wherever that model's name (.nm)
+     ends — a left-aligned fixed-width spark therefore staggers row to row. .meta's RIGHT edge
+     is common to every row (bounded by .acts), so aligning right lines the graphs up. */
+  /* #load-graph: downloaded-vs-total bar shown BESIDE a loading row. Deliberately NOT .mspark —
+     the poll wipes every #models .mspark from modelSparkCache, which would blank this. */
+  .ldspark{display:inline-block;vertical-align:middle;margin-left:10px;line-height:0}
+  .ldspark svg{vertical-align:middle}
+  .ldspark rect{transition:width .3s linear}
+  .row .meta .mspark{margin-top:7px;line-height:0;text-align:right}
+  .row .meta .mspark svg{max-width:100%;height:auto;vertical-align:middle}
+  .row .acts{display:flex;align-items:center;gap:7px}
+  .miniprog{height:4px;background:#0a0e14;border-radius:3px;margin-top:5px;max-width:280px;overflow:hidden}
+  .miniprog > i{display:block;height:100%;background:var(--warn)}
+  /* #load-phase: pre-dispatch has no percentage to show (totals come from the plan). A sliding
+     indeterminate bar says "working" without faking progress at a stuck 0%. */
+  .miniprog.indet > i{width:35%;animation:indet 1.1s ease-in-out infinite}
+  @keyframes indet{0%{margin-left:-35%}100%{margin-left:100%}}
+  @media (prefers-reduced-motion: reduce){.miniprog.indet > i{animation:none;width:100%;opacity:.45}}
+  .grp{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;padding:8px 15px 4px;background:var(--bg)}
+  /* nodes */
+  .node{display:grid;grid-template-columns:210px 1fr 1fr 96px;align-items:center;gap:14px;padding:8px 15px;border-bottom:1px solid var(--border);font-size:13px}
+  .node:last-child{border-bottom:none}
+  .node .nn{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .node .nn small{font-weight:400;color:var(--dim);font-size:11px}
+  .node .nn .nrst{cursor:pointer;color:var(--dim);font-weight:400;padding:0 2px;border-radius:4px}
+  .node .nn .nrst:hover{color:var(--hot);background:var(--border)}
+  .node .mb{display:flex;align-items:center;gap:8px;min-width:0}
+  .node .mb .lab{font-size:11px;color:var(--muted);width:34px;flex:none}
+  .node .mb .bar{flex:1}
+  .node .mb .num{font-size:11px;color:var(--muted);white-space:nowrap;flex:none;width:82px;text-align:right}
+  .node .util{font-size:11px;color:var(--dim);text-align:right}
+  .node .ver{font-size:10px;color:var(--dim);font-family:var(--mono);margin-top:2px}
+  .node .ver.stale{color:var(--warn)}
+  /* overlay/modal */
+  .ov{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:flex-start;justify-content:center;z-index:50}
+  .ov.show{display:flex}
+  /* #modal-scroll: while a popup is open the PAGE must not scroll — lock body (also covers
+     touch/keyboard), and contain wheel chaining when the modal's own scroll hits an end. */
+  body:has(.ov.show){overflow:hidden}
+  .modal{background:var(--surface);border:1px solid var(--border2);border-radius:12px;max-width:640px;width:92%;
+         margin:60px 0;padding:20px 22px;max-height:80vh;overflow:auto;overscroll-behavior:contain}
+  .modal h3{margin:0 0 4px;font-size:17px}
+  .modal .x{float:right;cursor:pointer;color:var(--muted);font-size:20px;line-height:1}
+  .modal label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px}
+  .modal input,.modal select{width:100%;background:var(--bg);border:1px solid var(--border2);color:var(--text);
+         border-radius:8px;padding:7px 10px;font-size:13px}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .note{font-size:12px;color:var(--warn);margin-top:8px}
+  table.kv{width:100%;font-size:12.5px;border-collapse:collapse;margin-top:6px}
+  table.kv td{padding:3px 0;color:var(--muted)} table.kv td.v{color:var(--text);text-align:right}
+  .empty{padding:26px;text-align:center;color:var(--dim);font-size:13px}
+  .err{color:var(--bad);font-size:12px}
+</style></head>
+<body><div class="wrap">
+
+<header>
+  <span class="brand">∞ LACII ∞ </span>
+  <span class="ctl" id="ctl">connecting…</span>
+  <nav>
+    <a class="on" href="/">Models</a>
+    <a href="/chat">Chat</a>
+    <a href="/config">Config</a>
+    <a href="/logs-page">Logs</a>
+    <a href="/bandwidth">Bandwidth</a>
+    <a href="/controllers">Controllers</a>
+  </nav>
+  <span class="grow"></span>
+  <button class="btn pri" onclick="openAdd()">+ Add model</button>
+</header>
+
+<!-- FLEET BAR -->
+<div class="fleet" id="fleet"></div>
+
+<!-- MODELS -->
+<div class="sec">
+  <h2>Models</h2><span class="hint" id="mcount"></span>
+  <span class="grow"></span>
+  <select class="f" id="msort" onchange="msortChange()" title="Sort models within each state group" style="width:auto">
+    <option value="name">Sort: name</option>
+    <option value="size">Sort: size ↓</option>
+  </select>
+  <input class="f" id="filter" placeholder="filter models…" oninput="render()">
+</div>
+<div class="legend">
+  <span><span class="dot" style="background:var(--good)"></span>Loaded</span>
+  <span><span class="dot" style="background:var(--warn)"></span>Loading / Compiling</span>
+  <span><span class="dot" style="background:var(--dim)"></span>Registered (on disk)</span>
+  <span><span class="dot" style="background:var(--accent)"></span>Downloading</span>
+  <span><span class="dot" style="background:var(--bad)"></span>Won't fit / not downloaded</span>
+</div>
+<div class="list" id="models"><div class="empty">loading…</div></div>
+
+<!-- NODES -->
+<div class="sec"><h2>Nodes</h2><span class="hint" id="ncount"></span></div>
+<div class="list" id="nodes"></div>
+
+<!-- CONNECTIONS (#connections) -->
+<div class="sec"><h2>Connections</h2><span class="hint" id="ccount"></span></div>
+<div class="list" id="conns"><div class="empty">no clients yet</div></div>
+
+</div>
+
+<div class="ov" id="ov" onclick="if(event.target===this)closeOv()"><div class="modal" id="modal"></div></div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
+const gb=v=>(v==null?'—':(Math.round(v*10)/10)+' GB');
+const pc=(a,b)=>b>0?Math.min(100,Math.round(100*a/b)):0;
+let LAST=null;
+let DETAIL_OPEN=null;   // #model-detail: model name whose detail modal is open (live-refreshed each poll)
+// #models-tps-graph: server-rendered per-model tok/s sparklines, cached so the 2s model
+// re-render never blanks them, refreshed from /status?graphs=1 only every ~10s (flicker-free,
+// mirrors the node bandwidth sparklines on the Bandwidth page).
+let modelSparkCache={}, lastMSparkT=0;
+
+async function api(path,opts){
+  try{const r=await fetch(path,opts);const t=await r.text();let j;try{j=JSON.parse(t)}catch(e){j={ok:r.ok,raw:t}}
+      if(!r.ok&&j&&j.error)throw new Error(j.error); if(!r.ok)throw new Error('HTTP '+r.status); return j;}
+  catch(e){ throw e; }
+}
+function toast(msg,bad){ const c=$('#ctl'); const o=c.textContent; c.innerHTML=(bad?'<span class="err">':'<span style="color:var(--good)">')+esc(msg)+'</span>';
+  window._toastUntil=Date.now()+(bad?6000:3500); setTimeout(()=>{c.textContent=o;},bad?6000:3500); }   // errors linger longer + survive status polls
+
+async function tick(){
+  let d; try{ d=await (await fetch('/status')).json(); }catch(e){ $('#ctl').innerHTML='<span class="err">controller unreachable</span>'; return; }
+  LAST=d; render();
+}
+function render(){
+  const d=LAST; if(!d)return;
+  const c=d.controller||{}, p=d.pool||{}, comp=d.compute||{}, cl=d.cluster||{};
+  if(!(window._toastUntil>Date.now())) $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');  // don't clobber an active toast
+  // fleet tiles
+  const loaded=(d.models||[]).filter(m=>m.loaded).length, reg=(d.models||[]).length;
+  // #unified-fleet: the tiles describe THE FLEET, not just the slice this controller drives.
+  // d.pool/d.compute are deliberately own-hardware-only, so on a controller that owns nothing they
+  // are all zeros — the tiles read "0 nodes / 0 GB / 0 tok/s" above a page listing the whole fleet.
+  // d.fleet is ours + every healthy peer's; fall back to the local blocks on an older controller.
+  const F=d.fleet||null, vp=(F&&F.via_peers)||{};
+  const pool=F?F:p, cmp2=F?F:comp;
+  // pool bars: PHYSICAL used (total - free) against PHYSICAL total, one base (#pool-base).
+  const vT=pool.vram_total_gb||0, rT=pool.ram_total_gb||0;
+  const vU=Math.max(0,vT-(pool.vram_free_gb||0)), rU=Math.max(0,rT-(pool.ram_free_gb||0));
+  // #pool-split: GREEN = what LACII itself uses (sum of loaded models' MEASURED VRAM/RAM),
+  // BLUE = the rest of the physical usage = OTHER processes on the nodes. So any blue beyond the
+  // green tells you something else is holding pool memory. Clamp iM's share to physical-used.
+  const _lm=(d.models||[]).filter(m=>m.loaded);
+  const vProg=Math.min(vU,_lm.reduce((s,m)=>s+(m.vram_used_gb||0),0));
+  const rProg=Math.min(rU,_lm.reduce((s,m)=>s+(m.ram_used_gb||0),0));
+  const _viaN=vp.nodes||0;
+  const _busyPct=(cmp2.units_total>0)?(100*(cmp2.units_busy||0)/cmp2.units_total):(comp.overall_pct||0);
+  $('#fleet').innerHTML=[
+    tile('Nodes', (pool.nodes||0)+' <small>· '+(cmp2.gpus||0)+' GPU'
+         +(_viaN?(' · '+_viaN+' via '+((vp.controllers||[]).join(', ')||'peers')):'')+'</small>'),
+    tile('Loaded', loaded+' <small>/ '+reg+' registered</small>'),
+    tile('GPU pool', fmt(vU)+'<small> / '+fmt(vT)+' GB</small>', poolbar(vProg,vU-vProg,vT,'LACII '+fmt(vProg)+' GB (green) · other processes '+fmt(vU-vProg)+' GB (blue) · '+fmt(vT-vU)+' GB free')),
+    tile('RAM pool', fmt(rU)+'<small> / '+fmt(rT)+' GB</small>', poolbar(rProg,rU-rProg,rT,'LACII '+fmt(rProg)+' GB (green) · other processes '+fmt(rU-rProg)+' GB (blue) · '+fmt(rT-rU)+' GB free')),
+    tile('Throughput', (F?(F.tokens_per_s||0):((d.metrics||{}).tokens_per_s||0)).toFixed(1)
+         +' <small>tok/s · '+Math.round(_busyPct)+'% busy</small>'),
+  ].join('');
+  renderModels(d,cl);
+  renderNodes(d);
+  renderConns(d);          // #connections: per-client accounting panel (bottom of the page)
+  refreshDetailIfOpen();   // #model-detail: live-update the open detail modal's operational section
+}
+function fmtB(b){ if(b==null)return '—'; if(b<1024)return b+' B'; if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  if(b<1073741824)return (b/1048576).toFixed(1)+' MB'; return (b/1073741824).toFixed(2)+' GB'; }
+// #connections: one row per client IP — connected-for, idle-for, real bytes both ways (ASGI
+// counter, so an active stream's bytes grow live), token totals, what it is using/loading
+// RIGHT NOW (INFLIGHT join + loading-card requested_by), and a Terminate button that kills
+// every in-flight request from that client (POST /terminate).
+function renderConns(d){
+  const cs=(d.clients||[]);
+  $('#ccount').textContent=cs.length+' client'+(cs.length==1?'':'s');
+  if(!cs.length){ $('#conns').innerHTML='<div class="empty">no connections yet</div>'; return; }
+  // both name forms: loading cards carry the Ollama display name (colons) AND the friendly
+  // key (dashes) — active[].model is the FRIENDLY key, so match against both (review-caught)
+  const lnames=((d.cluster||{}).loadings||[]).flatMap(l=>[l.model,l.display_model]).filter(Boolean);
+  $('#conns').innerHTML=cs.map(c=>{
+    const acts=(c.active||[]).map(a=>{
+      const lbl=a.state==='running'?(lnames.includes(a.model)?'loading':'generating'):'queued';
+      const col=a.state==='running'?'var(--good)':'var(--warn)';
+      return '<span class="chip" style="color:'+col+'">'+esc(a.model)+' · '+lbl+' '+dur(a.s)+'</span>';
+    });
+    (c.loading||[]).forEach(m=>acts.push('<span class="chip" style="color:var(--warn)">'+esc(m)+' · loading</span>'));
+    const act=acts.length?acts.join(' '):(c.last_model?('<span class="em">last: '+esc(c.last_model)+'</span>'):'<span class="em">—</span>');
+    const kind=c.api?'':' <span class="chip">dashboard</span>';
+    const idle=(c.active||[]).length?'<span style="color:var(--good)">active</span>':('idle '+dur(c.idle_s));
+    const term=(c.active||[]).length
+      ?' <button class="btn sm ghost" onclick="termClient(\''+esc(c.ip)+'\')">Terminate</button>':'';
+    return '<div class="nrow"><div class="nn">'+esc(c.ip)+kind
+      +' <small>· connected '+dur(c.connected_s)+' · '+idle+'</small></div>'
+      +'<div style="font-size:12px;color:var(--muted)">'
+      +fmtB(c.bytes_in)+' in / '+fmtB(c.bytes_out)+' out · '
+      +(c.tok_in||0).toLocaleString()+' / '+(c.tok_out||0).toLocaleString()+' tok · '
+      +(c.reqs||0)+' req</div>'
+      +'<div style="flex:1;text-align:right">'+act+term+'</div></div>';
+  }).join('');
+}
+async function termClient(ip){
+  if(!confirm('Terminate every in-flight request from '+ip+'?'))return;
+  try{ const r=await api('/terminate?ip='+encodeURIComponent(ip),{method:'POST'});
+       toast('terminated '+ip+' · '+r.cancelled+' request(s) cancelled'); tick(); }
+  catch(e){ toast(String(e.message||e),1); }
+}
+function fmt(v){return v==null?'—':(Math.round(v*10)/10)}
+function tile(k,v,extra){return '<div class="tile"><div class="k">'+k+'</div><div class="v">'+v+'</div>'+(extra||'')+'</div>';}
+function bar(a,b){const r=pc(a,b);const cls=r>=90?'hot':(r>=70?'warn':'');return '<div class="bar '+cls+'"><i style="width:'+r+'%"></i></div>';}
+// #pool-split: two-segment bar — prog (green, iM's own usage) then other (blue, everything else),
+// both against total. Fullness (green+blue) tints the BORDER warn/hot so the segment colors stay
+// meaningful. tip = hover breakdown.
+function poolbar(prog,other,total,tip){const pp=pc(prog,total),po=pc(Math.max(0,other),total);const cls=(pp+po)>=90?'hot':((pp+po)>=70?'warn':'');return '<div class="bar poolbar '+cls+'" title="'+tip+'"><i class="prog" style="width:'+pp+'%"></i><i class="oth" style="width:'+po+'%"></i></div>';}
+
+// ---- model state derivation: the one source of truth ----
+function mstate(m,cl){
+  const id=m.internal_name||m.name;
+  const loadings=(cl.loadings||[]), compiling=(cl.compiling||[]);
+  const ld=loadings.find(x=>x.model===id||x.display_model===m.name);
+  if(ld) return {k:'loading',c:'var(--warn)',rank:1,ld};
+  const cp=compiling.find(x=>x.model===id||x.display_model===m.name);
+  if(cp) return {k:'compiling',c:'var(--warn)',rank:1,ld:cp};
+  const st=m.status||'';
+  if(st==='downloading'||st==='pausing'||st==='stopping') return {k:'downloading',c:'var(--accent)',rank:2};
+  if(st==='paused'||st==='stopped') return {k:'dlhalt',c:'var(--warn)',rank:2};
+  if(m.loaded) return {k:'loaded',c:'var(--good)',rank:0};
+  if(m.ready) return {k:'registered',c:'var(--dim)',rank:3};
+  return {k:'notdl',c:'var(--bad)',rank:4};
+}
+function msortChange(){ try{localStorage.setItem('msort',$('#msort').value);}catch(e){} render(); }
+function renderModels(d,cl){
+  const f=($('#filter').value||'').toLowerCase().trim();
+  // #model-sort: keep the state grouping (Loaded / Registered / …) as the PRIMARY key; the toggle
+  // only re-orders WITHIN each group — by name (A→Z) or by weight size (size_gb, largest first).
+  const sortSel=$('#msort');
+  if(sortSel && !renderModels._si){ renderModels._si=1; try{const sv=localStorage.getItem('msort'); if(sv)sortSel.value=sv;}catch(e){} }
+  const sortK=(sortSel&&sortSel.value)||'name';
+  const _sz=x=>(x.m.size_gb!=null?+x.m.size_gb:-1);   // models without a size sort to the bottom
+  let ms=(d.models||[]).map(m=>({m,s:mstate(m,cl)}));
+  if(f) ms=ms.filter(x=>(x.m.name+' '+(x.m.target||'')+' '+(x.m.aliases||[]).join(' ')).toLowerCase().includes(f));
+  ms.sort((a,b)=>a.s.rank-b.s.rank
+    || (sortK==='size' ? ((_sz(b)-_sz(a)) || a.m.name.localeCompare(b.m.name))
+                       : a.m.name.localeCompare(b.m.name)));
+  $('#mcount').textContent=ms.length+' model'+(ms.length==1?'':'s');
+  if(!ms.length){ $('#models').innerHTML='<div class="empty">no models'+(f?' match "'+esc(f)+'"':'')+'</div>'; return; }
+  let html='', grp='';
+  const GN={loaded:'Loaded',loading:'Loading',compiling:'Compiling',downloading:'Downloading',dlhalt:'Download paused',registered:'Registered · on disk',notdl:'Not downloaded'};
+  for(const {m,s} of ms){
+    if(s.k!==grp){ grp=s.k; html+='<div class="grp">'+GN[grp]+'</div>'; }
+    html+=modelRow(m,s);
+  }
+  $('#models').innerHTML=html;
+  paintModelSparks(); refreshModelSparks();
+}
+// #models-tps-graph: refill the per-model tok/s graphs from cache after every model re-render
+// (the 2s poll rebuilds #models, blanking them), and refresh the cached SVGs from the server
+// at most every ~10s — a graph needs no 2s cadence, and this keeps them flicker-free.
+function paintModelSparks(){
+  document.querySelectorAll('#models .mspark').forEach(box=>{ const s=modelSparkCache[box.dataset.model]; box.innerHTML=s||''; });
+}
+function refreshModelSparks(){
+  const now=Date.now()/1000; if(now-lastMSparkT<10)return; lastMSparkT=now;
+  fetch('/status?graphs=1',{cache:'no-store'}).then(r=>r.json()).then(sd=>{
+    (sd.models||[]).forEach(m=>{ const g=m.spark_tps||m.spark_usage; if(g) modelSparkCache[m.name]=g; });
+    paintModelSparks();
+  }).catch(()=>{});
+}
+function modelRow(m,s){
+  const t2i=(m.capabilities||[]).includes('t2i');
+  // #cap-badges: every MODALITY capability gets a chip beside the model (config-inferred,
+  // see status._model_caps). 'tools' stays out of the row (most chat models have it — noise);
+  // it still shows in the detail modal's capabilities line.
+  const CAPB={t2i:['🖼 t2i','Text-to-image (diffusers) checkpoint — loads onto a controller-co-located GPU and serves POST /v1/images/generations + the Generate panel.'],
+    image:['👁 vision','Accepts image input (vision encoder in the checkpoint) — image→text on all three chat APIs.'],
+    video:['🎞 video','Accepts video input (video token support in the checkpoint).'],
+    stt:['🎤 stt','Accepts audio input (speech understanding — ask it what was said).'],
+    tts:['🔊 tts','Speech output — synthesize WAV via /v1/audio/speech or the Text-to-speech panel in the model detail.'],
+    t2music:['🎵 music','Text-to-music (MusicGen) — autoregressive transformer + EnCodec; generate a WAV via POST /v1/audio/music or the Generate music panel. Runs on AMD / NVIDIA / CPU.'],
+    ocr:['🔤 ocr','OCR-specialist checkpoint — built for document/text extraction from images (beyond generic vision).'],
+    embedding:['🧮 embed','Embedding encoder — /api/embed + /v1/embeddings, not a chat model.']};
+  const capChips=(m.capabilities||[]).filter(c=>CAPB[c]).map(c=>'<span class="chip" title="'+CAPB[c][1]+'">'+CAPB[c][0]+'</span>').join('');
+  const arch=archChip(m)+capChips;
+  const al=(m.aliases||[]).map(a=>'<span class="chip al">'+esc(a)+'</span>').join('');
+  let meta='', acts='';
+  if(s.k==='loaded'&&m.t2i){
+    // #t2i-serve: image model card — no ctx/tok_s; live per-step render progress instead.
+    const parts=[];
+    if(m.quant)parts.push(esc(m.quant));
+    if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
+    if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');   // t2i uses RAM too (CPU text encoder + VAE; whole DiT in offload)
+    if(m.active>0)parts.push('<span style="color:var(--good)">● rendering'
+      +(m.t2i_step?(' step '+m.t2i_step+'/'+(m.t2i_total||'?')):'')+'</span>');
+    // #models-usage-graph: t2i has no tok/s — show a request-activity graph (renders over time)
+    meta=parts.join(' · ')+'<div class="mspark" data-model="'+esc(m.name)+'" title="render activity over time (in-flight / recent renders) — hover a point for details, click to expand"></div>';
+    acts=unloadBtn(m.name);
+  } else if(s.k==='loaded'){
+    const parts=[];
+    if(m.quant)parts.push(esc(m.quant));
+    if(m.kv_quant&&m.kv_quant!=='none')parts.push('<span class="em" title="TurboQuant KV-cache quantization ('+esc(m.kv_quant)+'): keys/values stored at ~3–4 bits instead of bf16 (data-free rotation + Lloyd-Max, un-rotated on read so attention is unchanged) → ~2× smaller KV cache, so longer context and more co-resident models on the same VRAM. turbo4 ≈ near-lossless, turbo3 more aggressive; best on large models.">KV:'+esc(m.kv_quant)+'</span>');
+    if(m.kv_offload)parts.push('<span class="em" title="KV cache offloaded to system RAM (OffloadedCache, per-layer prefetch): the VRAM the KV would reserve goes to model layers instead. Slower decode; useful for long context on small cards.">KV:RAM</span>');
+    if(m.def_temperature!=null)parts.push('<span class="em" title="Default sampling temperature for this model — applied when a request does not send its own (explicit request values always win).">t='+esc(String(m.def_temperature))+'</span>');
+    if(m.def_min_p!=null)parts.push('<span class="em" title="Default min-p sampling floor — drops tokens below this fraction of the top token\'s probability; confidence-adaptive, pairs with high temperature. Applied when a request sends no min_p.">mp='+esc(String(m.def_min_p))+'</span>');
+    parts.push('ctx '+(m.ctx||'?'));
+    if(m.vram_used_gb)parts.push('<span class="em">'+gb(m.vram_used_gb)+' VRAM</span>');
+    if(m.ram_used_gb)parts.push(gb(m.ram_used_gb)+' RAM');
+    // honest tok/s: LIVE (● green) while generating; when idle show the FROZEN last-run rate
+    // (last_tok_s is never recomputed while idle, so it stays an honest measurement — not a
+    // decaying/averaged value presented as "current").
+    if(m.active>0){ parts.push('<span style="color:var(--good)">● '+(m.tok_s||0).toFixed(1)+' tok/s</span>'); }
+    else { const _lt=m.last_tok_s||m.ema_tok_s||0; if(_lt)parts.push('<span class="em" title="last run — not live">'+_lt.toFixed(1)+' tok/s</span>'); }
+    if(m.cpu_frac>=0.5)parts.push('<span style="color:var(--hot)">'+Math.round(m.cpu_frac*100)+'% CPU</span>');
+    if(m.active)parts.push(m.active+' active');
+    const b4=int4Badge(m); if(b4)parts.push(b4);   // #int4-badge: loaded but no int4 cache yet
+    const bUp=upgradeBadge(m); if(bUp)parts.push(bUp);   // #load-faster: a faster placement fits now
+    // #models-tps-graph + #models-usage-graph: a per-model graph on its own line (server-rendered
+    // SVG dropped in from cache by paintModelSparks; hover a point for details, click to expand).
+    // LLMs get decode throughput (tok/s); media (tts/t2a) + embedding models have no decode rate,
+    // so they get a "request activity" graph instead (mirrors the server: spark_tps vs spark_usage).
+    const graphG=(m.media||m.is_embedding)
+      ? '<div class="mspark" data-model="'+esc(m.name)+'" title="request activity over time (in-flight / recent requests) — hover a point for details, click to expand"></div>'
+      : '<div class="mspark" data-model="'+esc(m.name)+'" title="decode throughput (tok/s) — hover a point for details, click to expand"></div>';
+    meta=parts.join(' · ')+graphG;
+    acts=unloadBtn(m.name);
+  } else if(s.k==='loading'){
+    const ld=s.ld||{};
+    // #load-queue: only ONE model streams at a time. A model still waiting for the gate shows
+    // "queued" with no progress bar — a 0% "loading" bar that cannot move reads as a hung load.
+    if(ld.state==='queued'){
+      meta='queued · waiting for the in-flight load'+(ld.elapsed_s?(' · '+Math.round(ld.elapsed_s)+'s'):'');
+    } else if(ld.state==='planning'){
+      // PRE-dispatch: shard/byte totals are not known yet (they come from the plan), so a 0/0 bar
+      // would read as a frozen download. On a network models dir this phase is minutes: reading the
+      // weight map, evicting a resident copy, verifying the shard cache. Show the LIVE sub-step
+      // (ld.phase, updated by engine._ld_phase) + an indeterminate bar so it is visibly alive.
+      meta='<span class="warn">preparing</span> · '+esc(ld.phase||'planning placement')
+          +(ld.elapsed_s?(' · '+Math.round(ld.elapsed_s)+'s'):'')
+          +'<div class="miniprog indet"><i></i></div>';
+    } else {
+      // #load-bytes: byte progress is the honest measure (shard counts are lumpy — a 4 GB embed
+      // slice and a 0.3 GB layer both count as "1"). Bar tracks bytes when we have them.
+      const bt=ld.bytes_total||0, bd=ld.bytes_done||0;
+      const r=bt>0?pc(bd,bt):pc(ld.ready||0,ld.total||1);
+      meta='compiling/loading · '+(ld.ready||0)+'/'+(ld.total||'?')
+          +(bt>0?(' · '+fmtB(bd)+' / '+fmtB(bt)):'')
+          +(ld.bytes_per_s?(' · '+fmtB(ld.bytes_per_s)+'/s'):'')
+          +' · '+Math.round(ld.elapsed_s||0)+'s'+(ld.eta_s?(' · eta '+Math.round(ld.eta_s)+'s'):'')
+          +loadGraph(ld)            // #load-graph: downloaded-vs-total, hover for exact figures
+          +'<div class="miniprog"><i style="width:'+r+'%"></i></div>';
+    }
+    acts='<button class="btn sm ghost" onclick="cancelLoad(\''+esc(m.name)+'\')">Cancel</button>';
+  } else if(s.k==='compiling'){
+    const cp=s.ld||{}; const r=pc(cp.ready||0,cp.total||1);
+    meta='compiling shard cache · '+(cp.ready||0)+'/'+(cp.total||'?')
+        +(cp.elapsed_s!=null?' · '+Math.round(cp.elapsed_s)+'s':'')+(cp.eta_s?' · eta '+Math.round(cp.eta_s)+'s':'')
+        +'<div class="miniprog"><i style="width:'+r+'%"></i></div>';
+    acts='<button class="btn sm ghost" disabled>…</button>';
+  } else if(s.k==='downloading'){
+    // live download progress — the /status entry carries dl_done_gb/dl_total_gb/dl_pct plus a
+    // rolling rate + ETA; render them like the load/compile cards instead of a static line
+    // (a static "downloading weights…" reads as a crashed pull on a multi-hour download).
+    const p=(m.dl_pct!=null)?m.dl_pct:null;
+    meta='downloading · '+gb(m.dl_done_gb||0)+(m.dl_total_gb?' / '+gb(m.dl_total_gb):'')
+        +(p!=null?' · '+p.toFixed(1)+'%':'')
+        +(m.dl_rate_mbps?' · '+m.dl_rate_mbps.toFixed(1)+' MiB/s':'')
+        +(m.dl_eta_s&&m.dl_rate_mbps?' · eta '+dur(m.dl_eta_s):'')
+        +((m.status||'')!=='downloading'?' · <span class="em">'+esc(m.status)+'…</span>':'')
+        +'<div class="miniprog"><i style="width:'+(p||0)+'%"></i></div>';
+    acts='<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'pause\')" title="Pause after the current file — kept resumable">Pause</button>'
+        +'<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'stop\')" title="Stop after the current file — downloaded files are kept, Resume continues from here">Stop</button>';
+  } else if(s.k==='dlhalt'){
+    const p=(m.dl_pct!=null)?m.dl_pct:null;
+    meta='<span class="em">'+esc(m.status)+'</span> at '+gb(m.dl_done_gb||0)
+        +(m.dl_total_gb?' / '+gb(m.dl_total_gb):'')+(p!=null?' · '+p.toFixed(1)+'%':'')
+        +'<div class="miniprog"><i style="width:'+(p||0)+'%"></i></div>';
+    acts='<button class="btn sm pri" onclick="dl(\''+esc(m.name)+'\',\'resume\')">Resume</button>'
+        +'<button class="btn sm ghost" onclick="dl(\''+esc(m.name)+'\',\'clear\')" title="Discard the partially downloaded files">Clear</button>';
+  } else if(s.k==='registered'){
+    meta=fitMeta(m);
+    acts=t2i?'<button class="btn sm pri" title="Load the image pipeline onto a controller-co-located GPU: DiT mixed-edge int4 (first+last blocks bf16 — the gate-tested near-bf16 recipe), text encoder on CPU, tiled VAE. Takes a few minutes (quantize + move)." onclick="t2iLoadDlg(\''+esc(m.name)+'\')">Load 🖼</button>'
+            :'<button class="btn sm pri" onclick="openLoad(\''+esc(m.name)+'\')">Load ▾</button>';
+  } else { // notdl
+    meta='<span class="err">not downloaded</span> · '+gb(m.size_gb); acts='<button class="btn sm" onclick="dl(\''+esc(m.name)+'\',\'start\')">Download</button>';
+  }
+  // #unified-fleet: a model a PEER controller has resident shows here as loaded, because from a
+  // client's point of view it IS — a request for it is federated to the owner and answered. The
+  // chip names who actually holds the weights; Unload federates there too.
+  const fed=m.federated?'<span class="chip" title="Resident on controller '+esc(m.owner||'peer')+' ('+esc(m.owner_url||'')+'), not on this one. Requests for it are federated there and answered normally — one copy of the weights, either controller as the front door. Unload acts on the owning controller.">via '+esc(m.owner||'peer')+'</span>':'';
+  return '<div class="row"><span class="dot" style="background:'+s.c+'"></span>'
+    +'<div class="nm" onclick="openDetail(\''+esc(m.name)+'\')"><b>'+esc(m.name)+'</b>'+arch+fed+al+'</div>'
+    +'<div class="meta">'+meta+'</div><div class="acts">'+acts
+    +'<span class="btn sm ghost" title="details" onclick="openDetail(\''+esc(m.name)+'\')">⋯</span></div></div>';
+}
+function archChip(m){
+  const t=(m.target||'').toLowerCase(); let a='';
+  if(t.includes('moe')||(m.cached&&0))a='';
+  return m.arch?('<span class="chip">'+esc(m.arch)+'</span>'):'';
+}
+function fitMeta(m){
+  const cz=m.cached||{};
+  // int4 cached -> serve-from-cache ready; else honest "weights on disk" + the compile badge
+  // (the old text claimed "cache ready" for uncached models — misleading).
+  const q=cz.int4&&cz.int4.ok?('int4 '+gb(cz.int4.size_gb)+' cache ready')
+        :((m.size_gb?gb(m.size_gb):'on disk')+int4Badge(m));
+  let warn='';
+  // surface the devstral-style giant-ctx trap
+  const dc=m.default_ctx||0;
+  if(dc>=131072) warn=' · <span style="color:var(--hot)">⚠ native ctx '+(dc>=1000?Math.round(dc/1024)+'k':dc)+' — set ctx on load</span>';
+  return q+warn;
+}
+// #int4-badge: one-click int4 shard-cache compile for any on-disk model without one. Tooltip =
+// the cost (est. cache size on disk — disk.models' bf16-normalized int4 estimate — and the
+// controller's free disk) + the payoff (int4 loads serve from cache instantly). Click opens the
+// same openCompile() picker as the detail modal's Precache button (fleet / this controller / one
+// node); the row flips to Compiling with a progress bar on the next poll. m.ready gate: can't
+// compile weights that aren't downloaded.
+function int4Badge(m){
+  const cz=m.cached||{};
+  // embedding encoders load whole-model float32 (_load_embedding_locked) and NEVER read the
+  // shard cache — a compile would fail (decoder-shaped packer) and the payoff is false. Same
+  // for the single-node media kinds (tts/t2a — Kokoro, ACE-Step): their leaves build whole
+  // pipelines and never touch _shards/. No badge for any of them.
+  const _nocache=['embedding','t2i','tts','t2a','t2music'];
+  if(!m.ready||(cz.int4&&cz.int4.ok)||(m.capabilities||[]).some(c=>_nocache.includes(c)))return '';
+  const dk=(((LAST||{}).disk||{}).models||[]).find(x=>x.name===m.name||x.internal_name===m.internal_name)||{};
+  const est=(dk.quant_gb||{}).int4, free=((LAST||{}).disk||{}).controller_free_gb;
+  const tip='Compile the int4 shard cache for '+m.name
+    +'\n• est. size on disk: '+(est!=null?'~'+gb(est):'unknown')+(dk.src_dtype?' (packed from '+dk.src_dtype+' weights, group 128)':'')
+    +'\n• writes to the controller’s _shards/int4 cache · free disk '+(free!=null?gb(free):'—')
+    +((est!=null&&free!=null&&est>free)?' ⚠ may not fit':'')
+    +'\n• runs as a background subprocess (below-normal priority) — serving is unaffected'
+    +'\n• once cached: int4 loads serve from cache instantly, no on-the-fly quantize'
+    +'\n\nClick to compile now.';
+  return ' <span class="chip q4" title="'+esc(tip)+'" onclick="openCompile(\''+esc(m.name)+'\',\'int4\')">⚡ int4</span>';
+}
+
+// #load-faster: one-click "upgrade to a faster placement". Shown ONLY when the backend
+// (engine._upgrade_for, throttled ~30s) detected a faster VRAM-first / fewer-node placement that fits
+// with currently-free VRAM (m.upgrade.available). Tooltip = from -> to + why. Click applies immediately
+// (NO confirm — the swap is hitless: in-flight clients pause and ride onto the fresh copy; a busy model
+// drains first, up to ~2 min, then forces).
+function upgradeBadge(m){
+  const u=m.upgrade; if(!u||!u.available)return '';
+  const tip='Load '+m.name+' faster'
+    +'\n• from: '+(u.from||'?')
+    +'\n• to: '+(u.to||'?')
+    +(u.reason?'\n• '+u.reason:'')
+    +'\n\nRe-places it VRAM-first using the room that just freed up. Hitless: any in-flight reply '
+    +'finishes first, then it swaps (a long generation is cut off after ~2 min). Click to apply.';
+  return ' <span class="chip" style="cursor:pointer;border-color:var(--good);color:var(--good)" title="'
+    +esc(tip)+'" onclick="upgradePlacement(\''+esc(m.name)+'\')">⬆ load faster</span>';
+}
+
+function renderNodes(d){
+  // #unified-fleet: OUR nodes plus every node a peer controller owns, so this page shows the whole
+  // fleet from either controller. Peer nodes carry federated/owner and render read-only — the
+  // controller that owns a node is the only one that may restart it or place work on it.
+  const pns=(d.peer_nodes||[]);
+  const ns=(d.nodes||[]).concat(pns).slice().sort((a,b)=>(a.federated?1:0)-(b.federated?1:0)||(b.has_gpu?1:0)-(a.has_gpu?1:0)||String(a.hostname).localeCompare(String(b.hostname)));
+  $('#ncount').textContent=ns.length+' nodes'+(pns.length?' ('+pns.length+' via peers)':'');
+  // fleet-consensus version = the most common client_version among nodes; a node that differs from it
+  // is flagged (warn) so a worker that missed a restart/update stands out. When all match, nothing flags.
+  const _vc={}; ns.forEach(n=>{ if(n.client_version) _vc[n.client_version]=(_vc[n.client_version]||0)+1; });
+  const _consensus=Object.keys(_vc).sort((a,b)=>_vc[b]-_vc[a])[0]||null;
+  // #node-split: per node, GREEN = what LACII itself uses on THAT node — RAM = the worker
+  // process RSS (proc_rss_gb), VRAM = the sum of loaded models' per-stage GPU bytes placed here —
+  // vs BLUE = the rest of the physical usage (OS / other processes), so it stands out from everything
+  // else and mirrors the GPU/RAM pool tiles. Sum iM's per-node VRAM from the loaded models' stages.
+  const imVram={};
+  (d.models||[]).filter(m=>m.loaded).forEach(m=>(m.stages||[]).forEach(s=>{
+    imVram[s.hostname]=(imVram[s.hostname]||0)+(s.gpu_gb||0);
+  }));
+  $('#nodes').innerHTML=ns.map(n=>{
+    const gpu=n.has_gpu;
+    const util=gpu?('GPU '+Math.round(n.gpu_util||0)+'%'):('CPU '+Math.round(n.cpu_percent||0)+'%');
+    const dev=(gpu?(n.device_name||'GPU'):((n.cores||'')+'c CPU')).replace(/^NVIDIA GeForce /,'');
+    const off=(!n.alive)?' <span class="err">offline</span>':'';
+    // GREEN = iM's own usage on this node, BLUE = other/OS usage, then free (poolbar, same as the
+    // pool tiles). `im` is clamped to physical-used so a stale estimate can't overflow the bar.
+    const memRow=(lab,im,used,tot)=>{
+      const g=Math.max(0,Math.min(im,used)),o=Math.max(0,used-g),f=Math.max(0,tot-used);
+      return '<div class="mb"><span class="lab">'+lab+'</span>'
+        +poolbar(g,o,tot,'LACII '+fmt(g)+' GB (green) · other '+fmt(o)+' GB (blue) · '+fmt(f)+' GB free')
+        +'<span class="num">'+fmt(used)+' / '+fmt(tot)+'</span></div>';
+    };
+    // Fixed grid columns: name · VRAM · RAM · util. CPU-only nodes leave the VRAM
+    // cell empty so their RAM bar still aligns with the GPU nodes' RAM column.
+    const ramUsed=Math.max(0,(n.total_mem_gb||0)-(n.free_mem_gb||0));
+    const vram=gpu?memRow('VRAM',(imVram[n.hostname]||0),(n.vram_used_gb||0),(n.vram_total_gb||0)):'<div class="mb"></div>';
+    const cv=n.client_version||''; const _stale=(_consensus&&cv&&cv!==_consensus)?' stale':'';
+    const verCell='<div class="ver'+_stale+'"'+(_stale?' title="version differs from fleet consensus '+esc(_consensus)+'"':'')+'>'+(cv?'v'+esc(cv):'—')+'</div>';
+    // #node-restart: per-node fresh start — restarts just this worker process (supervisor
+    // relaunches it; clears whatever VRAM/RAM it holds). Models with a stage here drop and
+    // re-load on demand — the confirm says so. Hidden for offline nodes (nothing to signal).
+    const rbtn=(n.alive&&!n.federated)?' <a class="nrst" title="Restart this worker process (fresh start: clears its VRAM/RAM; models on it drop and re-load on demand)" onclick="restartNode(\''+esc(n.hostname)+'\')">↻</a>':'';
+    // A peer's node is shown, not driven: no restart handle, and a chip naming the controller that
+    // owns it. Ownership is exclusive by design (two planners against one node double-book its
+    // memory), so this is a live view of the other half of the fleet, not a second set of controls.
+    const own=n.federated?' <span class="chip" title="Owned by controller '+esc(n.owner||'peer')+' at '+esc(n.owner_url||'')+'. It places and restarts work here; this controller can drive models on it by federating (Load sends the request there).">via '+esc(n.owner||'peer')+'</span>':'';
+    return '<div class="node"'+(n.federated?' style="opacity:.72"':'')+'><div class="nn">'+esc(n.hostname)+rbtn+own+' <small>'+esc(dev)+'</small>'+off+'</div>'
+      +vram+memRow('RAM',(n.proc_rss_gb||0),ramUsed,(n.total_mem_gb||0))
+      +'<div class="util">'+util+verCell+'</div></div>';
+  }).join('');
+}
+async function restartNode(host){
+  if(!confirm('Restart the worker on '+host+'?\n\nFresh start for that node: the process relaunches and its VRAM/RAM clears. Any model with a stage on it drops and re-loads on demand.'))return;
+  try{
+    const r=await api('/restart_node?node='+encodeURIComponent(host),{method:'POST'});
+    const rec=r.recovering||[], drop=(r.models_affected||[]).filter(m=>!rec.includes(m));
+    let msg=host+' restarting';
+    if(rec.length)msg+=' — re-placing in-use '+rec.join(', ');
+    if(drop.length)msg+=(rec.length?'; ':' — ')+'drops idle '+drop.join(', ');
+    toast(msg);
+    tick();
+  }catch(e){ toast(String(e.message||e),1); }
+}
+
+// ---------- actions ----------
+function closeOv(){ $('#ov').classList.remove('show'); DETAIL_OPEN=null; }
+// #modal-scroll: wheel over the dark backdrop (outside the popup box) used to scroll the PAGE
+// behind the popup. Forward it to the modal instead so the wheel scrolls the popup wherever
+// the mouse sits. deltaMode 1 = line-based deltas (Firefox) — scale to ~pixels.
+$('#ov').addEventListener('wheel',e=>{ if(e.target===e.currentTarget){ $('#modal').scrollTop+=e.deltaY*(e.deltaMode===1?16:1); e.preventDefault(); } },{passive:false});
+function openAdd(){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Add a model</h3>'
+   +'<div style="font-size:12px;color:var(--muted);margin-top:4px">Just enter the Hugging Face id — <b>org/Model</b>. A GGUF-only repo automatically uses its safetensors source (or auto-picks a quant to convert), and the name is derived for you. Downloads in the background.</div>'
+   +'<label>Hugging Face id</label><input id="a-hf" placeholder="org/Model — e.g. ornith-ai/Ornith-1.0-35B">'
+   +'<div style="font-size:11px;color:var(--dim);margin:12px 0 2px">Optional overrides — leave blank unless you need them:</div>'
+   +'<div class="grid2"><div><label>Name</label><input id="a-nm" placeholder="auto from id"></div>'
+   +'<div><label>GGUF file</label><input id="a-gg" placeholder="auto — set only to force one quant"></div></div>'
+   +'<div style="margin-top:16px;text-align:right"><button class="btn pri" onclick="doAdd()">Add + download</button></div>'
+   +'<div id="a-err" class="err" style="margin-top:8px"></div>';
+  $('#ov').classList.add('show'); setTimeout(()=>$('#a-hf').focus(),50);
+}
+async function doAdd(){
+  const hf=$('#a-hf').value.trim(), nm=$('#a-nm').value.trim(), gg=$('#a-gg').value.trim();
+  if(!hf.includes('/')){ $('#a-err').textContent='enter an org/name Hugging Face id'; return; }
+  const q=new URLSearchParams({model:hf}); if(nm)q.set('name',nm); if(gg)q.set('gguf_file',gg);
+  try{ const r=await api('/add_model?'+q.toString(),{method:'POST'}); closeOv(); toast((r&&r.note)||('added '+((r&&r.friendly)||hf))); tick(); }
+  catch(e){ $('#a-err').textContent=String(e.message||e); }
+}
+function _devOpts(){
+  const ns=(LAST&&LAST.nodes||[]).slice().sort((a,b)=>(b.has_gpu?1:0)-(a.has_gpu?1:0)||a.hostname.localeCompare(b.hostname));
+  const g=ns.filter(n=>n.has_gpu&&n.vram_enabled!==false&&n.alive).map(n=>'<option value="g:'+esc(n.hostname)+'">'+esc(n.hostname)+' — GPU ('+fmt(n.vram_total_gb)+' GB)</option>').join('');
+  const c=ns.filter(n=>n.alive&&n.ram_enabled!==false).map(n=>'<option value="c:'+esc(n.hostname)+'">'+esc(n.hostname)+' — CPU/RAM ('+fmt(n.total_mem_gb)+' GB)</option>').join('');
+  return (g?'<optgroup label="Pin to a GPU device">'+g+'</optgroup>':'')+(c?'<optgroup label="Pin to a CPU node">'+c+'</optgroup>':'');
+}
+function openLoad(name){
+  const m=(LAST.models||[]).find(x=>x.name===name)||{};
+  const cz=m.cached||{}; const dc=m.default_ctx||0;
+  const ctxDefault = dc>=131072 ? 16384 : (dc||32767);
+  // #int2-caveat: the tier list is generated, so int2 used to sit in this select as a bare option
+  // next to int4 with nothing to distinguish it — and picking it on a model with no compiled int2
+  // cache is a HARD REFUSAL at load time, not a slower load. Carry the caveat on the option itself
+  // (same text as the model page's Compile int2 chip and the auto-load default quant).
+  const QTITLE={int2:'2-bit capacity tier (~2.5 bits/weight, ~half the int4 cache). GPTQ-CALIBRATED — per-layer Hessian error compensation over a bundled offline corpus, NOT round-to-nearest. DENSE models only: a MoE downgrades its experts to int4 (the calibration is built from dense activations, and a routed expert only ever sees the tokens routed to it). EXPLICIT-COMPILE ONLY — calibration is sequential (layer L needs layer L-1 quantized) and runs hours on a big model, so the cache is never auto-built; without a valid calibrated cache an int2 load REFUSES rather than serving uncalibrated weights. Build it first from the model page (Compile int2). Quality has only ever been measured at 7B and below, where int4 is strictly better; this tier exists for big DENSE models that cannot fit at int4.'};
+  const qopt=q=>'<option value="'+q+'"'+(QTITLE[q]?' title="'+QTITLE[q]+'"':'')+'>'+q+(cz[q]&&cz[q].ok?' · '+gb(cz[q].size_gb)+' cached':'')+'</option>';
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load '+esc(name)+'</h3>'
+   +'<div class="grid2"><div><label>Quant</label><select id="l-q" onchange="previewSoon(\''+esc(name)+'\')">'+qopt('int4')+qopt('int2')+qopt('int8')+'<option value="none">none (bf16)'+(cz.none&&cz.none.ok?' · '+gb(cz.none.size_gb)+' cached':(m.size_gb?' · '+gb(m.size_gb):''))+'</option></select></div>'
+   +'<div><label>Context length</label><input id="l-ctx" type="number" value="'+ctxDefault+'" oninput="previewSoon(\''+esc(name)+'\')"></div></div>'
+   +'<label>Placement</label><select id="l-place" onchange="_placeChg();previewSoon(\''+esc(name)+'\')">'
+   +'<optgroup label="Auto / distribute"><option value="m:auto">auto · GPU-first</option><option value="m:all-gpu">all-GPU</option>'
+   +'<option value="m:distribute">distribute (CPU+GPU)</option><option value="m:proportional">proportional</option></optgroup>'
+   +_devOpts()
+   +'<optgroup label="Tensor-parallel"><option value="tp:gpu">GPU tensor-parallel</option><option value="tp:cpu">CPU tensor-parallel (RAM)</option></optgroup></select>'
+   +'<div id="l-tpwrap" style="display:none;margin-top:8px"><label>TP width (number of nodes)</label><input id="l-tpn" type="number" min="2" value="2" oninput="previewSoon(\''+esc(name)+'\')"></div>'
+   +'<div class="grid2" style="margin-top:8px">'
+   +'<div><label title="Where the KV cache (the conversation scratchpad — grows with context) lives. GPU = fastest. System RAM (OffloadedCache, per-layer prefetch) frees that VRAM for model layers — useful when pushing context past what the card holds. Decode is slower, and MUCH slower on a discrete GPU (the whole cache crosses PCIe every token). To keep a big context on-GPU without spilling weights, prefer KV quant instead.">KV cache location</label>'
+   +'<select id="l-kvo" onchange="previewSoon(\''+esc(name)+'\')"><option value="">GPU (fastest)</option><option value="1">System RAM (frees VRAM)</option></select></div>'
+   +'<div><label title="TurboQuant KV-cache quantization (#172): store keys/values at ~2-4 bits ON the GPU (data-free rotation + Lloyd-Max, un-rotated on read so attention is unchanged), shrinking the KV ~4-5x so a bigger context fits on the same card WITHOUT spilling weights to RAM. turbo4 is near-lossless, turbo3 more aggressive, turbo2 smallest. Best on large (>=~7B) models — small models degrade. Overridden by System-RAM offload. NOTE: the fit-preview still sizes KV at bf16, so it under-counts what turbo saves.">KV quant</label>'
+   +'<select id="l-kvq" onchange="previewSoon(\''+esc(name)+'\')"><option value="">none (bf16, exact)</option><option value="turbo4">turbo4 &middot; ~4-bit (near-lossless)</option><option value="turbo3">turbo3 &middot; ~3-bit</option><option value="turbo2">turbo2 &middot; ~2-bit (smallest)</option></select></div></div>'
+   +'<div class="grid2" style="margin-top:8px">'
+   +'<div><label title="Default sampling temperature for this model: used when a request does not send its own (explicit request values always win). Empty = greedy (0). ~0.7 leans creative, 0 = deterministic.">Default temperature</label>'
+   +'<input id="l-temp" type="number" min="0" max="2" step="0.1" placeholder="0 (greedy)"></div>'
+   +'<div><label title="Min-p sampling floor: drops any token whose probability is below this fraction of the top token\'s. Confidence-adaptive — strict when the model is sure, looser when it isn\'t — so it pairs well with HIGH temperature (temp flattens the distribution and lets weird tokens in; min-p cuts them first). At temperature >= 1.0 use 0.05-0.1: lower barely filters, higher eats the variety you raised temperature for. Used when a request sends no min_p of its own.">Default min-p</label>'
+   +'<input id="l-minp" type="number" min="0" max="1" step="0.01" placeholder="0 (off)"></div></div>'
+   +(dc>=131072?'<div class="note">⚠ native ctx is '+(Math.round(dc/1024))+'k — a huge KV cache. Keep ctx modest (8–16k) unless you need more.</div>':'')
+   +'<div class="grid2" style="margin-top:8px">'
+   +'<div><label title="KV slots (C): independent per-request KV streams on this replica. Each slot also keeps its OWN prompt-prefix record, and a request is routed to the free slot whose prefix best matches it — so with C&gt;1 two interleaved conversations stop evicting each other\'s cached prompt. Measured: with a 2594-token prompt, one unrelated request between turns cost +4691 ms at C=1 (full re-prefill) versus +109 ms at C=3. Costs C x the full-context KV reservation, so raising it too far pushes layers onto CPU — which is far worse than a prefix miss.">KV slots (concurrent streams)</label>'
+   +'<input id="l-slots" type="number" min="1" max="8" value="1" oninput="previewSoon(\''+esc(name)+'\')"></div><div></div></div>'
+   +'<div style="margin-top:16px;text-align:right"><button class="btn ghost" title="Fill every field above with the fastest settings for THIS model on THIS hardware, and explain each choice. Nothing is loaded — review and adjust before pressing Load." onclick="optimizeLoad(\''+esc(name)+'\')">⚡ Optimized settings</button> '
+   +'<button class="btn ghost" onclick="preview(\''+esc(name)+'\')">Preview fit</button> '
+   +'<button class="btn pri" onclick="doLoad(\''+esc(name)+'\')">Load</button></div>'
+   +'<div id="l-out" style="font-size:12px;color:var(--muted);margin-top:10px"></div>';
+  $('#ov').classList.add('show');
+  previewSoon(name);   // #mem-preview: show the est VRAM/RAM + KV-at-ctx footprint immediately
+}
+function _placeChg(){ $('#l-tpwrap').style.display=$('#l-place').value.indexOf('tp:')===0?'block':'none'; }
+// #perf-auto: "⚡ Optimized settings" — ask the controller which knobs give this model the fastest
+// tokens on THIS fleet (GET /optimize_knobs, a pure dry-run) and fill the form in. Deliberately does
+// NOT load: the operator sees every value change and the reason for it, and can still override.
+// The reasons matter — several settings are counter-intuitive and each one is there because it was
+// measured (e.g. int4 is a memory tier and NOT a speed tier on pre-sm80 cards, where no fused
+// kernel exists and the whole bf16 weight is rematerialized every forward).
+async function optimizeLoad(name){
+  const out=$('#l-out'); if(out)out.innerHTML='<span class="muted">resolving fastest settings…</span>';
+  try{
+    const ctx=parseInt(($('#l-ctx')||{}).value||'0',10)||0;
+    const r=await fetch('/optimize_knobs?model='+encodeURIComponent(name)+'&ctx='+ctx);
+    const d=await r.json();
+    if(!d.ok){ if(out)out.innerHTML='<span class="bad">'+esc(d.error||'could not resolve')+'</span>'; return; }
+    const k=d.knobs||{}, changed=[];
+    const set=(sel,val,label)=>{ const el=$(sel); if(!el)return;
+      const before=el.value; el.value=String(val);
+      if(String(before)!==String(val))changed.push(label+': '+(before===''?'(default)':before)+' → '+val); };
+    if(k.quant!==undefined)     set('#l-q',   k.quant, 'quant');
+    if(k.kv_slots!==undefined)  set('#l-slots',k.kv_slots,'KV slots');
+    if(k.kv_offload!==undefined)set('#l-kvo', k.kv_offload?'1':'', 'KV location');
+    if(k.kv_quant!==undefined)  set('#l-kvq', k.kv_quant==='none'?'':k.kv_quant, 'KV quant');
+    const why=(d.why||[]).map(w=>'<div style="margin:2px 0 2px 10px">• '+esc(w)+'</div>').join('');
+    if(out)out.innerHTML='<div><b>⚡ optimized for '+esc(d.device_name||'?')+'</b> ('
+      +esc(d.device_class||'?')+', '+(d.free_vram_gb||0).toFixed(1)+' GB free on '+esc(d.node||'?')+')</div>'
+      +(changed.length?'<div style="margin-top:6px"><b>changed:</b> '+esc(changed.join('  ·  '))+'</div>'
+                      :'<div style="margin-top:6px">already at the fastest settings — nothing changed.</div>')
+      +'<div style="margin-top:8px"><b>why:</b></div>'+why
+      +'<div style="margin-top:8px" class="muted">Nothing is loaded yet — adjust anything above, then press Load.</div>';
+    previewSoon(name);
+  }catch(e){ if(out)out.innerHTML='<span class="bad">optimize failed: '+esc(String(e))+'</span>'; }
+}
+function placeParams(name){
+  const v=$('#l-place').value, p={model:name, quant:$('#l-q').value, ctx:$('#l-ctx').value};
+  if(v.indexOf('m:')===0) p.mode=v.slice(2);
+  else if(v.indexOf('g:')===0){ p.node=v.slice(2); }
+  else if(v.indexOf('c:')===0){ p.node=v.slice(2); p.cpu_only='true'; }
+  else if(v==='tp:gpu'){ p.tp=$('#l-tpn').value||2; }
+  else if(v==='tp:cpu'){ p.tp=$('#l-tpn').value||2; p.cpu_only='true'; }
+  const sl=$('#l-slots'); if(sl&&sl.value&&+sl.value>1)p.kv_slots=sl.value;  // #kv-slots: C streams
+  const kvo=$('#l-kvo'); if(kvo&&kvo.value)p.kv_offload='true';      // #kv-offload: KV in system RAM
+  const kvq=$('#l-kvq'); if(kvq&&kvq.value)p.kv_quant=kvq.value;     // #172 TurboQuant KV preset (turbo2/3/4)
+  const tmp=$('#l-temp'); if(tmp&&tmp.value!=='')p.temperature=tmp.value;  // #load-temp: default temp
+  const mp=$('#l-minp'); if(mp&&mp.value!=='')p.min_p=mp.value;            // #min-p: default floor
+  return p;
+}
+let _pvTimer=null;
+// #mem-preview: debounce the /plan estimate so typing a ctx / flipping quant re-estimates without a
+// request per keystroke. Called on dialog open + on every quant/ctx/placement change.
+function previewSoon(name){ clearTimeout(_pvTimer); const el=$('#l-out'); if(el)el.textContent='estimating…'; _pvTimer=setTimeout(()=>preview(name),350); }
+async function preview(name){
+  const p=placeParams(name); const q=new URLSearchParams({model:p.model,quant:p.quant,ctx:p.ctx});
+  if(p.mode)q.set('mode',p.mode); if(p.node)q.set('node',p.node); if(p.cpu_only)q.set('cpu_only',p.cpu_only);
+  // #172 kv-preview: send the TurboQuant preset too, or the footprint below sizes KV at bf16 and
+  // contradicts the KV-quant selector three rows above it in this same dialog.
+  if(p.kv_quant)q.set('kv_quant',p.kv_quant);
+  const out=$('#l-out'); if(!out)return; out.textContent='estimating…';
+  let r; try{ r=await (await fetch('/plan?'+q.toString())).json(); }
+  catch(e){ out.innerHTML='<span class="err">'+esc(String(e.message||e))+'</span>'; return; }
+  const mem=r.mem||{}, a=r.assess||{};
+  let html='';
+  // Estimated footprint: weights + KV-at-ctx (+ per-1k scaling) + the est VRAM/RAM split.
+  if(mem.weights_gb!=null){
+    const split=(mem.est_vram_gb!=null)
+      ? ('<span style="color:var(--good)">~'+gb(mem.est_vram_gb)+' VRAM</span> · <span class="em">~'+gb(mem.est_ram_gb)+' RAM</span>')
+      : '<span class="em">— (does not fit; see below)</span>';
+    // #172 kv-preview: name the preset the KV figure was actually sized with. mem.kv_quant is the
+    // EFFECTIVE one, so it reads 'bf16' whenever /plan dropped the request (hybrid arch) — the row
+    // never silently shows a bf16 number under a turbo3 selection.
+    const _kvq=(mem.kv_quant&&mem.kv_quant!=='none')?String(mem.kv_quant):'';
+    html+='<div style="margin:2px 0"><b>Estimated footprint</b> · '+esc(mem.quant)+' · ctx '+(mem.ctx||0).toLocaleString()+'</div>'
+      +'<table class="kv">'
+      +'<tr><td>weights</td><td class="v">'+gb(mem.weights_gb)+'</td></tr>'
+      +'<tr><td>KV cache @ '+(mem.ctx||0).toLocaleString()+' <span class="em">('+(_kvq?esc(_kvq):'bf16')+')</span></td><td class="v">'+gb(mem.kv_gb)+' <span class="em">(~'+gb(mem.kv_per_1k_gb)+' / 1k tok)</span></td></tr>'
+      +'<tr><td>total</td><td class="v"><b>'+gb(mem.total_gb)+'</b></td></tr>'
+      +'<tr><td>placement</td><td class="v">'+split+'</td></tr>'
+      +'</table>';
+    if(mem.kv_quant_note)html+='<div class="note">⚠ '+esc(mem.kv_quant_note)+'</div>';
+    // #kv-slots preview honesty: /plan takes NO kv_slots (its signature is model/ctx/quant/mode/
+    // node/cpu_only/kv_quant, and FastAPI drops any extra query param), so every figure above is
+    // the SINGLE-stream one. The load does not agree: it bakes C into the spec via
+    // ModelSpec.for_kv_slots, which multiplies kv_bytes_per_layer by C, so the worker reserves C x
+    // the full-context KV. A C>1 preview therefore under-counts KV by the slot factor and can say
+    // 'fits' where /load raises CapacityError. Do the multiplication here and name it rather than
+    // scaling the table itself — the plan/placement split above really was computed at C=1, and a
+    // table whose total no longer matched its own split would be a second lie.
+    const _C=Math.max(1,parseInt(p.kv_slots||1,10)||1);
+    if(_C>1&&mem.kv_gb!=null)
+      html+='<div class="note">⚠ KV slots C='+_C+': the figures above are for ONE stream — the fit '
+        +'preview does not size slots. The load reserves C x the full-context KV: ~'+gb(mem.kv_gb*_C)
+        +' KV, ~'+gb((mem.weights_gb||0)+mem.kv_gb*_C)+' total (~'+gb(mem.kv_gb*(_C-1))
+        +' more than shown), so this estimate is optimistic and the load can still refuse.</div>';
+  }
+  if(!r.ok){ html+='<div class="err" style="margin-top:6px">⚠ '+esc(r.error||'does not fit the fleet at these settings')+'</div>'; out.innerHTML=html; return; }
+  const st=(r.stages||[]).map(s=>esc(s.hostname)+' L'+s.layer_start+'-'+s.layer_end).join(', ');
+  html+='<div style="margin-top:6px"><b>plan:</b> '+esc(r.basis||'')+'<br>'+st+'</div>';
+  (a.warnings||[]).forEach(w=>html+='<div class="note">⚠ '+esc(w)+'</div>');
+  if(a.suggested_ctx&&(a.kv_ram_gb||0)>0.1) html+='<div class="note">tip: ctx ≤ '+a.suggested_ctx.toLocaleString()+' keeps the KV cache in VRAM</div>';
+  if(p.tp)html+='<div class="note">TP preview is approximate (planned as pipeline)</div>';
+  if(r.overload)html+='<div class="note">⚠ '+esc(r.overload.reason)+' — suggest '+esc(r.overload.suggest||'proportional')+'</div>';
+  out.innerHTML=html;
+}
+async function doLoad(name){
+  const q=new URLSearchParams(placeParams(name));
+  // /load blocks until the load finishes — so close the popup NOW (the loading card appears on the
+  // models page via the status poll) instead of holding the dialog open for the whole load.
+  closeOv(); toast('loading '+name+'…'); tick();
+  try{ await api('/load?'+q.toString(),{method:'POST'}); toast(name+' loaded'); }
+  catch(e){ toast(name+' load failed: '+String(e.message||e),1); }
+  tick();
+}
+// #persist / #no-unload: toggle a per-model lifecycle pin. persist -> autoload-on-restart;
+// no_unload -> the absolute do-not-auto-unload veto. Unchecking sends the OFF variant.
+async function setPin(name,kind,on){
+  const p=kind==='persist'?(on?'persist':'unpersist'):(on?'no_unload':'no_unload_off');
+  try{ await api('/config?'+p+'='+encodeURIComponent(name),{method:'POST'});
+       toast((kind==='persist'?'autoload-on-restart ':'do-not-auto-unload ')+(on?'on':'off')+' · '+name); }
+  catch(e){ toast(String(e.message||e),1); }
+  tick();
+}
+// #unload-feedback: unload can take a few seconds (multi-stage teardown), and the ~2s poll keeps
+// re-rendering the row meanwhile — so a feedback-less await looked like "nothing happened" and users
+// double-clicked. The BUTTON itself now shows the in-flight state: unloadBtn() renders a disabled
+// "Unloading…" whenever _unloading[name] is set (so it survives every poll re-render), unload() flips
+// the clicked button instantly, and a re-click while in flight is ignored (per model).
+const _unloading={};
+function unloadBtn(name){ return _unloading[name]
+  ? '<button class="btn sm" disabled title="tearing down shards…">Unloading…</button>'
+  : '<button class="btn sm" onclick="unload(\''+esc(name)+'\',this)">Unload</button>'; }
+async function unload(name,btn){ closeOv(); if(_unloading[name])return; _unloading[name]=1;
+  if(btn){try{btn.disabled=true;btn.textContent='Unloading…';}catch(e){}}
+  toast('unloading '+name+'…');
+  try{ await api('/unload?model='+encodeURIComponent(name),{method:'POST'}); toast('unloaded '+name); }
+  catch(e){ toast(String(e.message||e),1);}
+  finally{ delete _unloading[name]; } tick(); }
+async function cancelLoad(name){ try{ await api('/cancel_load?model='+encodeURIComponent(name),{method:'POST'}); toast('cancelled load'); tick(); }catch(e){ toast(String(e.message||e),1);} }
+async function dl(name,action){ try{ await api('/download'+(action==='start'?'':'/'+action)+'?model='+encodeURIComponent(name),{method:'POST'}); toast(action+' '+name); tick(); }catch(e){ toast(String(e.message||e),1);} }
+
+// #load-graph: compact downloaded-vs-total bar for an in-flight load, drawn beside the row.
+// Two hoverable segments (done / remaining) each carry an SVG <title>, so mousing over either
+// gives exact figures — bytes, percent, rate, ETA and shard count — without cluttering the row.
+function loadGraph(ld){
+  const bt=ld.bytes_total||0; if(!bt) return '';
+  const bd=Math.max(0,Math.min(ld.bytes_done||0,bt)), rem=Math.max(0,bt-bd);
+  const W=124,H=22,pad=1,IW=W-2*pad;
+  const f=bt>0?bd/bt:0, fw=Math.max(f>0?2:0,IW*f), pct=(100*f).toFixed(1);
+  const rate=ld.bytes_per_s?fmtB(ld.bytes_per_s)+'/s':'—';
+  const eta=ld.eta_s?dur(ld.eta_s):'—';
+  const doneTip='downloaded '+fmtB(bd)+' of '+fmtB(bt)+' ('+pct+'%)'
+    +'\nrate '+rate+'\neta '+eta+'\nshards '+(ld.ready||0)+'/'+(ld.total||'?');
+  const remTip='remaining '+fmtB(rem)+' of '+fmtB(bt)+' ('+(100-f*100).toFixed(1)+'%)'
+    +'\nat '+rate+(ld.eta_s?(' → '+dur(ld.eta_s)+' left'):'');
+  return '<span class="ldspark">'
+    +'<svg viewBox="0 0 '+W+' '+H+'" width="'+W+'" height="'+H+'" role="img" aria-label="download progress '+pct+'%">'
+    +'<rect x="0" y="0" width="'+W+'" height="'+H+'" rx="3" fill="#0a0e14"/>'
+    +'<rect x="'+pad+'" y="'+pad+'" width="'+IW+'" height="'+(H-2*pad)+'" rx="2" fill="#1b2733">'
+    +'<title>'+esc(remTip)+'</title></rect>'
+    +'<rect x="'+pad+'" y="'+pad+'" width="'+fw.toFixed(1)+'" height="'+(H-2*pad)+'" rx="2" fill="var(--warn)">'
+    +'<title>'+esc(doneTip)+'</title></rect>'
+    +'<text x="'+(W/2)+'" y="'+(H/2+3.5)+'" text-anchor="middle" font-size="10.5" '
+    +'fill="#e6eef7" style="pointer-events:none;font-variant-numeric:tabular-nums">'+pct+'%</text>'
+    +'</svg></span>';
+}
+function dur(sec){ sec=Math.max(0,Math.round(sec||0)); if(sec<60)return sec+'s';
+  const m=Math.floor(sec/60); if(m<60)return m+'m'+(sec%60?' '+(sec%60)+'s':'');
+  const h=Math.floor(m/60); return h+'h'+(m%60?' '+(m%60)+'m':''); }
+// #model-detail: the LIVE section (rebuilt from the fresh /status card every poll while the modal is
+// open). Loaded models get a full operational readout; not-loaded ones get the card summary (the deep
+// architecture/config info is fetched once from /api/show into a separate static section).
+function detailLive(name){
+  const m=(LAST.models||[]).find(x=>x.name===name); if(!m)return '<div class="empty">model gone</div>';
+  const cz=m.cached||{}; const now=Date.now()/1000;
+  let rows=''; const add=(k,v)=>{ if(v!=null&&v!=='') rows+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
+  add('HF id',esc(m.target)); add('arch',esc(m.arch||'')); add('status',esc(m.status));
+  add('aliases',(m.aliases||[]).map(esc).join(', '));
+  add('weights size', m.size_gb!=null?gb(m.size_gb):((m.media&&m.media.size_gb!=null)?gb(m.media.size_gb):''));
+  add('cached quants',Object.keys(cz).filter(q=>cz[q]&&cz[q].ok).map(q=>q+' '+gb(cz[q].size_gb)).join(', '));
+  let out='<table class="kv">'+rows+'</table>';
+  // #media-detail: a media model (tts/t2i/t2a) gets a media-appropriate operational block — the
+  // LLM section below (tok/s, context, KV, tokens, layers) is all zeros/meaningless for it.
+  if(m.loaded && m.media){
+    const md=m.media; let o=''; const oadd=(k,v)=>{ if(v!=null&&v!=='') o+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
+    const gen=(m.active||0)>0;
+    const KIND={tts:'Text-to-speech',t2i:'Text-to-image',t2a:'Text-to-audio (music)',t2music:'Text-to-music (MusicGen)'};
+    oadd('type',esc(KIND[md.kind]||md.kind||'media')+(md.engine?(' · '+esc(md.engine)):''));
+    oadd('state', gen?('<span style="color:var(--good)">● generating'+((m.active||0)>1?(' ×'+m.active):'')+'</span>'):'<span class="em">idle</span>');
+    if((m.queued||0)>0) oadd('queue','<span style="color:var(--warn)">'+m.queued+' waiting</span>');
+    oadd('device', md.device==='GPU'?'<span style="color:var(--good)">GPU</span>':'<span class="em">CPU</span>');
+    const _pf=n=>(n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(0)+'M':n>=1e3?(n/1e3).toFixed(0)+'K':String(n));
+    oadd('parameters', md.params?_pf(md.params):esc(m.params||''));
+    oadd('weights',gb(md.size_gb));
+    oadd('VRAM',gb(m.vram_used_gb));
+    if((m.ram_used_gb||0)>0.01) oadd('RAM',gb(m.ram_used_gb));
+    if(md.sample_rate) oadd('sample rate',(md.sample_rate/1000)+' kHz');
+    if(md.variant) oadd('variant','MusicGen '+esc(md.variant));
+    if(md.backend) oadd('backend',esc(md.backend));
+    if(md.arch) oadd('architecture',esc(md.arch));
+    if(md.codec) oadd('audio codec',esc(md.codec));
+    if(md.frame_rate) oadd('token rate',md.frame_rate+' Hz');
+    if(md.max_duration_s!=null) oadd('max clip',md.max_duration_s+'s');
+    if(md.channels) oadd('channels',md.channels===1?'mono':md.channels);
+    if(md.n_voices){
+      const vlist=(md.voices||[]);
+      oadd('voices', vlist.length
+        ? '<details><summary style="cursor:pointer;color:var(--accent)">'+md.n_voices+' available</summary><div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:5px;line-height:1.8">'+vlist.map(esc).join(' · ')+'</div></details>'
+        : md.n_voices);
+    }
+    if(md.default_voice) oadd('default voice','<span style="font-family:var(--mono)">'+esc(md.default_voice)+'</span>');
+    if(md.last_render_s!=null){
+      const spd=(md.last_audio_s>0&&md.last_render_s>0)?(md.last_audio_s/md.last_render_s):null;
+      oadd('last render',(md.last_audio_s!=null?(md.last_audio_s+'s audio '):'')+'in '+md.last_render_s+'s'+(spd!=null?(' · '+spd.toFixed(1)+'× real time'):''));
+    }
+    oadd('requests served', m.req_total!=null?m.req_total:'');
+    if(m.loaded_at_ts) oadd('uptime',dur(now-m.loaded_at_ts)+(m.load_seconds?(' · load took '+m.load_seconds+'s'):''));
+    if(m.last_used_ts) oadd('last request', gen?'now':(dur(now-m.last_used_ts)+' ago'));
+    oadd('placement basis',esc(m.plan_basis||''));
+    out+='<h3 style="font-size:13px;margin-top:14px">'+esc(KIND[md.kind]||'Media')+(gen?' · <span style="color:var(--good)">running</span>':'')+'</h3><table class="kv">'+o+'</table>';
+  } else if(m.loaded){
+    let o=''; const oadd=(k,v)=>{ if(v!=null&&v!=='') o+='<tr><td>'+k+'</td><td class="v">'+v+'</td></tr>'; };
+    const gen=(m.active||0)>0;
+    oadd('state', gen?('<span style="color:var(--good)">● generating'+((m.active||0)>1?(' ×'+m.active):'')+'</span>'):'<span class="em">idle</span>');
+    if((m.queued||0)>0) oadd('queue','<span style="color:var(--warn)">'+m.queued+' waiting</span>');
+    // honest tok/s: live while generating, else the FROZEN last-run rate (never recomputed at idle)
+    if(gen) oadd('tok/s (live)','<span style="color:var(--good)">● '+(m.tok_s||0).toFixed(1)+'</span>');
+    else if(m.last_tok_s) oadd('tok/s (last run)','<span class="em">'+(m.last_tok_s||0).toFixed(1)+' · frozen while idle</span>');
+    oadd('tok/s avg · peak','<span class="em">'+(m.ema_tok_s||0).toFixed(1)+' · '+(m.max_tok_s||0).toFixed(1)+' (lifetime)</span>');
+    oadd('quant',esc(m.quant)+(m.tp_size>1?(' · TP'+m.tp_size):' · pipeline'));
+    if(m.kv_quant&&m.kv_quant!=='none'){
+      const _kvb={turbo2:'~2-bit',turbo3:'~3-bit',turbo4:'~4-bit'}[m.kv_quant]||'';
+      oadd('<span title="TurboQuant KV-cache quantization: the KV cache (per-token memory the model accumulates) is stored at ~3–4 bits — a data-free random rotation makes the coordinates uniform, then a Lloyd-Max codebook quantizes each; on read it is un-rotated back to normal so the model\'s attention runs UNCHANGED. Effect: ~2× smaller KV cache → longer context or more co-resident models on the same VRAM. turbo4 ≈ near-lossless, turbo3 more aggressive; best on large models.">KV quant&nbsp;ⓘ</span>', esc(m.kv_quant)+(_kvb?(' · '+_kvb+' KV'):''));
+    }
+    const used=m.kv_pos||0, ctx=m.ctx||0, pctc=ctx?Math.min(100,Math.round(100*used/ctx)):0;
+    oadd('context','<b>'+used.toLocaleString()+'</b> / '+ctx.toLocaleString()+' tok'+(ctx?(' · '+pctc+'%'):'')+'<div class="miniprog"><i style="width:'+pctc+'%"></i></div>');
+    oadd('VRAM',gb(m.vram_used_gb));
+    oadd('RAM',gb(m.ram_used_gb)+(m.cpu_frac>=0.5?(' <span style="color:var(--hot)">('+Math.round(m.cpu_frac*100)+'% on CPU — slow)</span>'):(m.cpu_frac>0?(' ('+Math.round(m.cpu_frac*100)+'% CPU)'):'')));
+    oadd('KV used / reserved',gb(m.kv_used_gb)+' / '+gb(m.kv_reserved_gb));
+    oadd('layers · params',(m.num_layers||'?')+' · '+esc(m.params||'?'));
+    oadd('requests served',m.req_total!=null?m.req_total:'');
+    oadd('tokens in / out',m.tok_in_total!=null?((m.tok_in_total||0).toLocaleString()+' / '+(m.tok_out_total||0).toLocaleString()):'');
+    if(m.loaded_at_ts) oadd('uptime',dur(now-m.loaded_at_ts)+(m.load_seconds?(' · load took '+m.load_seconds+'s'):''));
+    if(m.last_used_ts) oadd('last request', gen?'now':(dur(now-m.last_used_ts)+' ago'));
+    oadd('placement basis',esc(m.plan_basis||'')+(m.speed_tier?(' · '+esc(m.speed_tier)):''));
+    // #runtime-config: live view of the sampling defaults (edited via the static form below —
+    // this row just reflects the current values each poll, so an Apply shows up immediately)
+    {const sd=m.sampling_defaults||{}, sdp=[];
+     if(m.def_temperature!=null)sdp.push('t='+esc(String(m.def_temperature)));
+     if(m.def_min_p!=null)sdp.push('min-p='+esc(String(m.def_min_p)));
+     for(const k in sd)if(sd[k]!=null)sdp.push(esc(k)+'='+esc(String(sd[k])));
+     if(sdp.length)oadd('sampling defaults',sdp.join(' · '));}
+    out+='<h3 style="font-size:13px;margin-top:14px">Operational'+(gen?' · <span style="color:var(--good)">running</span>':'')+'</h3><table class="kv">'+o+'</table>';
+  }
+  if(m.stages&&m.stages.length){
+    // #real-stats: "on GPU x of NODE-VRAM-total" — gpu_gb is the VRAM this stage MEASURED-placed
+    // (the old bare "GPU 16 GB" read as the card's capacity); the node's real total is pulled
+    // live from the nodes list so nothing about the hardware is assumed. NOTE est includes the
+    // KV reserve, so est-minus-gpu is NOT the CPU-resident weight — don't render that.
+    const _nodes=(LAST.nodes||[]);
+    out+='<h3 style="font-size:13px;margin-top:14px">Placement · '+m.stages.length+' stage'+(m.stages.length>1?'s':'')+'</h3><table class="kv">'
+      +m.stages.map(s=>{ const _n=_nodes.find(n=>n.hostname===s.hostname);
+        const cap=(_n&&_n.vram_total_gb)?(' of '+gb(_n.vram_total_gb)+' VRAM'):'';
+        const dev=(s.gpu_gb>0)?('<span style="color:var(--good)">on GPU '+gb(s.gpu_gb)+cap+'</span>')
+                              :'<span class="em">CPU</span>';
+        const role=[]; if(s.has_embed)role.push('embed'); if(s.has_head)role.push('head');
+        return '<tr><td>'+esc(s.hostname)+'</td><td class="v">L'+s.layer_start+'–'+s.layer_end+' · '+(s.num_layers||0)+'L · '+dev+(role.length?(' · '+role.join('+')):'')+' · est '+gb(s.est_gb)+'</td></tr>';
+      }).join('')+'</table>';
+  }
+  if((m.warnings||[]).length) out+='<div class="note">⚠ '+m.warnings.map(esc).join('<br>⚠ ')+'</div>';
+  return out;
+}
+function refreshDetailIfOpen(){
+  if(!DETAIL_OPEN)return;
+  const ov=$('#ov'), el=document.getElementById('dlive');
+  if(ov&&ov.classList.contains('show')&&el) el.innerHTML=detailLive(DETAIL_OPEN);
+}
+function _kvtbl(obj){ const ks=Object.keys(obj); if(!ks.length)return '';
+  return '<table class="kv">'+ks.map(k=>{ let v=obj[k]; if(v&&typeof v==='object')v=JSON.stringify(v);
+    if(typeof v==='number'&&Math.abs(v)>=1000)v=v.toLocaleString();
+    return '<tr><td>'+esc(k)+'</td><td class="v" style="word-break:break-word">'+esc(String(v))+'</td></tr>'; }).join('')+'</table>'; }
+// #model-detail: the STATIC deep section from /api/show — architecture, capabilities, and the FULL raw
+// config.json / generation_config.json (everything about the model, whether or not it's loaded).
+function renderShow(sh){
+  if(!sh)return '<div class="note">no model info</div>';
+  const mi=sh.model_info||{}, det=sh.details||{}, im=sh.LACII||{}, caps=sh.capabilities||[];
+  let out='';
+  const skip={'tokenizer.ggml.model':1,'general.file_type':1};
+  let ar=''; for(const k in mi){ if(skip[k])continue; let v=mi[k]; if(typeof v==='number'&&Math.abs(v)>=1000)v=v.toLocaleString();
+    const lbl=k.replace(/^general\./,'').replace(/\./g,' ').replace(/_/g,' '); ar+='<tr><td>'+esc(lbl)+'</td><td class="v">'+esc(String(v))+'</td></tr>'; }
+  if(ar) out+='<h3 style="font-size:13px;margin-top:14px">Architecture</h3><table class="kv">'+ar+'</table>';
+  let dr=''; const dadd=(k,v)=>{ if(v!=null&&v!=='') dr+='<tr><td>'+k+'</td><td class="v">'+esc(String(v))+'</td></tr>'; };
+  dadd('family',det.family); dadd('parameters',det.parameter_size); dadd('format',det.format);
+  dadd('on-disk dtype',im.src_dtype); dadd('native ctx',im.default_ctx?im.default_ctx.toLocaleString():'');
+  dadd('MoE',im.is_moe?'yes':''); dadd('embedding model',im.is_embedding?'yes':'');
+  if(dr) out+='<h3 style="font-size:13px;margin-top:14px">Details</h3><table class="kv">'+dr+'</table>';
+  if(caps.length) out+='<div style="margin-top:8px">capabilities: '+caps.map(c=>'<span class="chip">'+esc(c)+'</span>').join(' ')+'</div>';
+  const cfg=im.config||{}; if(Object.keys(cfg).length) out+='<details style="margin-top:12px"><summary style="cursor:pointer;font-size:13px;color:var(--accent)">raw config.json · '+Object.keys(cfg).length+' keys</summary>'+_kvtbl(cfg)+'</details>';
+  const gc=im.generation_config||{}; if(Object.keys(gc).length) out+='<details style="margin-top:8px"><summary style="cursor:pointer;font-size:13px;color:var(--accent)">generation_config.json · '+Object.keys(gc).length+' keys</summary>'+_kvtbl(gc)+'</details>';
+  if(im.engine) out+='<div style="margin-top:8px;font-size:11px;color:var(--dim)">engine '+esc(im.engine)+'</div>';
+  return out;
+}
+async function openDetail(name){
+  const m=(LAST.models||[]).find(x=>x.name===name); if(!m)return;
+  DETAIL_OPEN=name;
+  const cz=m.cached||{};
+  // precache (shard cache): compile int4/int8/int2 so future loads serve from cache instantly.
+  // int2 is explicit-build ONLY (never on first load) — NOT because the calibrated packer is
+  // missing (#38 shipped it, gptq_pack.py) but because GPTQ calibration is SEQUENTIAL (layer L
+  // needs layer L-1's quantized output) and runs hours on a big model, so nothing may kick it off
+  // behind a request. The button carries that caveat plus the measured quality scope. t2i
+  // checkpoints have no shard cache (diffusers layout — the LLM compiler can't parse them).
+  let pre='';
+  if(m.ready&&!(m.capabilities||[]).includes('t2i')){ let chips='';
+    for(const q of ['int4','int8','int2']){
+      if(cz[q]&&cz[q].ok) chips+='<span class="chip al">'+q+' cached '+gb(cz[q].size_gb)+'</span> ';
+      else chips+='<button class="btn sm ghost" '+(q==='int2'?'title="~2.5 bits/weight capacity tier, half the int4 cache size. GPTQ-calibrated (per-layer Hessian error compensation over a bundled offline corpus), NOT round-to-nearest. DENSE models only — a MoE auto-downgrades its experts to int4. Never auto-built on first load: calibration is sequential and runs hours on a big model, so you start it here deliberately (prefer an idle box — a GPU compile beside live residents has crashed one). Quality has only ever been measured at 7B and below, where int4 is strictly better; the tier exists for big dense models that cannot fit at int4. Without a valid v2 calibrated cache an int2 load refuses rather than serving uncalibrated weights." ':'')+'onclick="openCompile(\''+esc(name)+'\',\''+q+'\')">Compile '+q+'</button> ';
+    }
+    pre='<h3 style="font-size:13px;margin-top:14px">Precache (shard cache)</h3><div>'+chips+'</div>';
+  }
+  // #runtime-config: editable RUNTIME settings for a loaded model — everything changeable without
+  // a reload lives here. STATIC section (outside #dlive) so the per-poll live refresh can't clobber
+  // the inputs mid-typing. Values apply instantly via POST /model_config; the next request uses them.
+  let rt='';
+  if(m.loaded){
+    const sd=m.sampling_defaults||{};
+    const _v=x=>(x!=null)?String(x):'';
+    // #runtime-knobs: [input id, label, current value, placeholder-when-unset, suggested values
+    // (datalist dropdown — free text still allowed), tooltip]. Every knob a request can send has
+    // a runtime default here; empty input = unset (requests fall back to the built-in behavior).
+    const RTF=[
+      ['rt-temp','Temperature',_v(m.def_temperature),'unset (greedy)',['0','0.3','0.7','1','1.2','1.5'],'Default sampling temperature (0-2), used when a request does not send its own — explicit request values (including 0) always win. Empty = unset (greedy).'],
+      ['rt-minp','Min-p',_v(m.def_min_p),'unset (off)',['0.03','0.05','0.08','0.1'],'Min-p floor (0-1): drops tokens below this fraction of the top token\'s probability — confidence-adaptive; pairs with high temperature (useful band 0.05-0.1 at temp >= 1). Empty = off.'],
+      ['rt-topp','Top-p',_v(sd.top_p),'unset (1 = off)',['0.8','0.9','0.95','1'],'Nucleus sampling (0-1): keep the smallest set of top tokens whose probabilities sum to top-p, drop the tail. 1 = off.'],
+      ['rt-topk','Top-k',_v(sd.top_k),'unset (off)',['1','20','40','100'],'Keep only the k most-probable tokens (0-1000). 1 = always the single top token (deterministic at any temperature). 0 or empty = off.'],
+      ['rt-rp','Repeat penalty',_v(sd.repeat_penalty),'unset (1 = off)',['1.05','1.1','1.15','1.3'],'Penalize tokens already present in the recent window (0.5-2, llama.cpp convention: >1 discourages repetition, <1 encourages it). 1 = off.'],
+      ['rt-rln','Repeat window',_v(sd.repeat_last_n),'64 tokens',['64','256','1024','-1'],'How many recent tokens (prompt+output) the repeat penalty scans. -1 = the whole context, 0 = disable the window (penalty off). Default 64.'],
+      ['rt-pp','Presence penalty',_v(sd.presence_penalty),'unset (0 = off)',['0.5','1','1.5'],'Flat penalty on any token that has already appeared in the OUTPUT (-2 to 2, OpenAI convention; negative values encourage reuse). 0 = off.'],
+      ['rt-fp','Frequency penalty',_v(sd.frequency_penalty),'unset (0 = off)',['0.5','1','1.5'],'Penalty scaled by how OFTEN a token has appeared in the output so far (-2 to 2, OpenAI convention). 0 = off.'],
+      ['rt-seed','Seed',_v(sd.seed),'unset (random)',[],'Fix the sampling RNG: same prompt + same seed + same settings = same output every time. Empty = random per request.'],
+      ['rt-np','Max tokens',_v(sd.num_predict),'unset (256)',['256','512','1024','4096','8192'],'Default response-length cap used when a request sends no num_predict / max_tokens of its own. Explicit request values always win.']];
+    let rtf='', rtd='';
+    RTF.forEach((f,i)=>{
+      const dl='rtdl'+i;
+      if(f[4].length)rtd+='<datalist id="'+dl+'">'+f[4].map(o=>'<option value="'+o+'"></option>').join('')+'</datalist>';
+      rtf+='<div><label title="'+esc(f[5])+'">'+esc(f[1])+'</label>'
+        +'<input id="'+f[0]+'" type="number" step="any"'+(f[4].length?(' list="'+dl+'"'):'')
+        +' value="'+esc(f[2])+'" placeholder="'+esc(f[3])+'"></div>';
+    });
+    rt='<h3 style="font-size:13px;margin-top:14px">Runtime settings <span class="em" style="font-weight:normal">· sampling defaults — apply instantly, no reload; requests that send their own values always win</span></h3>'
+      +'<div class="grid2">'+rtf+'</div>'+rtd
+      +'<div style="margin-top:8px"><button class="btn sm pri" onclick="applyRt(\''+esc(name)+'\')">Apply</button> '
+      +'<span class="em" style="font-size:11px">empty = unset · each box\'s dropdown lists common values (free typing works too) · quant / ctx / KV placement still need a reload</span></div>';
+  }
+  // #tts-panel: a loaded speech-out model (capability 'tts' — Qwen2.5-Omni) gets an inline
+  // synthesize box: type text, pick a voice, POST /v1/audio/speech, play + download the WAV.
+  // STATIC (outside #dlive) so the per-poll live refresh can't wipe the textarea mid-typing.
+  let tts='';
+  if(m.loaded && (m.capabilities||[]).includes('tts')){
+    const _ist='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
+    tts='<h3 style="font-size:13px;margin-top:14px">Text-to-speech <span class="em" style="font-weight:normal">· synthesize a WAV from text via the Omni speech pipeline</span></h3>'
+      +'<textarea id="tts-text" rows="3" placeholder="Type text to speak…" style="width:100%;box-sizing:border-box;resize:vertical;'+_ist+'">Hello! This is a test of the LACII speech engine.</textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<label style="font-size:12px;color:var(--muted)">Voice</label>'
+      +'<select id="tts-voice" style="'+_ist+'"><option>Chelsie</option><option>Ethan</option></select>'
+      +'<button class="btn sm pri" onclick="ttsSpeak(\''+esc(name)+'\')">Speak ▶</button>'
+      +'<span id="tts-status" class="em" style="font-size:11px"></span></div>'
+      +'<audio id="tts-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
+      +'<div><a id="tts-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
+  }
+  // #t2i-serve: image-generation box — prompt + knobs, POST /v1/images/generations, show the
+  // PNG inline + download. STATIC (outside #dlive) so the poll can't wipe the prompt mid-typing.
+  let t2ig='';
+  if(m.loaded && (m.capabilities||[]).includes('t2i')){
+    const _ig='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
+    t2ig='<h3 style="font-size:13px;margin-top:14px">Generate image <span class="em" style="font-weight:normal">· flow-matching render on the model\'s GPU worker</span></h3>'
+      +'<textarea id="t2i-prompt" rows="3" placeholder="Describe the image…" style="width:100%;box-sizing:border-box;resize:vertical;'+_ig+'"></textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<label style="font-size:12px;color:var(--muted)">Size</label>'
+      +'<select id="t2i-size" style="'+_ig+'"><option>1024x1024</option><option>1328x1328</option><option>1664x928</option><option>928x1664</option><option>768x768</option></select>'
+      +'<label style="font-size:12px;color:var(--muted)" title="Denoising steps: 20 is the tested quality/speed default; fewer = faster, softer">Steps</label>'
+      +'<input id="t2i-steps" type="number" value="20" min="1" max="100" style="width:64px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Blank = random. Same seed + same prompt + same settings = same image">Seed</label>'
+      +'<input id="t2i-seed" type="number" placeholder="rnd" style="width:90px;'+_ig+'">'
+      +'<button class="btn sm pri" id="t2i-go" onclick="t2iGen(\''+esc(name)+'\')">Generate ▶</button>'
+      +'<span id="t2i-status" class="em" style="font-size:11px"></span></div>'
+      +'<div id="t2i-out" style="margin-top:8px"></div>';
+  }
+  // #t2a-serve: music-generation box — style/genre tags + optional lyrics + all render knobs,
+  // POST /v1/audio/music, play the WAV inline + download. STATIC (outside #dlive) so the per-poll
+  // live refresh can\'t wipe the fields mid-typing. Served from the controller (not sandboxed) so
+  // the download link works here — unlike a shared artifact.
+  let t2ag='';
+  if(m.loaded && (m.capabilities||[]).includes('t2a')){
+    const _ig='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
+    t2ag='<h3 style="font-size:13px;margin-top:14px">Generate music <span class="em" style="font-weight:normal">· ACE-Step flow-matching render on the model\'s GPU worker</span></h3>'
+      +'<textarea id="t2a-prompt" rows="2" placeholder="Style / genre tags — e.g. melodic techno, warm analog pads, driving sub-bass, 124 bpm, instrumental" style="width:100%;box-sizing:border-box;resize:vertical;'+_ig+'"></textarea>'
+      +'<textarea id="t2a-lyrics" rows="2" placeholder="[instrumental] = no vocals. Replace with your lyrics; [verse] / [chorus] tags give structure." style="width:100%;box-sizing:border-box;resize:vertical;margin-top:6px;'+_ig+'">[instrumental]</textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Clip length in seconds (3–240; ACE-Step caps at ~4 min). Longer clips develop more; short ones can loop.">Duration</label>'
+      +'<input id="t2a-dur" type="number" value="30" min="3" max="240" style="width:66px;'+_ig+'"><span class="em" style="font-size:11px;margin-left:-4px">s</span>'
+      +'<label style="font-size:12px;color:var(--muted)" title="Diffusion steps: 60 default; more = higher quality + slower, fewer = rougher">Steps</label>'
+      +'<input id="t2a-steps" type="number" value="60" min="1" max="200" style="width:60px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Guidance scale: how literally it follows the prompt (higher = more on-prompt but less varied). 12–15 typical.">Guidance</label>'
+      +'<input id="t2a-guid" type="number" value="12" step="0.5" min="0" max="30" style="width:60px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Blank = random. Same seed + prompt + settings = the same track every time.">Seed</label>'
+      +'<input id="t2a-seed" type="number" placeholder="rnd" style="width:84px;'+_ig+'">'
+      +'<button class="btn sm pri" id="t2a-go" onclick="t2aGen(\''+esc(name)+'\')">Generate ▶</button>'
+      +'<span id="t2a-status" class="em" style="font-size:11px"></span></div>'
+      +'<audio id="t2a-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
+      +'<div><a id="t2a-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
+  }
+  // #t2music-serve: MusicGen music box — text prompt + duration/guidance/temperature/top-k/seed,
+  // POST /v1/audio/music, play the WAV inline + download. STATIC (outside #dlive) so the per-poll
+  // live refresh can\'t wipe fields mid-typing. Served from the controller so the download works here.
+  let t2mg='';
+  if(m.loaded && (m.capabilities||[]).includes('t2music')){
+    const _ig='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
+    const _mv=((m.media||{}).variant||''); const _mdev=((m.media||{}).device==='GPU')?'GPU':'CPU';
+    t2mg='<h3 style="font-size:13px;margin-top:14px">Generate music <span class="em" style="font-weight:normal">· MusicGen '+esc(_mv)+' — autoregressive render on '+_mdev+'</span></h3>'
+      +'<textarea id="t2m-prompt" rows="2" placeholder="Describe the music — e.g. upbeat 80s synthwave, driving drums, warm analog bass, bright arpeggiated lead" style="width:100%;box-sizing:border-box;resize:vertical;'+_ig+'"></textarea>'
+      +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Clip length in seconds. MusicGen is trained ~10–30 s and HARD-caps near '+(((m.media||{}).max_duration_s)||40)+' s (its decoder position table); longer just extends and can drift.">Duration</label>'
+      +'<input id="t2m-dur" type="number" value="12" min="1" max="'+(((m.media||{}).max_duration_s)||40)+'" style="width:60px;'+_ig+'"><span class="em" style="font-size:11px;margin-left:-4px">s</span>'
+      +'<label style="font-size:12px;color:var(--muted)" title="Classifier-free guidance: how strongly it follows the prompt. 3 is the MusicGen default; higher = more on-prompt, less varied.">Guidance</label>'
+      +'<input id="t2m-guid" type="number" value="3" step="0.5" min="1" max="10" style="width:56px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Sampling temperature: higher = more varied, lower = more deterministic. 1.0 default.">Temp</label>'
+      +'<input id="t2m-temp" type="number" value="1.0" step="0.05" min="0.1" max="2" style="width:56px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Top-k sampling: consider the k most-likely tokens each step. 250 default.">Top-k</label>'
+      +'<input id="t2m-topk" type="number" value="250" min="0" max="1000" style="width:64px;'+_ig+'">'
+      +'<label style="font-size:12px;color:var(--muted)" title="Blank = random. Same seed + prompt + settings = the same track every time.">Seed</label>'
+      +'<input id="t2m-seed" type="number" placeholder="rnd" style="width:80px;'+_ig+'">'
+      +'<button class="btn sm pri" id="t2m-go" onclick="t2mGen(\''+esc(name)+'\')">Generate ▶</button>'
+      +'<span id="t2m-status" class="em" style="font-size:11px"></span></div>'
+      +'<audio id="t2m-audio" controls style="width:100%;margin-top:8px;display:none"></audio>'
+      +'<div><a id="t2m-dl" style="display:none;font-size:11px;color:var(--accent)" download>⬇ download wav</a></div>';
+  }
+  // #persist / #no-unload: per-model lifecycle pins (work for loaded AND not-loaded models — the
+  // controller reports current state via LAST.controller.{persist_models,no_unload_models}).
+  const _pc=(LAST&&LAST.controller)||{}, _pk=m.internal_name||m.friendly||name;
+  const _isP=!!m.persist||(_pc.persist_models||[]).includes(_pk);
+  const _isNU=!!m.no_unload||(_pc.no_unload_models||[]).includes(_pk);
+  const pers='<h3 style="font-size:13px;margin-top:14px">Persistence</h3>'
+    +'<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0;color:var(--text);cursor:pointer" title="Auto-reload this model when the controller restarts or redeploys — it re-streams to the workers after the fleet settles. Independent of the unload pin below.">'
+    +'<input type="checkbox" style="width:auto"'+(_isP?' checked':'')+' onchange="setPin(\''+esc(name)+'\',\'persist\',this.checked)"> Autoload on restart</label>'
+    +'<label style="display:flex;align-items:center;gap:8px;font-size:13px;margin:6px 0;color:var(--text);cursor:pointer" title="NEVER auto-unload this model — overrides every automatic REMOVAL: idle-unload and LRU eviction to free room for a new load (that new load FAILS instead of evicting this one). The juggler may still RELOAD it to promote it to a faster VRAM-only placement — a promotion, not a removal, so it is never left unloaded. This is the flag that wins.">'
+    +'<input type="checkbox" style="width:auto"'+(_isNU?' checked':'')+' onchange="setPin(\''+esc(name)+'\',\'no_unload\',this.checked)"> Do not auto-unload</label>';
+  let acts='';
+  const _isT2i=(m.capabilities||[]).includes('t2i');
+  const _isT2a=(m.capabilities||[]).includes('t2a');
+  const _isT2m=(m.capabilities||[]).includes('t2music');
+  if(m.loaded&&(_isT2i||_isT2a||_isT2m)) acts=unloadBtn(name);
+  else if(m.loaded) acts='<button class="btn sm pri" onclick="location.href=\'/chat?model='+encodeURIComponent(name)+'\'">Chat ↗</button> '
+    +unloadBtn(name)+' '
+    +'<button class="btn sm ghost" onclick="openHistory(\''+esc(name)+'\')">View context ▾</button> '
+    +'<button class="btn sm ghost" onclick="reconf(\''+esc(name)+'\')">Reconfigure…</button>';
+  else if(_isT2i) acts='<button class="btn sm pri" onclick="t2iLoadDlg(\''+esc(name)+'\')">Load 🖼</button> '
+    +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
+    +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
+  else if(_isT2a) acts='<button class="btn sm pri" onclick="t2aLoadDlg(\''+esc(name)+'\')">Load 🎵</button> '
+    +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
+    +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
+  else if(_isT2m) acts='<button class="btn sm pri" onclick="t2mLoadDlg(\''+esc(name)+'\')">Load 🎵</button> '
+    +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
+    +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
+  else acts='<button class="btn sm pri" onclick="closeOv();openLoad(\''+esc(name)+'\')">Load…</button> '
+    +'<button class="btn sm ghost" onclick="forget(\''+esc(name)+'\')">Forget</button> '
+    +'<button class="btn sm ghost" onclick="del(\''+esc(name)+'\')">Delete</button>';
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(name)+'</h3>'
+    +'<div id="dlive">'+detailLive(name)+'</div>'+rt+t2ig+t2ag+t2mg+tts+pre+pers
+    +'<div id="mi_more"><div class="empty">loading full model info…</div></div>'
+    +'<div style="margin-top:16px">'+acts+'</div>';
+  $('#ov').classList.add('show');
+  try{ const sh=await api('/api/show',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:name})});
+       const el=document.getElementById('mi_more'); if(el&&DETAIL_OPEN===name) el.innerHTML='<h3 style="font-size:13px;margin-top:14px">Model info</h3>'+renderShow(sh);
+  }catch(e){ const el=document.getElementById('mi_more'); if(el) el.innerHTML='<div class="note">full model info unavailable: '+esc(String(e.message||e))+'</div>'; }
+}
+// #runtime-config: push the detail modal's runtime-settings inputs to the controller. The UI always
+// sends EVERY field; an EMPTY input clears that default back to unset. Applies to all replicas.
+async function applyRt(name){
+  const F={temperature:'rt-temp',min_p:'rt-minp',top_p:'rt-topp',top_k:'rt-topk',
+           repeat_penalty:'rt-rp',repeat_last_n:'rt-rln',presence_penalty:'rt-pp',
+           frequency_penalty:'rt-fp',seed:'rt-seed',num_predict:'rt-np'};
+  const q=new URLSearchParams({model:name});
+  for(const k in F){ const el=$('#'+F[k]); q.set(k, el?el.value:''); }
+  try{ const r=await api('/model_config?'+q.toString(),{method:'POST'});
+       const d=r.defaults||{}, ks=Object.keys(d);
+       toast('runtime settings applied · '+(ks.length?ks.map(k=>k+'='+d[k]).join(' · '):'all unset'));
+       tick(); }
+  catch(e){ toast(String(e.message||e),1); }
+}
+// #t2i-serve: load an image model (no dialog — the load path picks the gate-tested recipe
+// itself). /load blocks for the whole multi-minute build, so fire it WITHOUT awaiting: the
+// loading card appears via the status poll, exactly like the LLM load dialog's pattern.
+// #t2i-load-dlg: the Load 🖼 CONFIRM dialog — a t2i load is heavyweight (needs ~14-17 GB on the
+// controller-co-located GPU and auto-evicts idle residents to get it), so it deserves the same
+// deliberate step other loads get, and a FAILURE must be a dialog the user actually sees (the
+// old fire-and-forget toast was missed live: the load failed "nothing evictable" invisibly).
+// #t2i-load-dlg v2: a REAL form (placement + precision), not two opaque buttons. Every
+// option maps to a supported /load param — quant (int4 mixed-edge | none=bf16) and
+// t2i_offload — so nothing is "magic". t2i v1 runs the WHOLE pipeline on one
+// controller-co-located GPU (no fleet split), so there is no distributed/TP option here;
+// the note says so explicitly rather than leaving it a mysterious omission.
+function t2iLoadDlg(name){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🖼 '+esc(name)+'</h3>'
+    +'<div class="note" style="margin-top:8px">The image pipeline runs <b>whole on one GPU</b> — it is not split across the fleet like an LLM, so there is no distributed / tensor-parallel option. Since <code>#media-anywhere</code> that GPU no longer has to share the controller box: any node advertising <code>can_t2i</code> can run it and returns the PNG over the control link. Text encoder runs on that node\'s CPU, VAE decodes tiled. Choose how the DiT weights sit on the GPU:</div>'
+    +'<label style="margin-top:10px">Placement</label>'
+    +'<select id="t-place" onchange="_t2iPlaceChg()">'
+    +'<option value="auto">Auto — GPU int4, spill to CPU if it won\'t fit (recommended)</option>'
+    +'<option value="gpu">GPU-resident — weights stay on the GPU</option>'
+    +'<option value="offload">CPU offload — weights in RAM, streamed to the GPU</option>'
+    +'</select>'
+    +'<div id="t-precwrap" style="display:none;margin-top:8px"><label>Precision</label>'
+    +'<select id="t-prec">'
+    +'<option value="int4">int4 mixed-edge (~13.5 GB — first+last blocks bf16 ≈ bf16 quality)</option>'
+    +'<option value="none">bf16 full (~41 GB — needs a big-VRAM / unified-memory card)</option>'
+    +'</select></div>'
+    +_mediaNodeSel('can_t2i','Which machine runs it')
+    +'<div id="t-note" class="note" style="margin-top:10px"></div>'
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="loadT2i(\''+esc(name)+'\')">Load 🖼</button> '
+    +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
+  $('#ov').classList.add('show');
+  _t2iPlaceChg();
+}
+// Show the precision picker only for a GPU-resident load, and explain the current choice.
+function _t2iPlaceChg(){
+  var v=$('#t-place')?$('#t-place').value:'auto';
+  var pw=$('#t-precwrap'); if(pw) pw.style.display=(v==='gpu')?'block':'none';
+  var n=$('#t-note'); if(!n) return;
+  if(v==='auto') n.innerHTML='Tries <b>int4 on the GPU</b> (~14–17 GB free VRAM; idle models auto-evict, active ones never do). If it can\'t fit there, it <b>automatically spills to CPU offload</b> — DiT bf16 in RAM (~47 GB), only ~4 GB VRAM, nothing evicted. Fast when there is room, always loads.';
+  else if(v==='gpu') n.innerHTML='Weights live on the GPU — fastest renders. <b>int4</b> needs ~14–17 GB free VRAM; <b>bf16</b> needs ~41 GB (om3nbox-class unified memory). Idle residents auto-evict to make room; a model actively serving is never evicted — if it holds the card the load fails with the reason shown.';
+  else n.innerHTML='DiT rests <b>bf16 in system RAM</b> (~47 GB) and blocks stream to the GPU each step — needs only <b>~4 GB VRAM</b>, <b>NEVER evicts</b> anything, ~2–3× slower per step. The safe choice on a tight or busy card (e.g. beast\'s 16 GB).';
+}
+// #t2a-serve: the Load 🎵 dialog. Offload is RECOMMENDED — the DiT rests in RAM and streams to the
+// GPU per render, so a multi-minute clip's activations don't OOM a tight card beside other residents
+// (GPU-resident holds ~8 GB and long clips can OOM on a 16 GB card).
+function t2aLoadDlg(name){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🎵 '+esc(name)+'</h3>'
+    +'<div class="note" style="margin-top:8px">Loads the ACE-Step music pipeline (DiT + VAE + text encoder, ~8 GB bf16) onto <b>any</b> GPU node advertising <code>can_t2a</code> — it no longer has to be the box running the controller. Then open its card to generate music.</div>'
+    +'<div class="note" style="margin-top:8px"><b>Offloaded (recommended)</b>: components rest in system RAM and the DiT streams to the GPU per render — ~0 GB resident, leaves headroom for long-clip activations, never evicts residents.</div>'
+    +'<div class="note" style="margin-top:8px"><b>GPU-resident</b>: the whole pipeline stays on the GPU (~8 GB) — quicker to start each render, but long (multi-minute) clips can OOM on a 16 GB card beside other residents.</div>'
+    +_mediaNodeSel('can_t2a','Which machine runs it')
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="loadT2a(\''+esc(name)+'\',1)">Load 🎵 offloaded</button> '
+    +'<button class="btn sm" onclick="loadT2a(\''+esc(name)+'\')">Load 🎵 GPU-resident</button> '
+    +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
+  $('#ov').classList.add('show');
+}
+function loadT2a(name,off){
+  // Read the node picker BEFORE closing the dialog — closeOv() tears the modal out of the DOM, so
+  // #m-node is gone by the time the request is built. (The buttons used to call closeOv() inline.)
+  const nq=_mediaNodeQS(); closeOv();
+  toast('loading music pipeline for '+name+(off?' (offloaded — components in RAM)':'')
+        +(nq?(' on '+decodeURIComponent(nq.slice(6))):'')+' — up to a minute…');
+  api('/load?model='+encodeURIComponent(name)+(off?'&t2i_offload=1':'')+nq,{method:'POST'})
+    .then(()=>{toast(name+' ready — open its card to generate');tick();})
+    .catch(e=>errDlg('music pipeline load failed',String(e.message||e)));
+  tick();
+}
+// #t2music-serve: the Load 🎵 dialog — MusicGen has no offload/GPU-resident choice (small
+// autoregressive net), so this is an informational confirm that sets expectations (autoregressive
+// render time scales with clip length; the FIRST render warms the EnCodec decoder once).
+function t2mLoadDlg(name){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Load 🎵 '+esc(name)+'</h3>'
+    +'<div class="note" style="margin-top:8px">Loads the <b>MusicGen</b> pipeline (text encoder + audio-token transformer + EnCodec decoder) onto a capable GPU — or CPU if that\'s all there is. It\'s autoregressive (~50 audio tokens/sec), so render time scales with clip length.</div>'
+    +'<div class="note" style="margin-top:8px"><b>The first render warms the EnCodec decoder once.</b> On an AMD gfx1151 GPU that\'s a one-time MIOpen compile (~a minute); every render after is fast. NVIDIA is fast immediately; CPU runs but is much slower.</div>'
+    +'<div class="note" style="margin-top:8px">When it\'s ready, open its card and use the <b>Generate music</b> panel — prompt + duration / guidance / temperature / top-k / seed, with an inline player and a WAV download.</div>'
+    +_mediaNodeSel('can_t2music','Which machine runs it')
+    +'<div style="margin-top:14px"><button class="btn sm pri" onclick="loadT2music(\''+esc(name)+'\')">Load 🎵</button> '
+    +'<button class="btn sm ghost" onclick="closeOv()">Cancel</button></div>';
+  $('#ov').classList.add('show');
+}
+// #t2music-serve: load a MusicGen model (no offload dance — small autoregressive net). The FIRST
+// render also JIT-warms the EnCodec audio decoder once (esp. on ROCm/gfx1151), then renders are fast.
+function loadT2music(name){
+  const nq=_mediaNodeQS(); closeOv();   // read the picker before the modal is torn down
+  toast('loading MusicGen '+name+(nq?(' on '+decodeURIComponent(nq.slice(6))):'')
+        +' — the first render also warms the audio decoder (one-time)…');
+  api('/load?model='+encodeURIComponent(name)+nq,{method:'POST'})
+    .then(()=>{toast(name+' ready — open its card to generate music');tick();})
+    .catch(e=>errDlg('MusicGen load failed',String(e.message||e)));
+  tick();
+}
+function errDlg(title,msg){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>'+esc(title)+'</h3>'
+    +'<div class="note" style="margin-top:8px">'+esc(msg)+'</div>'
+    +'<div style="margin-top:12px"><button class="btn sm" onclick="closeOv()">OK</button></div>';
+  $('#ov').classList.add('show');
+}
+// Fire one t2i load with an explicit query string, surfacing failures in a dialog the user sees.
+function _t2iFire(name,qs,label){
+  toast('loading image pipeline for '+name+(label||'')+' — a few minutes…');
+  api('/load?model='+encodeURIComponent(name)+qs,{method:'POST'})
+    .then(()=>{toast(name+' ready — open its card to generate');tick();})
+    .catch(e=>errDlg('image pipeline load failed',String(e.message||e)));
+  tick();
+}
+// Read the load dialog and dispatch. Auto = GPU int4, and on a capacity/eviction failure
+// (nothing evictable / not enough co-located VRAM) AUTO-SPILL to CPU offload — the
+// "GPU by default, spill to CPU as needed" behavior, done transparently with a toast.
+function loadT2i(name){
+  var place=$('#t-place')?$('#t-place').value:'auto';
+  var prec=$('#t-prec')?$('#t-prec').value:'int4';
+  var nq=_mediaNodeQS();          // read the picker BEFORE closeOv() tears the modal out
+  closeOv();
+  if(place==='offload'){ _t2iFire(name,'&t2i_offload=1'+nq,' (CPU offload — DiT in RAM)'); return; }
+  if(place==='gpu'){ _t2iFire(name,'&quant='+encodeURIComponent(prec)+nq,
+      prec==='none'?' (GPU-resident bf16)':' (GPU-resident int4)'); return; }
+  toast('loading '+name+' — GPU int4, will spill to CPU offload if it won\'t fit…');
+  api('/load?model='+encodeURIComponent(name)+'&quant=int4'+nq,{method:'POST'})
+    .then(()=>{toast(name+' ready on GPU (int4)');tick();})
+    .catch(e=>{ var msg=String(e.message||e);
+      if(/vram|evict|co-located gpu|no room|nothing/i.test(msg.toLowerCase())){
+        // The auto-spill keeps the SAME node pin — spilling to RAM is a placement-within-node
+        // decision, so silently relocating to a different machine would contradict the pick.
+        toast('GPU full — spilling to CPU offload…');
+        api('/load?model='+encodeURIComponent(name)+'&t2i_offload=1'+nq,{method:'POST'})
+          .then(()=>{toast(name+' ready (CPU offload — spilled)');tick();})
+          .catch(e2=>errDlg('image pipeline load failed',String(e2.message||e2)));
+      } else { errDlg('image pipeline load failed',msg); }
+      tick();
+    });
+  tick();
+}
+// #t2i-serve: render from the detail modal. Long await (a render is minutes) with a live
+// elapsed timer; while it runs the card's status poll shows the worker's step i/n too.
+async function t2iGen(name){
+  const p=($('#t2i-prompt').value||'').trim(); if(!p){toast('type a prompt',1);return;}
+  const sz=($('#t2i-size').value||'1024x1024');
+  const steps=parseInt($('#t2i-steps').value||'20')||20;
+  const seed=($('#t2i-seed').value||'').trim();
+  const btn=$('#t2i-go'), st=$('#t2i-status'), out=$('#t2i-out');
+  btn.disabled=true; const t0=Date.now();
+  const tick_=setInterval(()=>{ if(st){ const m=(LAST.models||[]).find(x=>x.name===name)||{};
+    st.textContent='rendering… '+Math.round((Date.now()-t0)/1000)+'s'
+      +(m.t2i_step?(' · step '+m.t2i_step+'/'+(m.t2i_total||'?')):''); } },1000);
+  try{
+    const body={model:name,prompt:p,size:sz,steps:steps};
+    if(seed!=='')body.seed=parseInt(seed);
+    const r=await fetch('/v1/images/generations',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!r.ok) throw new Error((j.error&&j.error.message)||('HTTP '+r.status));
+    const b64=j.data&&j.data[0]&&j.data[0].b64_json; if(!b64) throw new Error('empty response');
+    const src='data:image/png;base64,'+b64;
+    out.innerHTML='<img src="'+src+'" style="max-width:100%;border-radius:10px;border:1px solid var(--border)">'
+      +'<div><a href="'+src+'" download="'+esc(name)+'_'+Date.now()+'.png" '
+      +'style="font-size:11px;color:var(--accent)">⬇ download png</a>'
+      +'<span class="em" style="font-size:11px;margin-left:8px">'
+      +Math.round((Date.now()-t0)/1000)+'s · '+esc(sz)+' · '+steps+' steps</span></div>';
+    st.textContent='';
+  }catch(e){ st.textContent=''; toast(String(e.message||e),1); }
+  finally{ clearInterval(tick_); btn.disabled=false; }
+}
+// #t2a-serve: render music from the detail modal. Raw fetch (NOT api()) — /v1/audio/music returns
+// binary WAV; read it as a blob, play it, and offer a working download (object URL revoked on the
+// next run so repeats don\'t leak). Errors (503 load/capacity, 400 no prompt) arrive as a JSON body
+// even on this binary endpoint, so decode + surface them. A live step i/n rides the status poll.
+async function t2aGen(name){
+  const p=($('#t2a-prompt').value||'').trim(); if(!p){ toast('enter style / genre tags',1); return; }
+  const lyrics=($('#t2a-lyrics').value||'').trim();
+  const durS=parseInt($('#t2a-dur').value||'30')||30;
+  const steps=parseInt($('#t2a-steps').value||'60')||60;
+  const guid=parseFloat($('#t2a-guid').value||'12'); const seed=($('#t2a-seed').value||'').trim();
+  const btn=$('#t2a-go'), st=$('#t2a-status'), au=$('#t2a-audio'), dl=$('#t2a-dl');
+  btn.disabled=true; const t0=Date.now();
+  const tick_=setInterval(()=>{ if(st){ const m=(LAST.models||[]).find(x=>x.name===name)||{};
+    st.textContent='rendering '+durS+'s… '+Math.round((Date.now()-t0)/1000)+'s'
+      +(m.t2a_step?(' · step '+m.t2a_step+'/'+(m.t2a_total||'?')):''); } },1000);
+  try{
+    const body={model:name,prompt:p,duration:durS,steps:steps,guidance:guid,response_format:'wav'};
+    if(lyrics!=='')body.lyrics=lyrics;
+    if(seed!=='')body.seed=parseInt(seed);
+    const r=await fetch('/v1/audio/music',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){ let msg='HTTP '+r.status; try{ const j=await r.json(); msg=(j.error&&j.error.message)||j.error||msg; }catch(e){} throw new Error(msg); }
+    const blob=await r.blob();
+    if(au._url)URL.revokeObjectURL(au._url);
+    const url=URL.createObjectURL(blob); au._url=url;
+    au.src=url; au.style.display='block'; au.play().catch(()=>{});
+    dl.href=url; dl.download=name.replace(/[^a-z0-9]+/gi,'_')+'_'+durS+'s_'+Date.now()+'.wav'; dl.style.display='inline';
+    st.textContent='done · '+durS+'s · '+(blob.size/1e6).toFixed(1)+' MB · rendered in '+((Date.now()-t0)/1000).toFixed(1)+'s';
+  }catch(e){ st.textContent=''; toast(String(e.message||e),1); }
+  finally{ clearInterval(tick_); btn.disabled=false; }
+}
+// #t2music-serve: render music from the detail modal via MusicGen. Raw fetch (NOT api()) —
+// /v1/audio/music returns binary WAV; read it as a blob, play it, offer a working download.
+async function t2mGen(name){
+  const p=($('#t2m-prompt').value||'').trim(); if(!p){ toast('describe the music first',1); return; }
+  const durS=parseInt($('#t2m-dur').value||'12')||12;
+  const guid=parseFloat($('#t2m-guid').value||'3'); const temp=parseFloat($('#t2m-temp').value||'1.0');
+  const topk=parseInt($('#t2m-topk').value||'250'); const seed=($('#t2m-seed').value||'').trim();
+  const btn=$('#t2m-go'), st=$('#t2m-status'), au=$('#t2m-audio'), dl=$('#t2m-dl');
+  btn.disabled=true; const t0=Date.now();
+  const tick_=setInterval(()=>{ if(st){ const m=(LAST.models||[]).find(x=>x.name===name)||{};
+    st.textContent='generating '+durS+'s… '+Math.round((Date.now()-t0)/1000)+'s'
+      +(m.t2music_step?(' · '+Math.round(100*m.t2music_step/(m.t2music_total||1))+'%'):''); } },1000);
+  try{
+    const body={model:name,prompt:p,duration:durS,guidance:guid,temperature:temp,top_k:topk,response_format:'wav'};
+    if(seed!=='')body.seed=parseInt(seed);
+    const r=await fetch('/v1/audio/music',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!r.ok){ let msg='HTTP '+r.status; try{ const j=await r.json(); msg=(j.error&&j.error.message)||j.error||msg; }catch(e){} throw new Error(msg); }
+    const blob=await r.blob();
+    if(au._url)URL.revokeObjectURL(au._url);
+    const url=URL.createObjectURL(blob); au._url=url;
+    au.src=url; au.style.display='block'; au.play().catch(()=>{});
+    dl.href=url; dl.download=name.replace(/[^a-z0-9]+/gi,'_')+'_'+durS+'s_'+Date.now()+'.wav'; dl.style.display='inline';
+    st.textContent='done · '+durS+'s · '+(blob.size/1e6).toFixed(1)+' MB · generated in '+((Date.now()-t0)/1000).toFixed(1)+'s';
+  }catch(e){ st.textContent=''; toast(String(e.message||e),1); }
+  finally{ clearInterval(tick_); btn.disabled=false; }
+}
+// #tts-panel: synthesize speech from the detail modal. Raw fetch (NOT api(), which parses JSON) —
+// /v1/audio/speech returns binary audio; read it as a blob, play it, and offer a download. Object
+// URLs are revoked on the next synth so repeated runs don't leak. Errors (503 load/capacity, 400
+// empty input) come back as a JSON body even on this binary endpoint, so decode + surface them.
+async function ttsSpeak(name){
+  const t=$('#tts-text'), st=$('#tts-status'), au=$('#tts-audio'), dl=$('#tts-dl');
+  const text=(t&&t.value||'').trim(), voice=($('#tts-voice')||{}).value||'Chelsie';
+  if(!text){ if(st)st.textContent='enter some text first'; return; }
+  if(st)st.textContent='synthesizing…'; const t0=Date.now();
+  try{
+    const r=await fetch('/v1/audio/speech',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:name,input:text,voice:voice,response_format:'wav'})});
+    if(!r.ok){ let msg='HTTP '+r.status; try{ const j=await r.json(); msg=(j.error&&j.error.message)||j.error||msg; }catch(e){} throw new Error(msg); }
+    const blob=await r.blob();
+    if(au._url)URL.revokeObjectURL(au._url);
+    const url=URL.createObjectURL(blob); au._url=url;
+    au.src=url; au.style.display='block'; au.play().catch(()=>{});
+    dl.href=url; dl.download=name.replace(/[^a-z0-9]+/gi,'_')+'.wav'; dl.style.display='inline';
+    if(st)st.textContent='done · '+Math.round(blob.size/1024)+' KB · '+((Date.now()-t0)/1000).toFixed(1)+'s';
+  }catch(e){ if(st)st.textContent='error: '+(e.message||e); }
+}
+// Context viewer: one scrollable popup showing the IN/OUT flow of recent requests (newest first).
+// History is kept only while the model is resident (cleared on unload).
+async function openHistory(name){
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Context · '+esc(name)+'</h3><div class="empty">loading…</div>';
+  $('#ov').classList.add('show');
+  let d; try{ d=await api('/history?model='+encodeURIComponent(name)+'&dir=both'); }
+  catch(e){ $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Context · '+esc(name)+'</h3><div class="note">'+esc(String(e.message||e))+'</div>'; return; }
+  const es=d.entries||[];
+  const head='<span class="x" onclick="closeOv()">×</span><h3>Context · '+esc(name)+'</h3>'
+    +'<div style="font-size:12px;color:var(--dim);margin-bottom:8px">'+es.length+' of '+(d.count||0)+' captured · lifetime '+(d.tok_in_total||0)+' in / '+(d.tok_out_total||0)+' out tokens · newest first '
+    +'<button class="btn sm ghost" style="float:right" onclick="openDetail(\''+esc(name)+'\')">← back</button></div>';
+  if(!es.length){ $('#modal').innerHTML=head+'<div class="empty">no requests captured yet — generate something, then reopen</div>'; return; }
+  const blk=es.map(e=>{
+    const t=e.ts?new Date(e.ts*1000).toLocaleTimeString():'';
+    return '<div style="border:1px solid var(--border);border-radius:8px;padding:8px;margin-bottom:8px">'
+      +'<div style="font-size:11px;color:var(--dim);margin-bottom:4px">'+t+' · '+(e.tok_in||0)+' in → '+(e.tok_out||0)+' out</div>'
+      +'<div style="font-size:11px;color:var(--accent)">IN</div><pre style="white-space:pre-wrap;word-break:break-word;margin:2px 0;padding:6px;background:var(--bg);border-radius:6px;font-size:11px;max-height:220px;overflow:auto">'+esc(e.input||'')+'</pre>'
+      +'<div style="font-size:11px;color:var(--good);margin-top:4px">OUT</div><pre style="white-space:pre-wrap;word-break:break-word;margin:2px 0;padding:6px;background:var(--bg);border-radius:6px;font-size:11px;max-height:220px;overflow:auto">'+esc(e.output||'')+'</pre></div>';
+  }).join('');
+  $('#modal').innerHTML=head+'<div style="max-height:60vh;overflow:auto">'+blk+'</div>';
+}
+// #compile-picker: choose WHERE a shard-cache compile runs. /compile_shards packs on the
+// CONTROLLER (a small controller VM can OOM on a big checkpoint); /compile_dist fans one
+// layer-pack per worker across the fleet and is far faster — the packed bytes are identical
+// either way (the workers use the same shared packer). int2 is GPTQ-calibrated + sequential
+// (layer L needs layer L-1's quantized output) so it can ONLY build locally.
+// #media-node-pick: the media leaves (t2a/t2i/tts/stt/t2music) each run WHOLE on one node, and
+// since #media-pin the loader honours `node=` for all five — but the dialogs never offered the
+// choice, so placement was always whatever the heuristic picked. Build the option list from the
+// nodes that actually advertise the runtime, so a machine that cannot serve it is never offered.
+// `cap` is the capability flag ('can_t2a', 'can_t2i', 'can_tts', 'can_stt', 'can_t2music').
+function _mediaNodeOpts(cap){
+  const ns=(LAST&&LAST.nodes||[]).filter(n=>n.alive&&n[cap]).slice()
+    .sort((a,b)=>(b.usable_vram_gb||0)-(a.usable_vram_gb||0)
+                 ||String(a.hostname).localeCompare(String(b.hostname)));
+  if(!ns.length)return '';
+  return ns.map(n=>'<option value="'+esc(n.hostname)+'">'+esc(n.hostname)+' — '
+    +(n.has_gpu?(fmt(n.usable_vram_gb)+' GB VRAM'):'CPU only')
+    +(n.vram_used_gb?(' ('+fmt(n.vram_used_gb)+' GB in use)'):'')+'</option>').join('');
+}
+// The <select> itself, plus a note when nothing capable is connected. Default stays "Auto" so the
+// existing behaviour is unchanged for anyone who does not care where it lands.
+function _mediaNodeSel(cap,label){
+  const opts=_mediaNodeOpts(cap);
+  if(!opts)return '<div class="note" style="margin-top:8px">No connected node advertises <code>'
+    +esc(cap)+'</code>, so this cannot be placed anywhere right now.</div>';
+  return '<div style="margin-top:12px"><label>'+esc(label||'Which machine')+'</label>'
+    +'<select id="m-node"><option value="">Auto — let the controller choose</option>'+opts+'</select></div>';
+}
+// Read it back; '' means auto (send no node= at all, preserving the old behaviour exactly).
+function _mediaNodeQS(){
+  const el=$('#m-node'); const v=el?el.value:'';
+  return v?('&node='+encodeURIComponent(v)):'';
+}
+function _compileNodeOpts(){
+  const ns=(LAST&&LAST.nodes||[]).filter(n=>n.alive&&n.can_infer).slice()
+    .sort((a,b)=>(b.free_mem_gb||0)-(a.free_mem_gb||0));
+  return ns.map(n=>'<option value="dist:'+esc(n.hostname)+'">'+esc(n.hostname)+' — '
+    +fmt(n.free_mem_gb)+' GB RAM free</option>').join('');
+}
+function openCompile(name,quant){
+  const two=(quant==='int2');
+  $('#modal').innerHTML='<span class="x" onclick="closeOv()">×</span><h3>Compile '+esc(quant)+' cache — '+esc(name)+'</h3>'
+   +'<p style="font-size:12px;color:var(--muted);margin:6px 0 10px">Pre-quantizes the model ONCE so every future load serves the small '+esc(quant)+' shards instead of streaming full bf16. The packed result is bit-identical whichever machine does the work.</p>'
+   +'<label>Where to compile</label><select id="c-where"'+(two?' disabled':'')+'>'
+   +(two?'':'<option value="dist:">Auto — whole fleet (parallel, recommended)</option>')
+   +'<option value="local:">This controller only (single box)</option>'
+   +(two?'':'<optgroup label="One specific node">'+_compileNodeOpts()+'</optgroup>')
+   +'</select>'
+   +'<p style="font-size:12px;color:var(--muted);margin-top:8px">'
+   +(two?'int2 is GPTQ-calibrated and sequential — layer L needs layer L-1\'s quantized output — so it can only be built locally on the controller.'
+        :'Auto fans one layer-pack per worker across the fleet: fastest, and it keeps the heavy packing OFF this controller. Pick a single node to confine the work to one machine. Embed/head are always packed locally.')
+   +'</p>'
+   +'<div style="margin-top:14px"><button class="btn" onclick="runCompile(\''+esc(name)+'\',\''+esc(quant)+'\')">Compile</button> '
+   +'<button class="btn ghost" onclick="closeOv()">Cancel</button></div>';
+  $('#ov').classList.add('show');
+}
+async function runCompile(name,quant){
+  const sel=$('#c-where');                      // READ before closeOv() wipes the modal
+  const w=(sel&&sel.value)||(quant==='int2'?'local:':'dist:');
+  const dist=(w.indexOf('dist:')===0), host=w.slice(w.indexOf(':')+1);
+  closeOv();
+  toast('compiling '+quant+' cache for '+name+(dist?(host?' on '+host:' across the fleet'):' on this controller')+'…');
+  tick();
+  try{
+    // /compile_dist returns as soon as the fan-out starts (progress shows on the model card);
+    // /compile_shards BLOCKS until the cache is written.
+    await api(dist?('/compile_dist?model='+encodeURIComponent(name)+'&quant='+quant+(host?'&node='+encodeURIComponent(host):''))
+                  :('/compile_shards?model='+encodeURIComponent(name)+'&quant='+quant),{method:'POST'});
+    toast(dist?(quant+' compile started for '+name+' — progress on the model card')
+              :(quant+' cache for '+name+' done'));
+  }catch(e){ toast(String(e.message||e),1); }
+  tick();
+}
+async function upgradePlacement(name){ closeOv(); toast('re-placing '+name+' faster…'); tick(); try{ const r=await api('/load_faster?model='+encodeURIComponent(name),{method:'POST'}); toast(name+' → '+((r&&r.to)||'faster placement')+(r&&r.forced?' (in-flight reply cut off)':'')); }catch(e){ toast(String(e.message||e),1);} tick(); }
+async function forget(name){ if(!confirm('Forget '+name+'? (keeps weight files)'))return; closeOv(); try{ await api('/forget?model='+encodeURIComponent(name),{method:'POST'}); toast('forgot '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
+async function del(name){ if(!confirm('DELETE '+name+' and its weight files?'))return; closeOv(); toast('deleting '+name+'…'); try{ await api('/delete?model='+encodeURIComponent(name),{method:'POST'}); toast('deleted '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
+async function reconf(name){ const tp=prompt('Reconfigure '+name+' — tp size (1=pipeline):','1'); if(tp==null)return;
+  closeOv(); toast('reconfiguring '+name+'…'); try{ await api('/reconfigure?model='+encodeURIComponent(name)+'&tp='+encodeURIComponent(tp),{method:'POST'}); toast('reconfigured '+name); }catch(e){ toast(String(e.message||e),1);} tick(); }
+
+tick(); setInterval(tick,2000);
+</script>
+</body></html>
+"""
+
+
+CONFIG_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LACII — Config</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
+    --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
+    --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 60px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:18px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)} nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:7px 13px;font-size:13px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)} .btn:active{transform:scale(.98)} .btn.pri{border-color:var(--accent);color:#cfe0ff}
+  .btn.sm{padding:4px 9px;font-size:12px} .btn.danger{border-color:#5a2a2a;color:#ff9a9a} .btn.danger:hover{border-color:var(--bad)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 4px} .card .sub{font-size:12px;color:var(--dim);margin-bottom:12px}
+  .frm{display:grid;grid-template-columns:1fr 1fr;gap:13px 22px}
+  .fld{display:flex;flex-direction:column;gap:4px} .fld label{font-size:12px;color:var(--muted)}
+  .fld[title]{cursor:help} .fld[title]>label{width:max-content;max-width:100%;border-bottom:1px dotted var(--border2)}
+  .fld input,.fld select{background:var(--bg);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:7px 10px;font-size:13px}
+  .tog{display:flex;align-items:center;gap:8px;font-size:13px} .tog input{width:16px;height:16px}
+  .nrow{display:flex;align-items:center;gap:14px;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+  .nrow:last-child{border-bottom:none} .nrow .nn{min-width:150px;font-weight:600}
+  .nrow .nn small{font-weight:400;color:var(--dim);font-size:11px} .nrow .grow{flex:1}
+  .saved{color:var(--good);font-size:12px;margin-left:10px} .err{color:var(--bad);font-size:12px;margin-left:10px}
+  .actrow{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+</style></head>
+<body><div class="wrap">
+<header>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a class="on" href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
+</header>
+
+<div class="card">
+  <h2>Engine settings</h2><div class="sub">Runtime config, persisted across restarts.</div>
+  <div class="frm">
+    <div class="fld" title="Cap on how many models can be resident at once. Loading one more first evicts the least-recently-used IDLE model (if LRU auto-unload is on); with no evictable victim the load fails. Pinned (do-not-auto-unload) models are never evicted."><label>Max concurrent loaded models</label><input id="max_loaded" type="number" min="1"></div>
+    <div class="fld" title="How many requests may wait in line per model — generations for one model run one at a time. When the queue is full, further requests get a retryable 429/503 (honest backpressure) instead of piling up behind a long generation."><label>Per-model queue depth</label><input id="queue_depth" type="number" min="1"></div>
+    <div class="fld" title="Quantization tier used when a request or dashboard click auto-loads a model. int4 is the recommended default; if a quantized auto-load fails, one bf16 retry is attempted. Hover each option in the list for details."><label>Auto-load default quant</label><select id="autoload_quant"><option title="Fused 4-bit: ~4x smaller than bf16, near-lossless, fastest fused GPU kernels — the recommended default">int4</option><option title="2-bit capacity tier (~2.5 bits/weight, dense models only — a MoE auto-downgrades its experts to int4). GPTQ-calibrated, not round-to-nearest — but the cache is NEVER auto-built: calibration is sequential and runs hours on a big model, so an int2 auto-load refuses unless that model's int2 cache was compiled first. Quality has only ever been measured at ≤7B, where int4 is strictly better; the tier is for big dense models that cannot fit at int4.">int2</option><option title="8-bit: ~2x smaller than bf16, effectively lossless. MoE routed experts ARE packed at int8 (the fused 3D expert packer shipped) — a MoE no longer downgrades. Two caveats: there is no GROUPED int8 MoE kernel, so an int8 MoE decodes through the eager per-expert loop (this tier buys memory and quality, not speed), and shard-compile still rejects int8 MoE, so there is no int8 cache for a MoE and every int8 MoE load is a cold quantize. gpt-oss is the one MoE that still auto-downgrades to int4: its IN-major experts are only consumable by the fused 4-bit forward.">int8</option><option value="none" title="Full bf16 weights — exact but largest (~2 bytes per parameter); needs the most VRAM/RAM">none (bf16)</option></select></div>
+    <div class="fld" title="Context window (tokens) sized into auto/click loads. The per-layer KV-cache memory reserve grows with ctx, so bigger windows make placement fatter. 0 = the model's native maximum (can be huge — 128k+ on many models)."><label>Auto-load default ctx (0 = native)</label><input id="autoload_ctx" type="number" min="0"></div>
+    <div class="fld" title="Placement mode for auto-loads. auto = GPU-VRAM-first on the fewest nodes — best latency, the recommended default. If models seem to randomly load slow into system RAM, check this is not set to single. Hover each option in the list for details."><label>Auto-load placement mode</label><select id="autoload_mode"><option title="GPU-VRAM-first, fewest nodes — best latency (recommended)">auto</option><option title="A stage on EVERY enabled GPU, nothing on CPU — fails if the fleet's total VRAM cannot hold the model">all-gpu</option><option title="Spread stages across the whole fleet, CPUs and GPUs alike">distribute</option><option title="Layers across every capable node proportional to its capacity — for huge MoE models too big for the GPU-first subset">proportional</option><option title="Fewest nodes counting RAM+VRAM together — collapses to one box if it fits; RAM-first, usually the slow choice for big models">single</option></select></div>
+    <div class="fld" title="Prefill stall-watchdog: reclaim a generation that has produced NO tokens and reports no per-layer forward progress for this many seconds — its slot, queue and per-model lock reset so the next request re-flows the pipeline. Slow-but-ADVANCING prefills are never reclaimed (workers report progress over their heartbeat). Repeated reclaims of one model trip the wedge quarantine, which forces a fresh automatic re-place. 0 = watchdog off."><label>Prefill stall-watchdog (s, 0=off)</label><input id="gen_stall_s" type="number" min="0"></div>
+    <div class="fld" title="Mid-decode stall-watchdog: once at least one token has been produced, reclaim if no NEW token arrives for this many seconds. Tighter than the prefill threshold because a healthy decode ticks every second or two. 0 = off."><label>Decode stall-watchdog (s, 0=off)</label><input id="gen_stall_decode_s" type="number" min="0"></div>
+    <div class="fld" title="Unload any model that has served no requests for this many minutes. 0 or -1 = keep every model loaded forever (the default; -1 is the Ollama-style spelling and saves as -1). Pinned (📌) models and models with an active or queued request are never idle-unloaded."><label>Idle unload (min, 0/-1 = keep forever)</label><input id="idle_unload_m" type="number" min="-1" step="any" list="dl-idleu"><datalist id="dl-idleu"><option value="-1"></option><option value="0"></option><option value="5"></option><option value="15"></option><option value="60"></option><option value="240"></option><option value="1440"></option></datalist></div>
+    <div class="fld" title="On controller startup, wait at least this many seconds — AFTER the worker fleet has settled — before auto-reloading persisted (autoload-on-restart) models, so API clients have time to (re)connect before the box gets busy streaming weights. 0 = no extra wait."><label>Autostart delay (s, client-connect grace)</label><input id="autostart_delay_s" type="number" min="0" step="any"></div>
+    <div class="fld tog" title="When a new load needs room (or the max-loaded cap is hit), automatically evict the least-recently-used IDLE model. Busy models and pinned (do-not-auto-unload) models are never victims — if no evictable victim exists, the load fails instead. Off = nothing is ever evicted to make space."><input type="checkbox" id="auto_unload"><label for="auto_unload">LRU auto-unload</label></div>
+    <div class="fld tog" title="A request naming a model that is not resident triggers an automatic load using the auto-load defaults above, then serves the request (Ollama-style). Off = requests for non-resident models fail immediately."><input type="checkbox" id="auto_load"><label for="auto_load">Auto-load on request</label></div>
+    <div class="fld tog" title="Budget a new model's weights against each GPU's LIVE physically-free VRAM (committed-aware) rather than its nominal capacity — protects resident models' full-context KV reserves from being overcommitted. Leave on unless debugging placement."><input type="checkbox" id="vram_weights_first"><label for="vram_weights_first">Budget weights vs physical-free VRAM</label></div>
+    <div class="fld tog" title="Checks every ~60s (and right after an idle-unload frees VRAM) whether the hottest resident model running split across GPU+RAM would now fit entirely in VRAM, and if so promotes it. Only while that model is momentarily idle, it engages a barrier (new requests wait) and re-places it VRAM-only, then resumes — the client connection just pauses briefly, no reconnect. A busy model is skipped (caught at a gap by a later sweep) rather than stalled; embeddings and models that can't fit GPU are skipped. Lets models auto-load hybrid under memory pressure and migrate to full-GPU speed as the busy one out-competes quieter models for VRAM."><input type="checkbox" id="juggler"><label for="juggler">Juggler (promote hybrid→VRAM on free)</label></div>
+    <div class="fld tog" title="#master: mark THIS controller as the designated OWNER of the fleet. Purely a preference — it changes no placement or serving behaviour on its own. Its job is failover ergonomics: after another controller has taken the fleet (e.g. this one was down), the Controllers page shows a one-click 'Restore fleet to master' that hands every node back here. Set it on the controller that should normally hold the workers (e.g. beast). Per-controller (not synced across controllers)."><input type="checkbox" id="master"><label for="master">Master controller (designated fleet owner)</label></div>
+  </div>
+  <div style="margin-top:14px"><button class="btn pri" onclick="save()" title="Apply and persist every engine setting above — takes effect immediately and survives controller restarts.">Save settings</button><span id="cfg-msg"></span></div>
+</div>
+
+<div class="card">
+  <h2>Nodes — compute tiers</h2><div class="sub">Enable/disable each node's CPU/RAM and GPU/VRAM in the placement pool. Changes re-plan affected models.</div>
+  <div class="actrow" style="margin-bottom:8px">
+    <span style="font-size:12px;color:var(--muted)">Bulk:</span>
+    <button class="btn sm" onclick="bulk('ram',true)" title="Offer every node's CPU + system RAM to the placement pool">All RAM on</button><button class="btn sm" onclick="bulk('ram',false)" title="Remove every node's CPU/RAM from the placement pool — models placed there re-plan onto what remains">All RAM off</button>
+    <button class="btn sm" onclick="bulk('vram',true)" title="Offer every GPU's VRAM to the placement pool">All VRAM on</button><button class="btn sm" onclick="bulk('vram',false)" title="Remove every GPU from the placement pool — models placed there re-plan onto what remains">All VRAM off</button>
+    <span id="node-msg"></span>
+  </div>
+  <div id="nodes"></div>
+</div>
+
+<div class="card">
+  <h2>Controller</h2><div class="sub">Fleet-level operations. Use with care.</div>
+  <div class="actrow">
+    <button class="btn" onclick="ctlAct('/restart?workers=0','Restart the CONTROLLER only? (workers keep serving their models — the restarted controller re-adopts them)')" title="Restart the controller process only — HITLESS for loaded models: workers keep their shards across the restart and report them when they reconnect, and the controller re-ADOPTS the resident models instead of re-streaming them (no reload). Models that can't adopt (tensor-parallel, a worker that stayed down) are freed and re-load on demand.">Restart controller</button>
+    <button class="btn" onclick="ctlAct('/restart?workers=1&controller=0','Restart every WORKER? (controller stays up; resident models drop and re-load on demand)')" title="Restart every worker process; the controller stays up. A worker restart wipes its shards, so resident models drop (the controller cleans up their state as the links die) and re-load on demand or via their pins. The reset for stale worker state, wedged loads and allocator-held VRAM when the controller itself is healthy.">Restart fleet</button>
+    <button class="btn" onclick="ctlAct('/restart?workers=1','Restart EVERYTHING (controller + all workers)?')" title="Restart the controller AND every worker process — the full reset. All models drop; persisted (autoload-on-restart) models re-stream after startup + the autostart delay; everything else re-auto-loads on demand.">Restart all</button>
+    <button class="btn" onclick="ctlAct('/update?workers=1','Pull latest code from GitHub and deploy it to the controller AND all workers now?')" title="Deploy NOW, fleet-wide: unloads all models, pushes an immediate update to every worker (they stage the new files before relaunching), then the controller swaps its own code and restarts. This is the immediate path — the automatic background update only polls every 15 minutes. Raw-CDN propagation can lag a push by minutes per file — if a just-pushed change is missing, wait a little and update again.">Update + deploy</button>
+    <button class="btn" onclick="ctlAct('/gc_cache','Reclaim disk by removing redundant HF-cache copies?')" title="Delete the HuggingFace-cache copy of every model that is also complete in models/ (pure duplicates). Models existing only in the cache are kept — this never deletes the only copy.">GC disk cache</button>
+    <span id="ctl-msg"></span>
+  </div>
+</div>
+</div>
+
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
+const FIELDS=['max_loaded','queue_depth','autoload_quant','autoload_ctx','autoload_mode','gen_stall_s','gen_stall_decode_s','idle_unload_m','autostart_delay_s'];
+const TOGS=['auto_unload','auto_load','vram_weights_first','juggler','master'];
+// #cfg-dirty: fields the user touched since the last successful save. The 5s /status poll
+// used to overwrite EVERY field wholesale, silently reverting an in-progress edit before
+// the user could click Save. A dirty field is never overwritten by the poll; Save clears
+// the set so server values show through again.
+const DIRTY=new Set();
+let NODES=[];
+async function load(){
+  let d; try{ d=await (await fetch('/status')).json(); }catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; return; }
+  const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');
+  FIELDS.forEach(k=>{ const el=$('#'+k); if(el&&c[k]!=null&&!DIRTY.has(k)&&el!==document.activeElement)el.value=c[k]; });
+  TOGS.forEach(k=>{ const el=$('#'+k); if(el&&!DIRTY.has(k))el.checked=!!c[k]; });
+  NODES=d.nodes||[]; renderNodes();
+}
+function renderNodes(){
+  $('#nodes').innerHTML=NODES.slice().sort((a,b)=>(b.has_gpu?1:0)-(a.has_gpu?1:0)||a.hostname.localeCompare(b.hostname)).map(n=>{
+    const gpu=n.has_gpu;
+    return '<div class="nrow"><div class="nn">'+esc(n.hostname)+' <small>'+(gpu?esc(n.device_name||'GPU'):((n.cores||'')+'c CPU'))+(n.alive?'':' · offline')+'</small></div>'
+      +'<label class="tog" title="Include the CPU + system RAM of this node in the placement pool — toggling re-plans any model placed on it"><input type="checkbox" '+(n.ram_enabled?'checked':'')+' onchange="setTier(\''+esc(n.hostname)+'\',\'ram\',this.checked)">RAM</label>'
+      +(gpu?'<label class="tog" title="Include the GPU VRAM of this node in the placement pool — toggling re-plans any model placed on it"><input type="checkbox" '+(n.vram_enabled?'checked':'')+' onchange="setTier(\''+esc(n.hostname)+'\',\'vram\',this.checked)">VRAM</label>':'<span style="color:var(--dim);font-size:12px" title="This node has no usable GPU — it contributes CPU/RAM only">no GPU</span>')
+      +'<span class="grow"></span><span style="font-size:11px;color:var(--dim)" title="Live used / total memory of the primary tier on this node">'+(gpu?fmt(n.vram_used_gb)+'/'+fmt(n.vram_total_gb)+' GB VRAM':fmt((n.total_mem_gb||0)-(n.free_mem_gb||0))+'/'+fmt(n.total_mem_gb)+' GB RAM')+'</span></div>';
+  }).join('')||'<div style="color:var(--dim);font-size:13px">no nodes</div>';
+}
+function fmt(v){return v==null?'—':Math.round(v*10)/10}
+async function post(path){ const r=await fetch(path,{method:'POST'}); const t=await r.text(); let j;try{j=JSON.parse(t)}catch(e){j={ok:r.ok}} if(!r.ok||j.ok===false)throw new Error(j.error||('HTTP '+r.status)); return j; }
+function msg(id,txt,bad){ $(id).innerHTML=(bad?'<span class="err">':'<span class="saved">')+esc(txt)+'</span>'; setTimeout(()=>{$(id).innerHTML='';},3500); }
+async function save(){
+  const q=new URLSearchParams();
+  FIELDS.forEach(k=>{ const v=$('#'+k).value; if(v!=='')q.set(k,v); });
+  TOGS.forEach(k=>{ q.set(k,$('#'+k).checked?'true':'false'); });
+  try{ await post('/config?'+q.toString()); DIRTY.clear(); msg('#cfg-msg','saved'); load(); }catch(e){ msg('#cfg-msg',String(e.message||e),1); }
+}
+async function setTier(host,tier,on){ try{ await post('/nodeconfig?host='+encodeURIComponent(host)+'&'+tier+'='+(on?'true':'false')); msg('#node-msg',host+' '+tier+'='+on); }catch(e){ msg('#node-msg',String(e.message||e),1);} }
+async function bulk(tier,on){ try{ await post('/nodeconfig_all?tier='+tier+'&enabled='+(on?'true':'false')); msg('#node-msg','all '+tier+'='+on); load(); }catch(e){ msg('#node-msg',String(e.message||e),1);} }
+async function ctlAct(path,confirmMsg){
+  if(!confirm(confirmMsg))return;
+  async function run(p){ const r=await fetch(p,{method:'POST'}); let j={}; try{ j=JSON.parse(await r.text()); }catch(e){} return {ok:r.ok,status:r.status,j:j}; }
+  try{
+    let res=await run(path);
+    // #force-restart: the in-progress guard (409 load_in_progress / render_in_progress) is NOT a
+    // dead end — a restart/update that would abort an in-flight load/compile/render is refused, but
+    // force=1 overrides it. Offer that instead of just surfacing the 409, so the operator can force
+    // past a WEDGED load that never clears on its own.
+    if(!res.ok && res.status===409 && res.j && (res.j.status==='load_in_progress'||res.j.status==='render_in_progress')){
+      if(confirm('Blocked: '+(res.j.reason||'a load/compile/render is in progress')+'\n\nForce it anyway? This ABORTS the in-flight load/render.')){
+        res=await run(path+(path.indexOf('?')>=0?'&':'?')+'force=1');
+      } else { msg('#ctl-msg','cancelled — nothing restarted',1); return; }
+    }
+    if(!res.ok || (res.j && res.j.ok===false)) throw new Error((res.j&&(res.j.error||res.j.reason))||('HTTP '+res.status));
+    msg('#ctl-msg','sent — controller restarting if applicable');
+  }catch(e){ msg('#ctl-msg',String(e.message||e),1); }
+}
+FIELDS.concat(TOGS).forEach(k=>{ const el=$('#'+k); if(el){ el.addEventListener('input',()=>DIRTY.add(k)); el.addEventListener('change',()=>DIRTY.add(k)); } });
+load(); setInterval(load,5000);
+</script>
+</body></html>
+"""
+
+CHAT_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LACII — Chat</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
+    --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
+    --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 30px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:14px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)} nav a:hover{background:var(--surface)}
+  .bar{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+  select,textarea{background:var(--bg);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:8px 10px;font-size:14px;font-family:var(--sans)}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:8px 14px;font-size:14px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)} .btn.pri{border-color:var(--accent);color:#cfe0ff} .btn.sm{padding:4px 9px;font-size:12px}
+  .btn:disabled{opacity:.5;cursor:default} .grow{flex:1}
+  #log{border:1px solid var(--border);border-radius:12px;background:var(--surface);padding:12px;height:58vh;overflow:auto;margin-bottom:10px}
+  .msg{margin-bottom:10px} .who{font-size:11px;margin-bottom:2px} .who.u{color:var(--accent)} .who.a{color:var(--good)}
+  .bub{white-space:pre-wrap;word-break:break-word;background:var(--bg);border-radius:8px;padding:8px 10px;font-size:13px}
+  /* Reasoning models stream their scratchpad on a SEPARATE channel (Ollama message.thinking).
+     It used to be dropped on the floor, so a turn that spent its whole budget thinking rendered
+     as "(no output)" and looked like a dead model. Dimmed + italic so it reads as working-out
+     rather than answer. */
+  .think{white-space:pre-wrap;word-break:break-word;border-left:2px solid var(--dim);opacity:.62;
+         font-style:italic;margin:0 0 4px 0;padding:4px 0 4px 8px;font-size:12px}
+  .thinkh{font-size:10px;color:var(--dim);letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px}
+  .capped{color:var(--warn);font-size:12px;margin-top:4px}
+  .empty{color:var(--dim);text-align:center;padding:40px 0}
+  .inrow{display:flex;gap:8px} .inrow textarea{flex:1;resize:vertical;min-height:46px}
+  .hint{font-size:12px;color:var(--dim)}
+</style></head>
+<body><div class="wrap">
+<header>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a class="on" href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
+</header>
+<div class="bar">
+  <label class="hint">Model</label>
+  <select id="model" onchange="switchModel()"></select>
+  <span class="hint" id="mhint"></span>
+  <span class="grow"></span>
+  <label class="hint" title="Reasoning models (qwen3.x, gpt-oss) think before answering. The
+thinking counts against the SAME token budget as the answer, so with it on a turn can run for
+minutes and can even hit the cap before writing a word. Off = direct answers, which is what a
+smoke-test chat usually wants. When on, the scratchpad is shown above the reply.">
+    <input type="checkbox" id="think" onchange="thinkToggle()">reasoning</label>
+  <button class="btn sm" onclick="clearChat()">Clear</button>
+</div>
+<div id="log"></div>
+<div class="inrow">
+  <textarea id="in" rows="2" placeholder="type a prompt — Enter to send, Shift+Enter for newline" onkeydown="key(event)"></textarea>
+  <button class="btn pri" id="send" onclick="send()">Send</button>
+</div>
+<div class="hint" style="margin-top:6px">Throwaway test chat · streams live · leaving this tab or switching models ends the generation.</div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
+const qp=new URLSearchParams(location.search);
+let MODELS=[], cur='', msgs=[], live='', liveThink='', busy=false, abort=null;
+// Default OFF. On is the model's own default and produced the bug this fixes: a turn
+// that spent its entire budget thinking and rendered as '(no output)'.
+let wantThink=false;
+function thinkToggle(){ const c=$('#think'); wantThink=!!(c&&c.checked); }
+function aborter(){ if(abort){ try{abort.abort();}catch(e){} abort=null; } }
+async function loadModels(){
+  let d; try{ d=await (await fetch('/status',{cache:'no-store'})).json(); }
+  catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; return; }
+  const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');
+  MODELS=(d.models||[]).filter(m=>m.loaded).map(m=>m.name);
+  const sel=$('#model'); const want=cur||qp.get('model')||MODELS[0]||'';
+  // #cfg-dirty sibling: don't rebuild the option list while the dropdown is focused/open
+  // (the 5s poll would snap the native popup shut mid-selection), and skip no-op rebuilds
+  // when the loaded-model set hasn't changed.
+  const mkey=MODELS.join('\u0001');
+  if(sel!==document.activeElement&&sel.dataset.mkey!==mkey){
+    sel.dataset.mkey=mkey;
+    sel.innerHTML=MODELS.length
+      ? MODELS.map(n=>'<option value="'+esc(n)+'"'+(n===want?' selected':'')+'>'+esc(n)+'</option>').join('')
+      : '<option value="">(no models loaded)</option>';
+  }
+  if(MODELS.length){ cur=sel.value; $('#mhint').textContent=''; $('#send').disabled=false; $('#in').disabled=false; }
+  else { cur=''; $('#mhint').innerHTML='no models loaded — <a href="/">load one on the Models tab</a>'; $('#send').disabled=true; $('#in').disabled=true; }
+}
+function switchModel(){ aborter(); cur=$('#model').value; msgs=[]; live=''; liveThink=''; busy=false; render(); $('#in').focus(); }
+function clearChat(){ aborter(); msgs=[]; live=''; liveThink=''; busy=false; render(); }
+function key(e){ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); send(); } }
+function bub(role,text,think,capped,streaming){ const u=role==='user';
+  // A reasoning model can legitimately FINISH a turn with empty content — it hit its token cap
+  // while still inside the thinking block. Rendering just '(no output)' there is actively
+  // misleading: the model worked, we threw the work away. Show the reasoning, and say what
+  // happened. `streaming` matters: mid-stream a turn with reasoning-but-no-content-yet is the
+  // NORMAL state, so it must show progress, not the ran-out-of-budget verdict.
+  const th=(!u&&think)?('<div class="thinkh">reasoning</div><div class="think">'+esc(think)+'</div>'):'';
+  const body=(text&&text.length)?('<div class="bub">'+esc(text)+'</div>')
+    :(streaming?(think?'':'<div class="bub">…</div>')
+      :(think?'<div class="capped">no answer — the whole reply budget went to reasoning. '
+              +'Untick “reasoning” above for a direct answer, or raise Max tokens on the '
+              +'Config tab.</div>'
+             :'<div class="bub">'+esc(text||'')+'</div>'));
+  const cap=(capped&&text&&text.length)?'<div class="capped">cut off at the token cap</div>':'';
+  return '<div class="msg"><div class="who '+(u?'u':'a')+'">'+(u?'you':esc(cur))+'</div>'+th+body+cap+'</div>'; }
+function render(){ const l=$('#log'); if(!l)return;
+  let h=msgs.map(m=>bub(m.role,m.content,m.think,m.capped,false)).join('');
+  if(busy)h+=bub('assistant',live,liveThink,false,true);
+  l.innerHTML=h||'<div class="empty">select a loaded model and send a prompt</div>'; l.scrollTop=l.scrollHeight; }
+async function send(){
+  if(busy||!cur)return; const ta=$('#in'); const t=ta.value.trim(); if(!t)return;
+  ta.value=''; msgs.push({role:'user',content:t}); live=''; liveThink=''; busy=true;
+  $('#send').disabled=true; render();
+  const ctrl=new AbortController(); abort=ctrl; let capped=false;
+  try{
+    // num_predict was 512, which a reasoning model can spend ENTIRELY on its thinking block —
+    // qwen3.8-27b burns ~850 chars of scratchpad before its first content token, so the turn
+    // ended at the cap with empty content and the UI showed "(no output)". The cap is the
+    // response-length ceiling for the whole turn, reasoning included, so it has to clear the
+    // scratchpad before it can bound the answer. An explicit value still wins over the
+    // fleet default on the Config tab.
+    const r=await fetch('/api/chat',{method:'POST',signal:ctrl.signal,headers:{'Content-Type':'application/json'},
+      // Post ONLY role+content. msgs carries our own render-state (think, capped) and the wire
+      // format has no place for it — the server currently ignores unknown message keys, but the
+      // UI should not depend on that leniency, and a scratchpad must never be replayed as
+      // conversation anyway.
+      // `think` maps to enable_thinking on the chat template (serving._thinking_pref). Sent
+      // EXPLICITLY either way: on /api/chat a reasoning model defaults to thinking ON, so
+      // omitting the key is not the same as asking for a direct answer.
+      body:JSON.stringify({model:cur,messages:msgs.map(m=>({role:m.role,content:m.content})),
+                           stream:true,think:wantThink,
+                           options:{temperature:0.7,num_predict:4096}})});
+    if(!r.ok){ const tx=await r.text(); throw new Error(tx||('HTTP '+r.status)); }
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    while(true){ const x=await rd.read(); if(x.done)break; buf+=dec.decode(x.value,{stream:true}); let nl;
+      while((nl=buf.indexOf('\n'))>=0){ const ln=buf.slice(0,nl).trim(); buf=buf.slice(nl+1); if(!ln)continue;
+        let j; try{j=JSON.parse(ln);}catch(e){continue;} if(j.error)live+='\n[error] '+j.error;
+        // #reasoning-channel: a thinking model streams its scratchpad as message.thinking, NEVER
+        // as content. Reading only content is why an all-reasoning turn looked empty.
+        const th=(j.message&&j.message.thinking)||''; if(th){ liveThink+=th; render(); }
+        if(j.done&&j.done_reason==='length') capped=true;
+        const p=(j.message&&j.message.content)||j.response||''; if(p){ live+=p; render(); } } }
+    // `think`/`capped` are render-state only; the request builder above strips them back out.
+    msgs.push({role:'assistant',content:live,think:liveThink,capped:capped});
+  }catch(e){ if(e.name!=='AbortError') msgs.push({role:'assistant',content:'[error] '+String(e.message||e)}); }
+  finally{ busy=false; live=''; liveThink=''; abort=null; $('#send').disabled=(!cur); render();
+           const i=$('#in'); if(i)i.focus(); }
+}
+window.addEventListener('beforeunload',aborter);
+loadModels(); render(); setInterval(loadModels,5000);
+</script>
+</body></html>
+"""
+
+LOGS_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LACII — Logs</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
+    --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
+    --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 40px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:16px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)} nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:6px 12px;font-size:13px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)} .btn.on{border-color:var(--accent);color:#cfe0ff}
+  select.f{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:6px 10px;font-size:13px}
+  .tog{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+  .panes{display:grid;grid-template-columns:2.4fr 1fr;gap:14px;align-items:start}
+  @media(max-width:860px){.panes{grid-template-columns:1fr}}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+  .card h2{font-size:14px;margin:0;padding:10px 14px;border-bottom:1px solid var(--border);color:var(--muted)}
+  pre#log{margin:0;padding:12px 14px;font-family:var(--mono);font-size:12px;line-height:1.5;color:var(--text);
+    white-space:pre-wrap;word-break:break-word;height:72vh;overflow:auto;background:#0a0e14}
+  .act{padding:4px 0} .act div{padding:6px 14px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted)}
+  .act div:last-child{border-bottom:none} .act .t{color:var(--dim);font-size:11px;margin-right:6px}
+  .empty{padding:20px;color:var(--dim);font-size:13px;text-align:center}
+</style></head>
+<body><div class="wrap">
+<header>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a class="on" href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
+  <span class="grow"></span>
+  <span class="tog">source <select class="f" id="src" onchange="refresh()"></select></span>
+  <button class="btn on" id="auto" onclick="toggleAuto()">auto ⟳</button>
+  <button class="btn" onclick="refresh()">refresh</button>
+</header>
+<div class="panes">
+  <div class="card"><h2 id="logtitle">controller log</h2><pre id="log">loading…</pre></div>
+  <div class="card"><h2>activity</h2><div class="act" id="act"></div></div>
+</div>
+<div class="card" style="margin-top:14px"><h2>HTTP errors · 4xx / 5xx returned to clients &amp; nodes</h2><div class="act" id="errs"></div></div>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const _up=s=>{s=Math.max(0,Math.floor(s||0));const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')};
+let AUTO=true, SRCS=false;
+async function srcList(){
+  try{ const d=await (await fetch('/status')).json();
+    const c=d.controller||{}; $('#ctl').textContent=(c.hostname||'?')+':'+(c.http_port||'')+' · v'+(c.version||'?')+(c.code_date?' ('+c.code_date+')':'')+(c.uptime_s!=null?' · up '+_up(c.uptime_s):'');
+    if(!SRCS){ const sel=$('#src'); const cur=sel.value;
+      sel.innerHTML='<option value="">controller</option>'+(d.nodes||[]).map(n=>'<option value="'+esc(n.hostname)+'">'+esc(n.hostname)+(n.has_gpu?' (GPU)':'')+'</option>').join('');
+      if(cur)sel.value=cur; SRCS=true; }
+    renderAct(d.activity||[]);
+    renderErrors(d.errors||[]);
+  }catch(e){ $('#ctl').innerHTML='<span style="color:var(--bad)">controller unreachable</span>'; }
+}
+function renderErrors(es){
+  if(!es.length){ $('#errs').innerHTML='<div class="empty">no HTTP errors recorded</div>'; return; }
+  $('#errs').innerHTML=es.slice(0,80).map(e=>{
+    const ts=e.t?new Date(e.t*1000).toLocaleTimeString():'';
+    const col=(e.status>=500)?'var(--bad)':'var(--warn)';
+    return '<div><span class="t">'+esc(ts)+'</span><b style="color:'+col+'">'+esc(e.status)+'</b> '
+      +esc(e.method||'')+' <span style="font-family:var(--mono)">'+esc(e.path||'')+'</span>'
+      +' <span style="color:var(--dim)">· '+esc(e.ip||'')+'</span>'
+      +(e.detail?('<div style="color:var(--dim);font-size:11px;margin-top:2px">'+esc(e.detail)+'</div>'):'')+'</div>';
+  }).join('');
+}
+function renderAct(a){
+  if(!a.length){ $('#act').innerHTML='<div class="empty">no recent activity</div>'; return; }
+  $('#act').innerHTML=a.slice(-60).reverse().map(e=>{
+    const txt=typeof e==='string'?e:(e.msg||e.text||JSON.stringify(e)); const t=(e&&e.ts)?('<span class="t">'+esc(String(e.ts).slice(11,19))+'</span>'):'';
+    return '<div>'+t+esc(txt)+'</div>';
+  }).join('');
+}
+async function refresh(){
+  const host=$('#src').value;
+  $('#logtitle').textContent=host?('worker log · '+host):'controller log';
+  try{
+    const r=await fetch('/logs'+(host?('?node='+encodeURIComponent(host)):''));
+    const t=await r.text();
+    const el=$('#log'); const atBottom=el.scrollHeight-el.scrollTop-el.clientHeight<40;
+    el.textContent=t||'(empty)';
+    if(atBottom) el.scrollTop=el.scrollHeight;
+  }catch(e){ $('#log').textContent='error fetching log: '+(e.message||e); }
+}
+function toggleAuto(){ AUTO=!AUTO; $('#auto').classList.toggle('on',AUTO); $('#auto').textContent=AUTO?'auto ⟳':'auto off'; }
+async function tick(){ await srcList(); if(AUTO) refresh(); }
+refresh(); tick(); setInterval(tick,3000);
+</script>
+</body></html>
+"""
+
+
+# --- #federation: Cross-controller page (peers, their models/nodes, controller config) ------------
+# Phase 2. Renders GET /peers (peers.py's gossip cache). Actions land in later phases:
+#   Phase 4 adds "Pull" (fetch a model's weights FROM a peer), Phase 5 adds node lending.
+# #dash-nocache: the header set every dashboard page is served with.
+#
+# These pages were returned as BARE STRINGS, so the response carried no Cache-Control, no ETag and
+# no Last-Modified. Given neither a directive nor a validator, a browser falls back to HEURISTIC
+# caching and may reuse its copy indefinitely without revalidating. The effect is that a controller
+# self-update ships new dashboard JS and an already-open tab keeps running the OLD code — the wire
+# serves the new page while the operator sees the old behaviour, which is indistinguishable from
+# "your fix does not work". It cost exactly that: a chat still rendering "(no output)" from JS the
+# server had already replaced.
+#
+# Every page here is a Python constant that changes on each update and is ~12 KB, so there is
+# nothing to gain by caching and a correctness bug to lose. Defined ONCE and shared by every route
+# (routes_dashboard's five pages + routes_peers' /controllers) rather than copied per route —
+# per-branch copies of a rule are this codebase's dominant failure mode. Reaches the route modules
+# through server.py's import + state.publish/bind, the same path the HTML constants take.
+NOCACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",   # HTTP/1.0 intermediaries (GoldenEye fronts this fleet)
+    "Expires": "0",
+}
+
+CONTROLLERS_HTML = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LACII — Controllers</title>
+<style>
+  :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
+    --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
+    --radius:10px;--mono:ui-monospace,Menlo,Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 60px}
+  header{display:flex;align-items:center;gap:14px;margin-bottom:18px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600} .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px} nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)} nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:7px 13px;font-size:13px;cursor:pointer}
+  .btn:hover{border-color:var(--accent)} .btn:active{transform:scale(.98)} .btn.pri{border-color:var(--accent);color:#cfe0ff}
+  .btn.sm{padding:4px 9px;font-size:12px} .btn.danger{border-color:#5a2a2a;color:#ff9a9a} .btn.danger:hover{border-color:var(--bad)}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px 18px;margin-bottom:16px}
+  .card h2{font-size:15px;margin:0 0 4px} .card .sub{font-size:12px;color:var(--dim);margin-bottom:12px}
+  .fld{display:flex;flex-direction:column;gap:4px} .fld label{font-size:12px;color:var(--muted)}
+  .fld input{background:var(--bg);border:1px solid var(--border2);color:var(--text);border-radius:8px;padding:7px 10px;font-size:13px}
+  .actrow{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+  .peer{border:1px solid var(--border);border-radius:10px;padding:12px 14px;margin-bottom:12px;background:var(--surface2)}
+  .peer .ph{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .peer .pn{font-weight:600;font-size:14px}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .dot.ok{background:var(--good)} .dot.stale{background:var(--warn)} .dot.error{background:var(--bad)}
+  .chip{font-size:10.5px;color:var(--muted);border:1px solid var(--border2);border-radius:9px;padding:1px 7px}
+  .mono{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  table{width:100%;border-collapse:collapse;margin-top:9px}
+  th,td{text-align:left;font-size:12.5px;padding:5px 8px;border-bottom:1px solid var(--border)}
+  th{color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.4px}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  .note{color:var(--dim);font-size:12.5px} .err{color:var(--bad);font-size:12px}
+  .tbls{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:980px){.tbls{grid-template-columns:1fr}}
+  .scroll{overflow-x:auto}
+</style></head>
+<body><div class="wrap">
+<header>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a class="on" href="/controllers">Controllers</a></nav>
+  <span class="grow"></span>
+  <button class="btn" onclick="refresh(true)">Refresh now</button>
+</header>
+
+<div class="card">
+  <h2>This controller</h2>
+  <div class="sub">How other controllers see us. They reach us at <span class="mono">GET /peer_info</span>.
+    Mark a controller <b>master</b> on its <a href="/config">Config</a> page to enable one-click failback.</div>
+  <div id="self" class="mono">…</div>
+  <div id="masterbar" style="margin-top:11px"></div>
+</div>
+
+<div class="card">
+  <h2>Add a controller</h2>
+  <div class="sub">Controllers on the same LAN find each other automatically by UDP broadcast.
+    Add one by hand only when broadcast cannot reach it — a different subnet, a VLAN, or across a VPN.</div>
+  <div class="actrow">
+    <div class="fld"><label>Host / IP</label><input id="ph" placeholder="192.168.1.116"></div>
+    <div class="fld"><label>HTTP port</label><input id="pp" type="number" placeholder="21434"></div>
+    <button class="btn pri" onclick="addPeer()">Add controller</button>
+    <span id="addmsg" class="note"></span>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Node ownership</h2>
+  <div class="sub">A node is used by <b>one</b> controller at a time — two controllers planning
+    against the same node's memory would double-book it and OOM the box. Lending a node just stops
+    using it here, which makes it available to whichever controller wants it.</div>
+  <div id="nodes"><div class="note">loading…</div></div>
+</div>
+
+<div class="card" id="pullcard" style="display:none">
+  <h2>Model transfers</h2>
+  <div class="sub">Copying weights from a peer controller — no HuggingFace round trip. Interrupted
+    transfers resume: completed files are skipped on a re-run.</div>
+  <div id="pulls"></div>
+</div>
+
+<div class="card">
+  <h2>Peer controllers</h2>
+  <div class="sub">Discovered by broadcast and polled every 30s. Their models and nodes are shown as
+    of the last successful poll.</div>
+  <div id="peers"><div class="note">loading…</div></div>
+</div>
+
+<div id="cov" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:80;align-items:flex-start;justify-content:center">
+  <div style="background:var(--card,#141922);border:1px solid var(--border);border-radius:11px;padding:20px 22px;max-width:440px;margin-top:16vh;box-shadow:0 20px 60px rgba(0,0,0,.5)">
+    <div id="cmsg" style="font-size:14px;line-height:1.55;color:var(--text);white-space:pre-line"></div>
+    <div style="margin-top:18px;text-align:right"><button class="btn ghost" onclick="cAnswer(false)">Cancel</button>
+      <button class="btn pri" id="cok" onclick="cAnswer(true)">Confirm</button></div>
+  </div>
+</div>
+
+<script>
+const esc = s => String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const gb = v => (v==null||isNaN(v)) ? '—' : (Math.round(v*10)/10)+' GB';
+let SELF = {};   // #master: this controller's identity (incl. node count) from the last /peers poll
+// #onclick-quotes: a JS string arg safe INSIDE a double-quoted onclick="" attribute. JSON.stringify
+// emits DOUBLE quotes, which truncate the attribute (onclick="fn("x")" parses as onclick="fn(") and
+// silently kills the handler — the bug that made Give-fleet / Pull / Forget do nothing. Single-quote
+// it, HTML-escape &<", and backslash-escape ' (which stays inert in HTML).
+const A = s => "'"+String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;').replace(/'/g,"\\'")+"'";
+
+function peerRow(p){
+  const nodes  = (p.nodes||[]);
+  // Resident models (with runtime info), keyed for enrichment of the on-disk rows.
+  const resident = {};
+  (p.models||[]).forEach(m => { if(m.friendly) resident[m.friendly]=m; if(m.target) resident[m.target]=m; });
+  // The pullable list = every model the peer has ON DISK (includes ones NOT loaded — the whole point).
+  // Fall back to just the resident list if talking to an older peer that doesn't advertise disk_models.
+  const disk = (p.disk_models||[]);
+  const list = disk.length ? disk
+    : (p.models||[]).map(m=>({friendly:m.friendly, display_name:m.friendly, target:m.target, size_gb:m.size_gb, loaded:true}));
+  const mrows = list.length ? list.map(dm => {
+      const rm = resident[dm.friendly] || resident[dm.target] || null;
+      const loaded = dm.loaded || !!rm;
+      const stat = loaded
+        ? '<span style="color:var(--good)">● loaded'+(rm&&rm.stages&&rm.stages.length?' <span class="mono note">'+esc(rm.stages.join(','))+'</span>':'')+'</span>'
+        : '<span class="note">on disk</span>';
+      return '<tr><td>'+esc(dm.display_name||dm.friendly)+'</td>'
+        +'<td class="num">'+gb(dm.size_gb)+'</td><td>'+stat+'</td>'
+        +'<td><button class="btn sm" title="Copy this model\'s weights from '+esc(p.name||p.host)+' to THIS controller (resumes if interrupted; skips files already present)"'
+        +' onclick="pullModel(this,'+A(p.host)+','+p.http_port+','+A(dm.friendly||dm.target)+')">Pull</button></td></tr>';
+    }).join('') : '<tr><td colspan="4" class="note">no models on disk</td></tr>';
+  const nrows = nodes.length ? nodes.map(n =>
+      '<tr><td>'+esc(n.hostname)+'</td><td class="mono">'+esc(n.device||'—')+'</td>'
+      +'<td class="num">'+gb(n.vram_used_gb)+' / '+gb(n.vram_total_gb)+'</td>'
+      +'<td class="num">'+gb(n.free_mem_gb)+'</td>'
+      +'<td class="mono">'+(n.vram_enabled?'gpu':'')+(n.vram_enabled&&n.ram_enabled?'+':'')+(n.ram_enabled?'cpu':'')
+      +((!n.vram_enabled&&!n.ram_enabled)?'<span style="color:var(--warn)">disabled</span>':'')+'</td></tr>'
+    ).join('') : '<tr><td colspan="5" class="note">no nodes</td></tr>';
+  return '<div class="peer">'
+    +'<div class="ph"><span class="dot '+esc(p.state)+'"></span>'
+    +'<span class="pn">'+esc(p.name||p.host)+'</span>'
+    +(p.master?'<span class="chip" style="border-color:var(--good);color:var(--good)">★ master</span>':'')
+    +'<a class="mono" href="'+esc(p.url)+'" target="_blank" rel="noopener">'+esc(p.host)+':'+esc(p.http_port)+'</a>'
+    +'<span class="chip">'+esc(p.version||'?')+'</span>'
+    +(p.cluster_id?'<span class="chip">cluster '+esc(p.cluster_id)+'</span>':'')
+    +'<span class="chip">'+esc(p.source||'')+'</span>'
+    +'<span class="grow"></span>'
+    +'<span class="note">seen '+esc(p.last_seen_s)+'s ago</span>'
+    // #master: fleet handoff — direction depends on who holds the nodes. If WE hold the fleet,
+    // offer to give it to this peer; if THIS PEER holds it, offer to pull it here.
+    +(((SELF.nodes||0)>0 && p.state==='ok')
+       ? '<button class="btn sm" onclick="handoffFleet('+A(p.host)+','+A(p.name||p.host)+')" title="Hand this controller\'s entire fleet (all nodes + loaded shards) to '+esc(p.name||p.host)+', no reload.">⇄ Give fleet</button>' : '')
+    +(((p.nodes||[]).length>0 && (SELF.nodes||0)===0 && p.state==='ok')
+       ? '<button class="btn sm" onclick="reclaimFleet('+A(p.host)+','+A(p.name||p.host)+')" title="Pull '+esc(p.name||p.host)+'\'s entire fleet here, no reload.">⇐ Take fleet</button>' : '')
+    +'<button class="btn sm danger" onclick="rmPeer('+A(p.host)+','+p.http_port+')">Forget</button>'
+    +'</div>'
+    +(p.error?'<div class="err">'+esc(p.error)+'</div>':'')
+    +'<div class="tbls">'
+    +'<div class="scroll"><table><thead><tr><th>Model (on disk = pullable)</th><th>Weights</th><th>Status</th><th></th></tr></thead><tbody>'+mrows+'</tbody></table></div>'
+    +'<div class="scroll"><table><thead><tr><th>Node</th><th>Device</th><th>VRAM</th><th>Free RAM</th><th>Tiers</th></tr></thead><tbody>'+nrows+'</tbody></table></div>'
+    +'</div></div>';
+}
+
+async function refresh(force){
+  try{
+    const r = await fetch(force?'/peer_refresh':'/peers', {method: force?'POST':'GET'});
+    const j = await r.json();
+    const s = j.self||{}; SELF = s;
+    document.getElementById('ctl').textContent = (s.name||'') + ' · ' + (s.version||'');
+    document.getElementById('self').innerHTML =
+      esc(s.name||'?')+' — http :'+esc(s.http_port)+' — '+esc(s.version||'?')
+      +(s.master?' <span class="chip" style="border-color:var(--good);color:var(--good)">★ MASTER</span>':'')
+      +' — holds '+(s.nodes||0)+' node'+((s.nodes===1)?'':'s')
+      +(s.cluster_id?' — cluster '+esc(s.cluster_id):' — cluster &lt;unset&gt;');
+    const ps = j.peers||[];
+    // #master: one-click failback banner. Handoff can only be ISSUED by whoever owns the nodes, so
+    // the button we show depends on who currently holds the fleet.
+    const master = ps.find(p=>p.master && p.state==='ok');
+    const mb = document.getElementById('masterbar');
+    if(mb){
+      let h='';
+      if((s.nodes||0)>0 && master){
+        // We hold the fleet but a peer is the designated master → hand it back in one click.
+        h='<button class="btn pri" onclick="handoffFleet('+A(master.host)+','+A(master.name||master.host)+')" '
+         +'title="Move every node (and its loaded shards) back to the master controller with no reload (~seconds). Use after a failover to restore normal ownership.">↩ Restore fleet to master ('+esc(master.name||master.host)+')</button>';
+      } else if(s.master && (s.nodes||0)>0){
+        h='<span class="note">★ This is the master and currently holds the fleet.</span>';
+      } else if(s.master){
+        // We ARE master but hold nothing → offer to TAKE it from whichever peer holds the fleet.
+        const owner = ps.find(p=>(p.nodes||[]).length>0 && p.state==='ok');
+        h = owner
+          ? '<button class="btn pri" onclick="reclaimFleet('+A(owner.host)+','+A(owner.name||owner.host)+')" '
+            +'title="Pull every node from the controller that currently holds the fleet back to here, with no reload.">⇐ Take the fleet from '+esc(owner.name||owner.host)+'</button>'
+          : '<span class="note">★ This is the master; no peer is holding the fleet.</span>';
+      }
+      mb.innerHTML=h;
+    }
+    document.getElementById('peers').innerHTML = ps.length
+      ? ps.map(peerRow).join('')
+      : '<div class="note">No other controllers found yet. They announce themselves every 60s; '
+        +'if one is on another subnet/VLAN/VPN, add it by hand above.</div>';
+  }catch(e){
+    document.getElementById('peers').innerHTML = '<div class="err">failed to load peers: '+esc(e.message||e)+'</div>';
+  }
+}
+
+async function addPeer(){
+  const h = document.getElementById('ph').value.trim();
+  const p = document.getElementById('pp').value.trim() || '21434';
+  const msg = document.getElementById('addmsg');
+  if(!h){ msg.textContent='enter a host'; return; }
+  msg.textContent='adding…';
+  try{
+    const r = await fetch('/peer_add?host='+encodeURIComponent(h)+'&port='+encodeURIComponent(p), {method:'POST'});
+    const j = await r.json();
+    msg.textContent = j.ok ? (j.reachable?'added and reachable':'added but NOT reachable: '+(j.error||'')) : ('failed: '+(j.error||''));
+    document.getElementById('ph').value='';
+    refresh(false);
+  }catch(e){ msg.textContent='failed: '+(e.message||e); }
+}
+
+async function rmPeer(host, port){
+  await fetch('/peer_remove?host='+encodeURIComponent(host)+'&port='+port, {method:'POST'});
+  refresh(false);
+}
+// In-page confirm (browser confirm() gets auto-suppressed after repeated dialogs, silently
+// cancelling — a fleet handoff must never depend on that). Survives the 5s peers refresh because
+// the modal is a stable element outside #peers.
+let _cAnswer=null;
+function askConfirm(msg){ return new Promise(res=>{ _cAnswer=res;
+  document.getElementById('cmsg').textContent=msg; document.getElementById('cov').style.display='flex'; }); }
+function cAnswer(ok){ document.getElementById('cov').style.display='none'; const f=_cAnswer; _cAnswer=null; if(f)f(ok); }
+// #master: hand THIS controller's whole fleet to a peer (node=* handoff — no reload).
+async function handoffFleet(host, name){
+  if(!await askConfirm('Hand the ENTIRE fleet to '+name+'?\n\nEvery node and its loaded shards move to '+name
+    +' with no reload (~seconds). This controller keeps serving those models via federation afterward.'))return;
+  try{
+    const r = await fetch('/peer_handoff?node=*&to='+encodeURIComponent(host), {method:'POST'});
+    const j = await r.json();
+    if(j.ok) alert('Handed '+((j.nodes||[]).length)+' node(s) to '+name
+      +((j.skipped_colocated&&j.skipped_colocated.length)?'\n(kept this box\'s own worker: '+j.skipped_colocated.join(', ')+')':'')
+      +((j.models_moved&&j.models_moved.length)?'\nmoved with no reload: '+j.models_moved.join(', '):''));
+    else alert('handoff failed: '+(j.error||'unknown'));
+  }catch(e){ alert('handoff failed: '+(e.message||e)); }
+  refresh(false);
+}
+// #master: pull a peer's whole fleet HERE (the mirror — used when you're on the receiving controller).
+async function reclaimFleet(host, name){
+  if(!await askConfirm('Take the ENTIRE fleet from '+name+' to this controller?\n\nEvery node moves here with no reload.'))return;
+  try{
+    const r = await fetch('/reclaim_fleet?host='+encodeURIComponent(host), {method:'POST'});
+    const j = await r.json();
+    if(j.ok) alert('Fleet reclaimed from '+name+' — nodes now here.');
+    else alert('reclaim failed: '+(j.error||(j.result&&j.result.error)||'unknown'));
+  }catch(e){ alert('reclaim failed: '+(e.message||e)); }
+  refresh(false);
+}
+
+async function pullModel(btn, host, port, model){
+  // NO confirm() — repeated dialogs get auto-suppressed by browsers ("prevent additional dialogs"),
+  // which silently made the button do nothing. Give inline feedback on the button instead.
+  if(btn){ btn.disabled=true; btn.dataset.t=btn.textContent; btn.textContent='starting…'; }
+  try{
+    const r = await fetch('/peer_pull?host='+encodeURIComponent(host)+'&port='+port
+                          +'&model='+encodeURIComponent(model), {method:'POST'});
+    const j = await r.json();
+    if(j.ok){ if(btn){ btn.textContent='pulling ✓'; } }
+    else { alert('pull failed: '+(j.error||'unknown')); if(btn){ btn.disabled=false; btn.textContent=btn.dataset.t||'Pull'; } }
+    pulls();
+  }catch(e){ alert('pull failed: '+(e.message||e)); if(btn){ btn.disabled=false; btn.textContent=btn.dataset.t||'Pull'; } }
+}
+
+function pullRow(p){
+  const pct = (p.pct==null) ? '' : p.pct+'%';
+  const bar = (p.pct==null) ? '' :
+    '<div style="height:5px;background:#0a0e14;border-radius:3px;overflow:hidden;margin-top:5px">'
+    +'<i style="display:block;height:100%;width:'+Math.min(100,p.pct)+'%;background:var(--accent)"></i></div>';
+  const col = p.state==='done' ? 'var(--good)' : (p.state==='error' ? 'var(--bad)' : 'var(--warn)');
+  return '<div style="padding:7px 0;border-bottom:1px solid var(--border)">'
+    +'<span style="color:'+col+'">●</span> <b>'+esc(p.target)+'</b> '
+    +'<span class="note">from '+esc(p.peer_name||p.peer)+'</span> '
+    +'<span class="chip">'+esc(p.state)+'</span> '
+    +'<span class="note">'+esc(p.files_done)+'/'+esc(p.files_total)+' files · '
+    +(p.done_bytes/1e9).toFixed(2)+' / '+(p.total_bytes/1e9).toFixed(2)+' GB '+pct+'</span>'
+    +(p.file?' <span class="mono">'+esc(p.file)+'</span>':'')
+    +(p.error?'<div class="err">'+esc(p.error)+'</div>':'')
+    +bar+'</div>';
+}
+
+async function pulls(){
+  try{
+    const r = await fetch('/peer_pull_status');
+    const j = await r.json();
+    const ps = j.pulls||[];
+    document.getElementById('pullcard').style.display = ps.length ? '' : 'none';
+    document.getElementById('pulls').innerHTML = ps.map(pullRow).join('');
+  }catch(e){ /* transfers panel is best-effort */ }
+}
+
+function nodeRow(n){
+  let owner, act;
+  if(n.peer && !n.mine){
+    owner = '<span style="color:var(--warn)">in use by '+esc(n.peer)+'</span>';
+    act   = '<span class="note">not plannable here</span>';
+  }else if(n.mine){
+    owner = '<span style="color:var(--good)">in use by this controller</span>';
+    act   = '<button class="btn sm" onclick="lend('+A(n.hostname)+')">Lend</button>';
+  }else if(n.lent){
+    owner = '<span class="note">lent (disabled here)</span>';
+    act   = '<button class="btn sm" onclick="reclaim('+A(n.hostname)+')">Reclaim</button>';
+  }else{
+    owner = '<span class="note">free</span>';
+    act   = '<button class="btn sm" onclick="lend('+A(n.hostname)+')">Lend</button>';
+  }
+  return '<tr><td>'+esc(n.hostname)+'</td><td class="mono">'+esc(n.device||'—')+'</td>'
+    +'<td class="num">'+gb(n.vram_total_gb)+'</td><td>'+owner+'</td>'
+    +'<td class="mono">'+(n.vram_enabled?'gpu':'')+(n.vram_enabled&&n.ram_enabled?'+':'')
+    +(n.ram_enabled?'cpu':'')+((!n.vram_enabled&&!n.ram_enabled)?'off':'')+'</td>'
+    +'<td>'+act+'</td></tr>';
+}
+
+async function nodes(){
+  try{
+    const r = await fetch('/peer_nodes'); const j = await r.json();
+    const rows = (j.nodes||[]).map(nodeRow).join('');
+    document.getElementById('nodes').innerHTML =
+      '<div class="scroll"><table><thead><tr><th>Node</th><th>Device</th><th>VRAM</th>'
+      +'<th>Owner</th><th>Tiers</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+      +(j.respect_peer_claims?'':'<div class="note" style="margin-top:8px">⚠ respect_peer_claims is OFF '
+        +'— this controller will plan onto peer-claimed nodes.</div>');
+  }catch(e){
+    document.getElementById('nodes').innerHTML='<div class="err">failed: '+esc(e.message||e)+'</div>';
+  }
+}
+
+async function lend(node){
+  if(!confirm('Stop using "'+node+'" on this controller so another can take it?\n\nModels with a shard there will be re-placed.')) return;
+  await fetch('/peer_lend?node='+encodeURIComponent(node), {method:'POST'});
+  nodes();
+}
+async function reclaim(node){
+  await fetch('/peer_reclaim?node='+encodeURIComponent(node), {method:'POST'});
+  nodes();
+}
+
+refresh(false); pulls(); nodes();
+setInterval(()=>refresh(false), 5000);
+setInterval(pulls, 2000);
+setInterval(nodes, 5000);
+</script>
+</body></html>
+""""""Dashboard + bandwidth HTML for LACII, extracted from server.py to shrink it.
+Imported by server.py via the multi-file self-update; server.py keeps a minimal placeholder
+fallback for the brief window before this file lands on a freshly-updated controller."""
+
+BANDWIDTH_HTML = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LACII — Bandwidth</title>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a class="on" href="/controllers">Controllers</a></nav>
+  <span class="grow"></span>
+  <button class="btn" onclick="refresh(true)">Refresh now</button>
+<style>
+  :root{
+    --bg:#0d1117; --surface:#161b22; --surface2:#1c2230; --border:#2a3038; --border2:#3a424d;
+    --text:#e6edf3; --muted:#9aa7b4; --dim:#6e7b89;
+    --accent:#4f8cff; --good:#2ea043; --warn:#d29922; --hot:#e0833a; --bad:#da3633;
+    --radius:10px; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;line-height:1.5;}
+  a{color:var(--accent);text-decoration:none}
+  .wrap{max-width:none;margin:0 auto;padding:18px 24px 60px;}
+  /* header */
+  header{display:flex;align-items:center;gap:14px;margin-bottom:16px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600;letter-spacing:.2px}
+  .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px}
+  nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)}
+  nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;
+       padding:6px 12px;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .btn:hover{border-color:var(--accent)} .btn:active{transform:scale(.98)}
+  .btn.pri{border-color:var(--accent);color:#cfe0ff}
+  .btn.sm{padding:4px 9px;font-size:12px}
+  .btn.ghost{background:transparent;border-color:var(--border);color:var(--muted)}
   body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Consolas,monospace;margin:18px}
   h1{font-size:18px;margin:0 0 4px} a{color:#58a6ff;text-decoration:none} a:hover{text-decoration:underline}
   .sub{color:#8b949e;font-size:12px}
