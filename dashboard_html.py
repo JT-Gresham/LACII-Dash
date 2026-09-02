@@ -6,6 +6,10 @@ BANDWIDTH_HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>InfiniteModel — Bandwidth</title>
+  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a class="on" href="/controllers">Controllers</a></nav>
+  <span class="grow"></span>
+  <button class="btn" onclick="refresh(true)">Refresh now</button>
 <style>
   body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Consolas,monospace;margin:18px}
   h1{font-size:18px;margin:0 0 4px} a{color:#58a6ff;text-decoration:none} a:hover{text-decoration:underline}
