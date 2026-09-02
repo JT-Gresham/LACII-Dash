@@ -8,6 +8,6 @@
   "worker_data_port": 50200,
   "discovery_port": 50099,
   "cluster_id": "",
-  "update_repo": "SixOfFive/infiniteModel",
+  "update_repo": "JT-Gresham/infiniteModel",
   "update_branch": "main"
 }
