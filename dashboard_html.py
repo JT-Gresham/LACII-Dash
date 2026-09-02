@@ -11,6 +11,21 @@ BANDWIDTH_HTML = """<!doctype html>
   <span class="grow"></span>
   <button class="btn" onclick="refresh(true)">Refresh now</button>
 <style>
+  /* header */
+  header{display:flex;align-items:center;gap:14px;margin-bottom:16px;flex-wrap:wrap}
+  .brand{font-size:20px;font-weight:600;letter-spacing:.2px}
+  .ctl{font-size:12px;color:var(--dim);font-family:var(--mono)}
+  nav{display:flex;gap:4px;margin-left:8px}
+  nav a{font-size:13px;color:var(--muted);padding:5px 11px;border-radius:8px;border:1px solid transparent}
+  nav a.on{color:var(--text);background:var(--surface);border-color:var(--border)}
+  nav a:hover{background:var(--surface)}
+  .grow{flex:1}
+  .btn{background:var(--surface);border:1px solid var(--border2);color:var(--text);border-radius:8px;
+       padding:6px 12px;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .btn:hover{border-color:var(--accent)} .btn:active{transform:scale(.98)}
+  .btn.pri{border-color:var(--accent);color:#cfe0ff}
+  .btn.sm{padding:4px 9px;font-size:12px}
+  .btn.ghost{background:transparent;border-color:var(--border);color:var(--muted)}
   body{background:#0d1117;color:#c9d1d9;font:13px/1.5 ui-monospace,Consolas,monospace;margin:18px}
   h1{font-size:18px;margin:0 0 4px} a{color:#58a6ff;text-decoration:none} a:hover{text-decoration:underline}
   .sub{color:#8b949e;font-size:12px}
