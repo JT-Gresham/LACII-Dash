@@ -1,12 +1,12 @@
-"""Dashboard + bandwidth HTML for InfiniteModel, extracted from server.py to shrink it.
+"""Dashboard + bandwidth HTML for LACII, extracted from server.py to shrink it.
 Imported by server.py via the multi-file self-update; server.py keeps a minimal placeholder
 fallback for the brief window before this file lands on a freshly-updated controller."""
 
 BANDWIDTH_HTML = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>InfiniteModel — Bandwidth</title>
-  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+<title>LACII — Bandwidth</title>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
   <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a class="on" href="/controllers">Controllers</a></nav>
   <span class="grow"></span>
   <button class="btn" onclick="refresh(true)">Refresh now</button>
@@ -130,7 +130,7 @@ tick(); setInterval(tick,2000);
 DASHBOARD_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>InfiniteModel</title>
+<title>LACII</title>
 <style>
   :root{
     --bg:#0d1117; --surface:#161b22; --surface2:#1c2230; --border:#2a3038; --border2:#3a424d;
@@ -258,7 +258,7 @@ DASHBOARD_HTML = r"""<!doctype html>
 <body><div class="wrap">
 
 <header>
-  <span class="brand">∞ InfiniteModel</span>
+  <span class="brand">∞ LACII ∞ </span>
   <span class="ctl" id="ctl">connecting…</span>
   <nav>
     <a class="on" href="/">Models</a>
@@ -346,7 +346,7 @@ function render(){
   // pool bars: PHYSICAL used (total - free) against PHYSICAL total, one base (#pool-base).
   const vT=pool.vram_total_gb||0, rT=pool.ram_total_gb||0;
   const vU=Math.max(0,vT-(pool.vram_free_gb||0)), rU=Math.max(0,rT-(pool.ram_free_gb||0));
-  // #pool-split: GREEN = what InfiniteModel itself uses (sum of loaded models' MEASURED VRAM/RAM),
+  // #pool-split: GREEN = what LACII itself uses (sum of loaded models' MEASURED VRAM/RAM),
   // BLUE = the rest of the physical usage = OTHER processes on the nodes. So any blue beyond the
   // green tells you something else is holding pool memory. Clamp iM's share to physical-used.
   const _lm=(d.models||[]).filter(m=>m.loaded);
@@ -358,8 +358,8 @@ function render(){
     tile('Nodes', (pool.nodes||0)+' <small>· '+(cmp2.gpus||0)+' GPU'
          +(_viaN?(' · '+_viaN+' via '+((vp.controllers||[]).join(', ')||'peers')):'')+'</small>'),
     tile('Loaded', loaded+' <small>/ '+reg+' registered</small>'),
-    tile('GPU pool', fmt(vU)+'<small> / '+fmt(vT)+' GB</small>', poolbar(vProg,vU-vProg,vT,'InfiniteModel '+fmt(vProg)+' GB (green) · other processes '+fmt(vU-vProg)+' GB (blue) · '+fmt(vT-vU)+' GB free')),
-    tile('RAM pool', fmt(rU)+'<small> / '+fmt(rT)+' GB</small>', poolbar(rProg,rU-rProg,rT,'InfiniteModel '+fmt(rProg)+' GB (green) · other processes '+fmt(rU-rProg)+' GB (blue) · '+fmt(rT-rU)+' GB free')),
+    tile('GPU pool', fmt(vU)+'<small> / '+fmt(vT)+' GB</small>', poolbar(vProg,vU-vProg,vT,'LACII '+fmt(vProg)+' GB (green) · other processes '+fmt(vU-vProg)+' GB (blue) · '+fmt(vT-vU)+' GB free')),
+    tile('RAM pool', fmt(rU)+'<small> / '+fmt(rT)+' GB</small>', poolbar(rProg,rU-rProg,rT,'LACII '+fmt(rProg)+' GB (green) · other processes '+fmt(rU-rProg)+' GB (blue) · '+fmt(rT-rU)+' GB free')),
     tile('Throughput', (F?(F.tokens_per_s||0):((d.metrics||{}).tokens_per_s||0)).toFixed(1)
          +' <small>tok/s · '+Math.round(_busyPct)+'% busy</small>'),
   ].join('');
@@ -665,7 +665,7 @@ function renderNodes(d){
   // is flagged (warn) so a worker that missed a restart/update stands out. When all match, nothing flags.
   const _vc={}; ns.forEach(n=>{ if(n.client_version) _vc[n.client_version]=(_vc[n.client_version]||0)+1; });
   const _consensus=Object.keys(_vc).sort((a,b)=>_vc[b]-_vc[a])[0]||null;
-  // #node-split: per node, GREEN = what InfiniteModel itself uses on THAT node — RAM = the worker
+  // #node-split: per node, GREEN = what LACII itself uses on THAT node — RAM = the worker
   // process RSS (proc_rss_gb), VRAM = the sum of loaded models' per-stage GPU bytes placed here —
   // vs BLUE = the rest of the physical usage (OS / other processes), so it stands out from everything
   // else and mirrors the GPU/RAM pool tiles. Sum iM's per-node VRAM from the loaded models' stages.
@@ -683,7 +683,7 @@ function renderNodes(d){
     const memRow=(lab,im,used,tot)=>{
       const g=Math.max(0,Math.min(im,used)),o=Math.max(0,used-g),f=Math.max(0,tot-used);
       return '<div class="mb"><span class="lab">'+lab+'</span>'
-        +poolbar(g,o,tot,'InfiniteModel '+fmt(g)+' GB (green) · other '+fmt(o)+' GB (blue) · '+fmt(f)+' GB free')
+        +poolbar(g,o,tot,'LACII '+fmt(g)+' GB (green) · other '+fmt(o)+' GB (blue) · '+fmt(f)+' GB free')
         +'<span class="num">'+fmt(used)+' / '+fmt(tot)+'</span></div>';
     };
     // Fixed grid columns: name · VRAM · RAM · util. CPU-only nodes leave the VRAM
@@ -1070,7 +1070,7 @@ function _kvtbl(obj){ const ks=Object.keys(obj); if(!ks.length)return '';
 // config.json / generation_config.json (everything about the model, whether or not it's loaded).
 function renderShow(sh){
   if(!sh)return '<div class="note">no model info</div>';
-  const mi=sh.model_info||{}, det=sh.details||{}, im=sh.infinitemodel||{}, caps=sh.capabilities||[];
+  const mi=sh.model_info||{}, det=sh.details||{}, im=sh.LACII||{}, caps=sh.capabilities||[];
   let out='';
   const skip={'tokenizer.ggml.model':1,'general.file_type':1};
   let ar=''; for(const k in mi){ if(skip[k])continue; let v=mi[k]; if(typeof v==='number'&&Math.abs(v)>=1000)v=v.toLocaleString();
@@ -1146,7 +1146,7 @@ async function openDetail(name){
   if(m.loaded && (m.capabilities||[]).includes('tts')){
     const _ist='font:inherit;padding:6px 7px;border-radius:8px;border:1px solid var(--border2);background:var(--bg);color:var(--text)';
     tts='<h3 style="font-size:13px;margin-top:14px">Text-to-speech <span class="em" style="font-weight:normal">· synthesize a WAV from text via the Omni speech pipeline</span></h3>'
-      +'<textarea id="tts-text" rows="3" placeholder="Type text to speak…" style="width:100%;box-sizing:border-box;resize:vertical;'+_ist+'">Hello! This is a test of the InfiniteModel speech engine.</textarea>'
+      +'<textarea id="tts-text" rows="3" placeholder="Type text to speak…" style="width:100%;box-sizing:border-box;resize:vertical;'+_ist+'">Hello! This is a test of the LACII speech engine.</textarea>'
       +'<div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
       +'<label style="font-size:12px;color:var(--muted)">Voice</label>'
       +'<select id="tts-voice" style="'+_ist+'"><option>Chelsie</option><option>Ethan</option></select>'
@@ -1624,7 +1624,7 @@ tick(); setInterval(tick,2000);
 CONFIG_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>InfiniteModel — Config</title>
+<title>LACII — Config</title>
 <style>
   :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
     --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
@@ -1655,7 +1655,7 @@ CONFIG_HTML = r"""<!doctype html>
 </style></head>
 <body><div class="wrap">
 <header>
-  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
   <nav><a href="/">Models</a><a href="/chat">Chat</a><a class="on" href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
 </header>
 
@@ -1770,7 +1770,7 @@ load(); setInterval(load,5000);
 CHAT_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>InfiniteModel — Chat</title>
+<title>LACII — Chat</title>
 <style>
   :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
     --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
@@ -1804,7 +1804,7 @@ CHAT_HTML = r"""<!doctype html>
 </style></head>
 <body><div class="wrap">
 <header>
-  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
   <nav><a href="/">Models</a><a class="on" href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
 </header>
 <div class="bar">
@@ -1926,7 +1926,7 @@ loadModels(); render(); setInterval(loadModels,5000);
 LOGS_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>InfiniteModel — Logs</title>
+<title>LACII — Logs</title>
 <style>
   :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
     --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
@@ -1955,7 +1955,7 @@ LOGS_HTML = r"""<!doctype html>
 </style></head>
 <body><div class="wrap">
 <header>
-  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
   <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a class="on" href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a href="/controllers">Controllers</a></nav>
   <span class="grow"></span>
   <span class="tog">source <select class="f" id="src" onchange="refresh()"></select></span>
@@ -2047,7 +2047,7 @@ NOCACHE_HEADERS = {
 CONTROLLERS_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>InfiniteModel — Controllers</title>
+<title>LACII — Controllers</title>
 <style>
   :root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2230;--border:#2a3038;--border2:#3a424d;
     --text:#e6edf3;--muted:#9aa7b4;--dim:#6e7b89;--accent:#4f8cff;--good:#2ea043;--warn:#d29922;--bad:#da3633;
@@ -2086,7 +2086,7 @@ CONTROLLERS_HTML = r"""<!doctype html>
 </style></head>
 <body><div class="wrap">
 <header>
-  <span class="brand">∞ InfiniteModel</span><span class="ctl" id="ctl">…</span>
+  <span class="brand">∞ LACII ∞ </span><span class="ctl" id="ctl">…</span>
   <nav><a href="/">Models</a><a href="/chat">Chat</a><a href="/config">Config</a><a href="/logs-page">Logs</a><a href="/bandwidth">Bandwidth</a><a class="on" href="/controllers">Controllers</a></nav>
   <span class="grow"></span>
   <button class="btn" onclick="refresh(true)">Refresh now</button>
