@@ -3,7 +3,7 @@
 #  InfiniteModel WORKER (Linux)  -  connects to the BEAST controller
 #
 #  Usage:
-#    ./client.sh                    CPU worker (uses ./.venv/bin/python if present)
+#    ./client.sh                    CPU worker (uses ./InfMdlWrk_env/bin/python if present)
 #    ./client.sh --device cpu+gpu   use a local GPU, spill overflow to CPU
 #    ./client.sh --name work        override the reported hostname
 #
