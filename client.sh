@@ -12,8 +12,23 @@
 #  To run detached on a worker:
 #    setsid ./client.sh </dev/null >client.log 2>&1 &
 # ===========================================================================
+
+# Check if installed to a master or worker
+if [ -d /root/InfMdlCtl ]
+    then
+        PY=./InfMdlCtlenv/bin/python
+    else
+        PY=./InfMdlWrk_env/bin/python
+fi
+
 set -e
 cd "$(dirname "$0")"
-PY=./InfMdlWrk_env/bin/python
 [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
+
+if [ -d /root/InfMdlCtl ]
+    then
+        export PATH="$(pwd)/InfMdlCtl_env/bin:$PATH"
+    else
+        export PATH="$(pwd)/InfMdlWrk_env/bin:$PATH"
+fi
 exec "$PY" client.py "$@"   # controller host/port default from config.json (override: --controller HOST)
