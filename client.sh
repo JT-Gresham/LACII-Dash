@@ -31,4 +31,7 @@ if [ -d /root/InfMdlCtl ]
     else
         export PATH="$(pwd)/InfMdlWrk_env/bin:$PATH"
 fi
-exec "$PY" client.py "$@"   # controller host/port default from config.json (override: --controller HOST)
+exec "$PY" client.py "$@" &
+
+
+# controller host/port default from config.json (override: --controller HOST)
