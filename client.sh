@@ -16,9 +16,9 @@
 # Check if installed to a master or worker
 if [ -d /root/InfMdlCtl ]
     then
-        PY=./InfMdlCtlenv/bin/python
+        PY=/root/InfMdlCtl/InfMdlCtl_env/bin/python
     else
-        PY=./InfMdlWrk_env/bin/python
+        PY=/root/InfMdlWrk/InfMdlWrk_env/bin/python
 fi
 
 set -e

@@ -4,9 +4,7 @@
 # ===========================================================================
 set -e
 cd "$(dirname "$0")"
-PY=./InfMdlCtl_env/bin/python
+PY=/root/InfMdlCtl/InfMdlCtl_env/bin/python
 [ -x "$PY" ] || PY="$(command -v python3 || command -v python)"
-export PATH="$(pwd)/InfMdlCtl_env/bin:$PATH"
-exec "$PY" client.py "$@" &
 export PATH="$(pwd)/InfMdlCtl_env/bin:$PATH"
 exec "$PY" server.py "$@" &
